@@ -1,0 +1,2 @@
+{"type": "SESSION_START", "session_id": "20251217_101200", "timestamp": "2025-12-17T10:12:00.025558", "date": "20251217"}
+{"type": "SESSION_END", "session_id": "20251217_101200", "timestamp": "2025-12-17T10:13:49.776727", "duration_minutes": 1.8291861500000002, "final_stats": {"total_trades": 0, "wins": 0, "losses": 0, "win_rate": 0, "total_pnl": 0.0, "initial_balance": 4821.8423, "final_balance": 4788.7708, "total_return_pct": -0.6858685527728725}}

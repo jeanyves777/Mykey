@@ -950,13 +950,11 @@ class CryptoLiveTradingEngine:
 
     def _print_scores_table(self):
         """Print confirmation scores table."""
-        from trading_system.strategies.crypto_scalping import SYMBOL_RISK_PARAMS
-
         scores = self._get_symbol_scores()
-        default_min_score = self.config.min_entry_score
+        min_score = self.config.min_entry_score  # V17: Use config value for all symbols
 
         print()
-        print(f"\n--- [LIVE] Signal Scores (per-symbol thresholds) ---")
+        print(f"\n--- [LIVE] Signal Scores (V17: min_score={min_score} for all) ---")
 
         ready = []
         close = []
@@ -966,10 +964,6 @@ class CryptoLiveTradingEngine:
             short_sym = symbol.split('/')[0]
             quote = self.latest_quotes.get(symbol)
             price_str = f"${quote.mid:,.2f}" if quote else "N/A"
-
-            # Get per-symbol min_entry_score
-            symbol_params = SYMBOL_RISK_PARAMS.get(symbol, {})
-            min_score = symbol_params.get('min_entry_score', default_min_score)
 
             if score >= min_score:
                 ready.append(f"  {short_sym}: {score}/{min_score} READY @ {price_str}")

@@ -25,8 +25,9 @@ STRATEGY LOGIC:
 ===============
 - Uses EMA, RSI, MACD, Bollinger Bands, Volume for direction analysis
 - Buys ATM (at-the-money) weekly options based on market direction
-- Target profit: 7.5% (configurable)
+- Target profit: 25% (high target to let trailing stop work)
 - Stop loss: 25% (configurable)
+- Trailing stop: Activates at 10% profit, trails 15% below peak
 - Max hold time: 30 minutes (configurable)
 """
 
@@ -68,7 +69,7 @@ class COINDaily0DTEMomentumConfig(StrategyConfig):
     fixed_position_value : float
         FIXED dollar amount per trade (default $2000).
     target_profit_pct : Decimal
-        Target profit percentage (default 7.5%).
+        Target profit percentage (default 25% - high to allow trailing stop).
     stop_loss_pct : Decimal
         Stop loss percentage (default 25%).
     min_hold_minutes : int
@@ -86,8 +87,12 @@ class COINDaily0DTEMomentumConfig(StrategyConfig):
     instrument_id: str = ""
     bar_type: str = ""
     fixed_position_value: float = 2000.0
-    target_profit_pct: Decimal = Decimal("7.5")
+    target_profit_pct: Decimal = Decimal("25.0")  # Increased to allow trailing stop to work
     stop_loss_pct: Decimal = Decimal("25.0")
+    # Trailing Stop Configuration
+    trailing_stop_enabled: bool = True
+    trailing_trigger_pct: Decimal = Decimal("10.0")  # Start trailing after 10% profit
+    trailing_distance_pct: Decimal = Decimal("5.0")  # Trail 5% below high water mark (TIGHT to lock profit!)
     min_hold_minutes: int = 5
     entry_time_start: str = "09:30:00"
     entry_time_end: str = "10:00:00"
@@ -106,7 +111,8 @@ class COINDaily0DTEMomentumConfig(StrategyConfig):
     min_option_premium: float = 2.0
     max_option_premium: float = 30.0
     request_bars: bool = True
-    max_trades_per_day: int = 1  # STRICT: This strategy trades exactly 1 time per day
+    max_trades_per_day: int = 3  # Allow up to 3 trades per day
+    daily_profit_target_pct: float = 15.0  # Stop trading if daily P&L reaches +15%
 
 
 class COINDaily0DTEMomentum(Strategy):
@@ -153,6 +159,11 @@ class COINDaily0DTEMomentum(Strategy):
         self.is_closing = False
         self.current_signal: str = ""  # BULLISH, BEARISH, or NEUTRAL
 
+        # Trailing Stop Tracking
+        self.high_water_mark: Optional[float] = None  # Highest price since entry
+        self.trailing_stop_active: bool = False  # Is trailing stop now active?
+        self.trailing_stop_price: Optional[float] = None  # Current trailing stop level
+
         # Volume tracking
         self.volume_history = []
         self.max_volume_samples = 20
@@ -190,6 +201,12 @@ class COINDaily0DTEMomentum(Strategy):
         self.log.info(f"   Force Exit: {self.config.force_exit_time} EST", LogColor.CYAN)
         self.log.info(f"   Target Profit: +{self.config.target_profit_pct}%", LogColor.CYAN)
         self.log.info(f"   Stop Loss: -{self.config.stop_loss_pct}%", LogColor.CYAN)
+        if self.config.trailing_stop_enabled:
+            self.log.info(f"   Trailing Stop: ENABLED", LogColor.GREEN)
+            self.log.info(f"      Trigger: +{self.config.trailing_trigger_pct}% profit", LogColor.GREEN)
+            self.log.info(f"      Trail Distance: {self.config.trailing_distance_pct}% below HWM", LogColor.GREEN)
+        else:
+            self.log.info(f"   Trailing Stop: DISABLED", LogColor.YELLOW)
 
     def on_bar(self, bar: Bar) -> None:
         """Process each bar"""
@@ -229,6 +246,7 @@ class COINDaily0DTEMomentum(Strategy):
                 self.traded_today = False
                 self.trades_today = 0
                 self.daily_pnl = 0.0
+                self._profit_target_logged = False  # Reset daily profit target flag
                 self.last_trade_date = current_date  # Update immediately to prevent duplicate logs
                 self._cancel_all_tracked_orders("New trading day")
 
@@ -242,8 +260,22 @@ class COINDaily0DTEMomentum(Strategy):
                 self._manage_position(bar, bar_time_est)
                 return
 
-            # Check if already traded today
-            if self.traded_today:
+            # Check if already traded max times today
+            if self.trades_today >= self.config.max_trades_per_day:
+                return
+
+            # Check if daily profit target reached
+            daily_profit_pct = (self.daily_pnl / self.config.fixed_position_value) * 100
+            if daily_profit_pct >= self.config.daily_profit_target_pct:
+                # Log only once when target is first reached
+                if not hasattr(self, '_profit_target_logged') or not self._profit_target_logged:
+                    self.log.info("=" * 60, LogColor.GREEN)
+                    self.log.info(f"🎯 DAILY PROFIT TARGET REACHED!", LogColor.GREEN)
+                    self.log.info(f"   Daily P&L: ${self.daily_pnl:.2f} (+{daily_profit_pct:.1f}%)", LogColor.GREEN)
+                    self.log.info(f"   Target: +{self.config.daily_profit_target_pct}%", LogColor.GREEN)
+                    self.log.info(f"   No more trades today!", LogColor.GREEN)
+                    self.log.info("=" * 60, LogColor.GREEN)
+                    self._profit_target_logged = True
                 return
 
             # Check entry window
@@ -600,7 +632,7 @@ class COINDaily0DTEMomentum(Strategy):
         return best_match
 
     def _manage_position(self, bar: Bar, bar_time_est: datetime) -> None:
-        """Manage open position - check for time-based exits"""
+        """Manage open position - check for time-based exits and trailing stop"""
         if self.current_position is None or self.is_closing:
             return
 
@@ -610,6 +642,7 @@ class COINDaily0DTEMomentum(Strategy):
             if pos is None or pos.is_flat:
                 self.log.info("   Position closed externally (SL/TP triggered)", LogColor.CYAN)
                 self.current_position = None
+                self._reset_trailing_stop()
                 return
 
         # Calculate hold time
@@ -630,6 +663,56 @@ class COINDaily0DTEMomentum(Strategy):
             self._close_position("Max hold time exceeded")
             return
 
+        # ========== TRAILING STOP MANAGEMENT ==========
+        if self.config.trailing_stop_enabled and self.entry_price:
+            current_price = bar.close
+
+            # Update high water mark
+            if self.high_water_mark is None:
+                self.high_water_mark = current_price
+            elif current_price > self.high_water_mark:
+                old_hwm = self.high_water_mark
+                self.high_water_mark = current_price
+
+                # Recalculate trailing stop if active
+                if self.trailing_stop_active:
+                    self.trailing_stop_price = self.high_water_mark * (1 - float(self.config.trailing_distance_pct) / 100)
+                    self.log.info(f"📈 HWM Updated: ${old_hwm:.2f} -> ${self.high_water_mark:.2f} | Trail: ${self.trailing_stop_price:.2f}", LogColor.GREEN)
+
+            # Calculate current profit percentage
+            profit_pct = ((current_price - self.entry_price) / self.entry_price) * 100
+
+            # Check if we should ACTIVATE trailing stop
+            if not self.trailing_stop_active and profit_pct >= float(self.config.trailing_trigger_pct):
+                self.trailing_stop_active = True
+                self.trailing_stop_price = self.high_water_mark * (1 - float(self.config.trailing_distance_pct) / 100)
+
+                self.log.info("=" * 60, LogColor.GREEN)
+                self.log.info(f"🔄 TRAILING STOP ACTIVATED!", LogColor.GREEN)
+                self.log.info(f"   Current Price: ${current_price:.2f}", LogColor.GREEN)
+                self.log.info(f"   Entry Price: ${self.entry_price:.2f}", LogColor.GREEN)
+                self.log.info(f"   Profit: +{profit_pct:.1f}% (trigger: +{self.config.trailing_trigger_pct}%)", LogColor.GREEN)
+                self.log.info(f"   High Water Mark: ${self.high_water_mark:.2f}", LogColor.GREEN)
+                self.log.info(f"   Trailing Stop: ${self.trailing_stop_price:.2f} ({self.config.trailing_distance_pct}% below HWM)", LogColor.GREEN)
+                self.log.info("=" * 60, LogColor.GREEN)
+
+            # Check if trailing stop is HIT
+            if self.trailing_stop_active and self.trailing_stop_price:
+                if current_price <= self.trailing_stop_price:
+                    locked_profit_pct = ((self.trailing_stop_price - self.entry_price) / self.entry_price) * 100
+
+                    self.log.info("=" * 60, LogColor.YELLOW)
+                    self.log.info(f"🛑 TRAILING STOP HIT!", LogColor.YELLOW)
+                    self.log.info(f"   Entry: ${self.entry_price:.2f}", LogColor.YELLOW)
+                    self.log.info(f"   High Water Mark: ${self.high_water_mark:.2f}", LogColor.YELLOW)
+                    self.log.info(f"   Trail Stop: ${self.trailing_stop_price:.2f}", LogColor.YELLOW)
+                    self.log.info(f"   Current Price: ${current_price:.2f}", LogColor.YELLOW)
+                    self.log.info(f"   Locked Profit: +{locked_profit_pct:.1f}%", LogColor.GREEN if locked_profit_pct > 0 else LogColor.RED)
+                    self.log.info("=" * 60, LogColor.YELLOW)
+
+                    self._close_position(f"Trailing stop hit at ${current_price:.2f}")
+                    return
+
     def _cancel_all_tracked_orders(self, reason: str) -> None:
         """Cancel all tracked SL/TP orders"""
         for order_id in [self.active_sl_order_id, self.active_tp_order_id]:
@@ -639,6 +722,12 @@ class COINDaily0DTEMomentum(Strategy):
         self.active_sl_order_id = None
         self.active_tp_order_id = None
 
+    def _reset_trailing_stop(self) -> None:
+        """Reset trailing stop state when position is closed"""
+        self.high_water_mark = None
+        self.trailing_stop_active = False
+        self.trailing_stop_price = None
+
     def _close_position(self, reason: str) -> None:
         """Close current position"""
         if self.current_position is None or self.is_closing:
@@ -647,8 +736,18 @@ class COINDaily0DTEMomentum(Strategy):
         self.is_closing = True
         self.log.info(f"🔒 CLOSING POSITION: {reason}", LogColor.YELLOW)
 
+        # Estimate P&L before closing (actual P&L tracked in on_order_filled)
+        # Store entry price and position for P&L tracking
+        entry_price_for_pnl = self.entry_price
+        position_qty = self.current_position.quantity if self.current_position else 0
+
         # Cancel SL/TP orders
         self._cancel_all_tracked_orders(reason)
+
+        # Track that this is a manual close so we can calculate P&L in on_order_filled
+        self._manual_close_entry_price = entry_price_for_pnl
+        self._manual_close_qty = position_qty
+        self._manual_close_reason = reason
 
         # Close position
         if self.current_option_instrument:
@@ -661,6 +760,7 @@ class COINDaily0DTEMomentum(Strategy):
         self.entry_timestamp = None
         self.entry_bar_datetime = None
         self.is_closing = False
+        self._reset_trailing_stop()  # Reset trailing stop state
 
     def on_order_filled(self, event: FillEvent) -> None:
         """Handle order fills"""
@@ -672,6 +772,13 @@ class COINDaily0DTEMomentum(Strategy):
             if event.client_order_id == self.active_sl_order_id:
                 self.log.info("🛑 STOP LOSS TRIGGERED", LogColor.RED)
                 self.log.info(f"   Exit Price: ${fill_price:.2f}", LogColor.RED)
+
+                # Calculate and track P&L
+                if self.entry_price:
+                    trade_pnl = (fill_price - self.entry_price) * fill_qty * 100  # 100 multiplier for options
+                    self.daily_pnl += trade_pnl
+                    self.log.info(f"   Trade P&L: ${trade_pnl:.2f}", LogColor.RED)
+                    self.log.info(f"   Daily P&L: ${self.daily_pnl:.2f}", LogColor.CYAN)
 
                 # Set exit reason on position before it closes
                 if self._engine and self.current_option_instrument:
@@ -685,12 +792,21 @@ class COINDaily0DTEMomentum(Strategy):
                 if self.active_tp_order_id:
                     self.cancel_order(self.active_tp_order_id)
                     self.active_tp_order_id = None
+
+                self._reset_trailing_stop()  # Reset trailing stop on SL fill
                 return
 
             # Check if TP filled
             if event.client_order_id == self.active_tp_order_id:
                 self.log.info("🎯 TAKE PROFIT HIT!", LogColor.GREEN)
                 self.log.info(f"   Exit Price: ${fill_price:.2f}", LogColor.GREEN)
+
+                # Calculate and track P&L
+                if self.entry_price:
+                    trade_pnl = (fill_price - self.entry_price) * fill_qty * 100  # 100 multiplier for options
+                    self.daily_pnl += trade_pnl
+                    self.log.info(f"   Trade P&L: ${trade_pnl:.2f}", LogColor.GREEN)
+                    self.log.info(f"   Daily P&L: ${self.daily_pnl:.2f}", LogColor.CYAN)
 
                 # Set exit reason on position before it closes
                 if self._engine and self.current_option_instrument:
@@ -704,6 +820,8 @@ class COINDaily0DTEMomentum(Strategy):
                 if self.active_sl_order_id:
                     self.cancel_order(self.active_sl_order_id)
                     self.active_sl_order_id = None
+
+                self._reset_trailing_stop()  # Reset trailing stop on TP fill
                 return
 
             # Entry order filled
@@ -779,6 +897,23 @@ class COINDaily0DTEMomentum(Strategy):
                 # Clear pending
                 self.pending_option_instrument = None
                 self.entry_order_id = None
+                return
+
+            # Manual close fill (trailing stop, max hold, force exit, etc.)
+            # Check if we have stored manual close info and this is a SELL order
+            if hasattr(self, '_manual_close_entry_price') and self._manual_close_entry_price:
+                if event.order_side == OrderSide.SELL:
+                    trade_pnl = (fill_price - self._manual_close_entry_price) * fill_qty * 100
+                    self.daily_pnl += trade_pnl
+                    reason = getattr(self, '_manual_close_reason', 'Manual close')
+                    color = LogColor.GREEN if trade_pnl >= 0 else LogColor.RED
+                    self.log.info(f"📊 {reason} P&L: ${trade_pnl:.2f}", color)
+                    self.log.info(f"   Daily P&L: ${self.daily_pnl:.2f}", LogColor.CYAN)
+
+                    # Clear manual close tracking
+                    self._manual_close_entry_price = None
+                    self._manual_close_qty = None
+                    self._manual_close_reason = None
 
         except Exception as e:
             self.log.error(f"Error in on_order_filled(): {e}", LogColor.RED)
@@ -1217,4 +1352,645 @@ class COINDaily0DTEMomentum(Strategy):
             'bullish_points': bullish_points,
             'bearish_points': bearish_points,
             'reasons': reasons
+        }
+
+    @staticmethod
+    def check_pullback_entry(bars: list, direction: str) -> dict:
+        """
+        Check if conditions are right for entry based on pullback analysis.
+
+        This is the PULLBACK DETECTION layer that waits for better entry points.
+        - For BULLISH signals: Wait for a dip/pullback before buying CALL
+        - For BEARISH signals: Wait for a bounce/rally before buying PUT
+
+        This helps get better entries instead of chasing momentum.
+
+        Parameters
+        ----------
+        bars : list
+            List of bar objects with: open, close, high, low attributes (1-min bars)
+        direction : str
+            'BULLISH' or 'BEARISH' - the intended trade direction
+
+        Returns
+        -------
+        dict
+            {
+                'ready_to_enter': bool,  # True if pullback conditions met
+                'pullback_detected': bool,
+                'recovery_detected': bool,
+                'pullback_score': int,
+                'recovery_score': int,
+                'reasons': list,
+                'indicators': dict
+            }
+        """
+        if not bars or len(bars) < 20:
+            return {
+                'ready_to_enter': False,
+                'pullback_detected': False,
+                'recovery_detected': False,
+                'pullback_score': 0,
+                'recovery_score': 0,
+                'reasons': ['Not enough data for pullback analysis'],
+                'indicators': {}
+            }
+
+        closes = [b.close for b in bars]
+        opens = [b.open for b in bars]
+        highs = [b.high for b in bars]
+        lows = [b.low for b in bars]
+        current_price = closes[-1]
+
+        # Calculate key indicators
+        def calc_ema(prices, period):
+            if len(prices) < period:
+                return sum(prices) / len(prices)
+            multiplier = 2 / (period + 1)
+            ema = sum(prices[:period]) / period
+            for price in prices[period:]:
+                ema = (price - ema) * multiplier + ema
+            return ema
+
+        def calc_rsi(prices, period=14):
+            if len(prices) < period + 1:
+                return 50.0
+            gains, losses = [], []
+            for i in range(1, len(prices)):
+                change = prices[i] - prices[i-1]
+                gains.append(max(0, change))
+                losses.append(max(0, -change))
+            avg_gain = sum(gains[-period:]) / period
+            avg_loss = sum(losses[-period:]) / period
+            if avg_loss == 0:
+                return 100.0
+            rs = avg_gain / avg_loss
+            return 100 - (100 / (1 + rs))
+
+        def calc_vwap(bars_list):
+            total_vol = sum(getattr(b, 'volume', 1) for b in bars_list)
+            if total_vol == 0:
+                return bars_list[-1].close
+            total_vwap = sum(((b.high + b.low + b.close) / 3) * getattr(b, 'volume', 1) for b in bars_list)
+            return total_vwap / total_vol
+
+        ema_9 = calc_ema(closes, 9)
+        ema_20 = calc_ema(closes, 20)
+        rsi = calc_rsi(closes, 14)
+        vwap = calc_vwap(bars)
+
+        # Recent extremes
+        recent_high = max(highs[-20:])
+        recent_low = min(lows[-10:])
+        pullback_from_high = ((recent_high - current_price) / recent_high) * 100
+        bounce_from_low = ((current_price - recent_low) / recent_low) * 100 if recent_low > 0 else 0
+
+        indicators = {
+            'price': current_price,
+            'ema_9': ema_9,
+            'ema_20': ema_20,
+            'rsi': rsi,
+            'vwap': vwap,
+            'recent_high': recent_high,
+            'recent_low': recent_low,
+            'pullback_from_high_pct': pullback_from_high,
+            'bounce_from_low_pct': bounce_from_low,
+        }
+
+        reasons = []
+        pullback_score = 0
+        recovery_score = 0
+
+        last_bar = bars[-1]
+        last_5_bars = bars[-5:]
+
+        if direction == 'BULLISH':
+            # For BULLISH: We want to see a pullback (dip) followed by recovery
+            # This gives us a better entry for CALLS
+
+            # ========== PULLBACK DETECTION (for calls - price pulled back) ==========
+            # 1. RSI in oversold/low zone
+            if rsi < 40:
+                pullback_score += 3
+                reasons.append(f"RSI oversold zone ({rsi:.1f})")
+            elif rsi < 50:
+                pullback_score += 1
+                reasons.append(f"RSI neutral-low ({rsi:.1f})")
+
+            # 2. Price below VWAP (indicates selling pressure)
+            if current_price < vwap:
+                pullback_score += 2
+                reasons.append(f"Below VWAP (${current_price:.2f} < ${vwap:.2f})")
+
+            # 3. Pullback from recent high
+            if pullback_from_high >= 0.3:
+                pullback_score += 2
+                reasons.append(f"Pulled back {pullback_from_high:.2f}% from high")
+
+            # 4. Red candles in last 5 bars
+            red_count = sum(1 for b in last_5_bars if b.close < b.open)
+            if red_count >= 3:
+                pullback_score += 2
+                reasons.append(f"{red_count}/5 red candles (selling)")
+            elif red_count >= 2:
+                pullback_score += 1
+                reasons.append(f"{red_count}/5 red candles")
+
+            # ========== RECOVERY DETECTION (for calls - turning bullish) ==========
+            # 1. Last bar is GREEN (key signal!)
+            if last_bar.close > last_bar.open:
+                recovery_score += 3
+                bar_change = ((last_bar.close - last_bar.open) / last_bar.open) * 100
+                reasons.append(f"Last bar GREEN (+{bar_change:.2f}%) - reversal signal")
+            else:
+                reasons.append("Waiting for green candle...")
+
+            # 2. Bouncing from low
+            if bounce_from_low >= 0.05:
+                recovery_score += 2
+                reasons.append(f"Bounced {bounce_from_low:.2f}% from low")
+
+            # 3. RSI not too low (showing recovery)
+            if rsi > 35:
+                recovery_score += 1
+                reasons.append(f"RSI recovering ({rsi:.1f})")
+
+            # 4. Positive 3-bar momentum
+            if len(bars) >= 3:
+                momentum_3 = ((closes[-1] - closes[-3]) / closes[-3]) * 100
+                if momentum_3 > 0:
+                    recovery_score += 2
+                    reasons.append(f"3-bar momentum positive (+{momentum_3:.2f}%)")
+
+            # 5. Higher low pattern
+            if len(bars) >= 2 and bars[-1].low > bars[-2].low:
+                recovery_score += 1
+                reasons.append("Higher low (reversal)")
+
+            indicators['pullback_score'] = pullback_score
+            indicators['recovery_score'] = recovery_score
+
+            # DECISION: Need pullback AND recovery for optimal entry
+            pullback_detected = pullback_score >= 4
+            recovery_detected = recovery_score >= 4
+
+            # Safety: Don't enter if RSI too high (overbought)
+            if rsi > 65:
+                reasons.append(f"RSI too high ({rsi:.1f}) - skip entry")
+                return {
+                    'ready_to_enter': False,
+                    'pullback_detected': pullback_detected,
+                    'recovery_detected': recovery_detected,
+                    'pullback_score': pullback_score,
+                    'recovery_score': recovery_score,
+                    'reasons': reasons,
+                    'indicators': indicators
+                }
+
+            # Require green candle for call entries
+            if last_bar.close <= last_bar.open:
+                return {
+                    'ready_to_enter': False,
+                    'pullback_detected': pullback_detected,
+                    'recovery_detected': False,
+                    'pullback_score': pullback_score,
+                    'recovery_score': recovery_score,
+                    'reasons': reasons,
+                    'indicators': indicators
+                }
+
+            ready = pullback_detected and recovery_detected
+            if ready:
+                reasons.append(">>> PULLBACK + RECOVERY: BUY CALL NOW!")
+
+        else:  # BEARISH
+            # For BEARISH: We want to see a bounce (rally) followed by rejection
+            # This gives us a better entry for PUTS
+
+            # ========== BOUNCE DETECTION (for puts - price bounced up) ==========
+            # 1. RSI in overbought/high zone
+            if rsi > 60:
+                pullback_score += 3
+                reasons.append(f"RSI overbought zone ({rsi:.1f})")
+            elif rsi > 50:
+                pullback_score += 1
+                reasons.append(f"RSI neutral-high ({rsi:.1f})")
+
+            # 2. Price above VWAP (indicates buying pressure)
+            if current_price > vwap:
+                pullback_score += 2
+                reasons.append(f"Above VWAP (${current_price:.2f} > ${vwap:.2f})")
+
+            # 3. Bounce from recent low
+            if bounce_from_low >= 0.3:
+                pullback_score += 2
+                reasons.append(f"Bounced {bounce_from_low:.2f}% from low")
+
+            # 4. Green candles in last 5 bars
+            green_count = sum(1 for b in last_5_bars if b.close > b.open)
+            if green_count >= 3:
+                pullback_score += 2
+                reasons.append(f"{green_count}/5 green candles (buying)")
+            elif green_count >= 2:
+                pullback_score += 1
+                reasons.append(f"{green_count}/5 green candles")
+
+            # ========== REJECTION DETECTION (for puts - turning bearish) ==========
+            # 1. Last bar is RED (key signal!)
+            if last_bar.close < last_bar.open:
+                recovery_score += 3
+                bar_change = ((last_bar.close - last_bar.open) / last_bar.open) * 100
+                reasons.append(f"Last bar RED ({bar_change:.2f}%) - rejection signal")
+            else:
+                reasons.append("Waiting for red candle...")
+
+            # 2. Pulling back from high
+            if pullback_from_high >= 0.05:
+                recovery_score += 2
+                reasons.append(f"Pulled back {pullback_from_high:.2f}% from high")
+
+            # 3. RSI not too high (showing rejection)
+            if rsi < 65:
+                recovery_score += 1
+                reasons.append(f"RSI turning down ({rsi:.1f})")
+
+            # 4. Negative 3-bar momentum
+            if len(bars) >= 3:
+                momentum_3 = ((closes[-1] - closes[-3]) / closes[-3]) * 100
+                if momentum_3 < 0:
+                    recovery_score += 2
+                    reasons.append(f"3-bar momentum negative ({momentum_3:.2f}%)")
+
+            # 5. Lower high pattern
+            if len(bars) >= 2 and bars[-1].high < bars[-2].high:
+                recovery_score += 1
+                reasons.append("Lower high (rejection)")
+
+            indicators['pullback_score'] = pullback_score
+            indicators['recovery_score'] = recovery_score
+
+            # DECISION: Need bounce AND rejection for optimal entry
+            pullback_detected = pullback_score >= 4  # Actually "bounce" for puts
+            recovery_detected = recovery_score >= 4  # Actually "rejection" for puts
+
+            # Safety: Don't enter if RSI too low (oversold)
+            if rsi < 35:
+                reasons.append(f"RSI too low ({rsi:.1f}) - skip entry")
+                return {
+                    'ready_to_enter': False,
+                    'pullback_detected': pullback_detected,
+                    'recovery_detected': recovery_detected,
+                    'pullback_score': pullback_score,
+                    'recovery_score': recovery_score,
+                    'reasons': reasons,
+                    'indicators': indicators
+                }
+
+            # Require red candle for put entries
+            if last_bar.close >= last_bar.open:
+                return {
+                    'ready_to_enter': False,
+                    'pullback_detected': pullback_detected,
+                    'recovery_detected': False,
+                    'pullback_score': pullback_score,
+                    'recovery_score': recovery_score,
+                    'reasons': reasons,
+                    'indicators': indicators
+                }
+
+            ready = pullback_detected and recovery_detected
+            if ready:
+                reasons.append(">>> BOUNCE + REJECTION: BUY PUT NOW!")
+
+        return {
+            'ready_to_enter': ready,
+            'pullback_detected': pullback_detected,
+            'recovery_detected': recovery_detected,
+            'pullback_score': pullback_score,
+            'recovery_score': recovery_score,
+            'reasons': reasons,
+            'indicators': indicators
+        }
+
+    @staticmethod
+    def check_pullback_entry_htf(bars_5min: list, direction: str) -> dict:
+        """
+        V4 PULLBACK DETECTION LAYER using 5-minute bars (Higher TimeFrame = less noise).
+
+        For BULLISH signals: Wait for dip/pullback + recovery (green 5-min candle)
+        For BEARISH signals: Wait for bounce/rally + rejection (red 5-min candle)
+
+        Using 5-min bars instead of 1-min reduces noise and gives more reliable signals.
+
+        Parameters
+        ----------
+        bars_5min : list
+            List of 5-minute bar objects with: open, close, high, low, volume attributes
+        direction : str
+            'BULLISH' or 'BEARISH' - the intended trade direction
+
+        Returns
+        -------
+        dict
+            {
+                'ready_to_enter': bool,
+                'pullback_detected': bool,
+                'recovery_detected': bool,
+                'pullback_score': int,
+                'recovery_score': int,
+                'reasons': list,
+                'indicators': dict
+            }
+        """
+        if not bars_5min or len(bars_5min) < 10:
+            return {
+                'ready_to_enter': False,
+                'pullback_detected': False,
+                'recovery_detected': False,
+                'pullback_score': 0,
+                'recovery_score': 0,
+                'reasons': ['Not enough 5-min data for pullback analysis'],
+                'indicators': {}
+            }
+
+        # Support both dict and object access
+        def get_val(bar, key):
+            if isinstance(bar, dict):
+                return bar[key]
+            return getattr(bar, key)
+
+        closes = [get_val(b, 'close') for b in bars_5min]
+        opens = [get_val(b, 'open') for b in bars_5min]
+        highs = [get_val(b, 'high') for b in bars_5min]
+        lows = [get_val(b, 'low') for b in bars_5min]
+        current_price = closes[-1]
+
+        # Calculate key indicators
+        def calc_ema(prices, period):
+            if len(prices) < period:
+                return sum(prices) / len(prices)
+            multiplier = 2 / (period + 1)
+            ema = sum(prices[:period]) / period
+            for price in prices[period:]:
+                ema = (price - ema) * multiplier + ema
+            return ema
+
+        def calc_rsi(prices, period=14):
+            if len(prices) < period + 1:
+                return 50.0
+            gains, losses = [], []
+            for i in range(1, len(prices)):
+                change = prices[i] - prices[i-1]
+                gains.append(max(0, change))
+                losses.append(max(0, -change))
+            avg_gain = sum(gains[-period:]) / period
+            avg_loss = sum(losses[-period:]) / period
+            if avg_loss == 0:
+                return 100.0
+            rs = avg_gain / avg_loss
+            return 100 - (100 / (1 + rs))
+
+        def calc_vwap(bars_list):
+            total_vol = sum(getattr(b, 'volume', 1) if hasattr(b, 'volume') else b.get('volume', 1) if isinstance(b, dict) else 1 for b in bars_list)
+            if total_vol == 0:
+                return get_val(bars_list[-1], 'close')
+            total_vwap = sum(((get_val(b, 'high') + get_val(b, 'low') + get_val(b, 'close')) / 3) *
+                           (getattr(b, 'volume', 1) if hasattr(b, 'volume') else b.get('volume', 1) if isinstance(b, dict) else 1)
+                           for b in bars_list)
+            return total_vwap / total_vol
+
+        ema_9 = calc_ema(closes, 9)
+        ema_20 = calc_ema(closes, min(20, len(closes)))
+        rsi = calc_rsi(closes, min(14, len(closes) - 1))
+        vwap = calc_vwap(bars_5min)
+
+        # Recent extremes (using 5-min bars = less noise)
+        recent_high = max(highs[-10:])  # Last 50 minutes
+        recent_low = min(lows[-6:])     # Last 30 minutes
+        pullback_from_high = ((recent_high - current_price) / recent_high) * 100
+        bounce_from_low = ((current_price - recent_low) / recent_low) * 100 if recent_low > 0 else 0
+
+        indicators = {
+            'price': current_price,
+            'ema_9': ema_9,
+            'ema_20': ema_20,
+            'rsi': rsi,
+            'vwap': vwap,
+            'recent_high': recent_high,
+            'recent_low': recent_low,
+            'pullback_from_high_pct': pullback_from_high,
+            'bounce_from_low_pct': bounce_from_low,
+        }
+
+        reasons = []
+        pullback_score = 0
+        recovery_score = 0
+
+        last_bar = bars_5min[-1]
+        last_3_bars = bars_5min[-3:]  # 15 minutes of data
+
+        if direction == 'BULLISH':
+            # ========== PULLBACK DETECTION (for calls - price pulled back) ==========
+            # 1. RSI in oversold/neutral zone (more relaxed for 5-min)
+            if rsi < 45:
+                pullback_score += 3
+                reasons.append(f"RSI low zone ({rsi:.1f})")
+            elif rsi < 55:
+                pullback_score += 1
+                reasons.append(f"RSI neutral ({rsi:.1f})")
+
+            # 2. Price below VWAP (indicates selling pressure)
+            if current_price < vwap:
+                pullback_score += 2
+                reasons.append(f"Below VWAP (${current_price:.2f} < ${vwap:.2f})")
+
+            # 3. Pullback from recent high (use larger % for 5-min)
+            if pullback_from_high >= 0.5:
+                pullback_score += 2
+                reasons.append(f"Pulled back {pullback_from_high:.2f}% from high")
+            elif pullback_from_high >= 0.25:
+                pullback_score += 1
+                reasons.append(f"Small pullback {pullback_from_high:.2f}%")
+
+            # 4. Red candles in last 3 bars (5-min = 15 min of selling)
+            red_count = sum(1 for b in last_3_bars if get_val(b, 'close') < get_val(b, 'open'))
+            if red_count >= 2:
+                pullback_score += 2
+                reasons.append(f"{red_count}/3 red 5-min candles (selling)")
+            elif red_count >= 1:
+                pullback_score += 1
+                reasons.append(f"{red_count}/3 red candles")
+
+            # ========== RECOVERY DETECTION (for calls - turning bullish) ==========
+            # 1. Last 5-min bar is GREEN (key signal!)
+            if get_val(last_bar, 'close') > get_val(last_bar, 'open'):
+                recovery_score += 3
+                bar_change = ((get_val(last_bar, 'close') - get_val(last_bar, 'open')) / get_val(last_bar, 'open')) * 100
+                reasons.append(f"Last 5-min bar GREEN (+{bar_change:.2f}%) - reversal")
+            else:
+                reasons.append("Waiting for green 5-min candle...")
+
+            # 2. Bouncing from low
+            if bounce_from_low >= 0.15:
+                recovery_score += 2
+                reasons.append(f"Bounced {bounce_from_low:.2f}% from low")
+
+            # 3. RSI recovering (not oversold anymore)
+            if rsi > 40:
+                recovery_score += 1
+                reasons.append(f"RSI recovering ({rsi:.1f})")
+
+            # 4. Positive 2-bar momentum (10 minutes)
+            if len(bars_5min) >= 2:
+                momentum_2 = ((closes[-1] - closes[-2]) / closes[-2]) * 100
+                if momentum_2 > 0:
+                    recovery_score += 2
+                    reasons.append(f"10-min momentum positive (+{momentum_2:.2f}%)")
+
+            # 5. Higher low pattern
+            if len(bars_5min) >= 2 and get_val(bars_5min[-1], 'low') > get_val(bars_5min[-2], 'low'):
+                recovery_score += 1
+                reasons.append("Higher low (reversal)")
+
+            indicators['pullback_score'] = pullback_score
+            indicators['recovery_score'] = recovery_score
+
+            pullback_detected = pullback_score >= 3  # Slightly relaxed for 5-min
+            recovery_detected = recovery_score >= 4
+
+            # Safety: Don't enter if RSI too high
+            if rsi > 70:
+                reasons.append(f"RSI overbought ({rsi:.1f}) - skip")
+                return {
+                    'ready_to_enter': False,
+                    'pullback_detected': pullback_detected,
+                    'recovery_detected': recovery_detected,
+                    'pullback_score': pullback_score,
+                    'recovery_score': recovery_score,
+                    'reasons': reasons,
+                    'indicators': indicators
+                }
+
+            # Require green candle for call entries
+            if get_val(last_bar, 'close') <= get_val(last_bar, 'open'):
+                return {
+                    'ready_to_enter': False,
+                    'pullback_detected': pullback_detected,
+                    'recovery_detected': False,
+                    'pullback_score': pullback_score,
+                    'recovery_score': recovery_score,
+                    'reasons': reasons,
+                    'indicators': indicators
+                }
+
+            ready = pullback_detected and recovery_detected
+            if ready:
+                reasons.append(">>> PULLBACK + RECOVERY: BUY CALL NOW!")
+
+        else:  # BEARISH
+            # ========== BOUNCE DETECTION (for puts - price bounced up) ==========
+            # 1. RSI in overbought/high zone
+            if rsi > 55:
+                pullback_score += 3
+                reasons.append(f"RSI high zone ({rsi:.1f})")
+            elif rsi > 45:
+                pullback_score += 1
+                reasons.append(f"RSI neutral-high ({rsi:.1f})")
+
+            # 2. Price above VWAP
+            if current_price > vwap:
+                pullback_score += 2
+                reasons.append(f"Above VWAP (${current_price:.2f} > ${vwap:.2f})")
+
+            # 3. Bounce from recent low
+            if bounce_from_low >= 0.5:
+                pullback_score += 2
+                reasons.append(f"Bounced {bounce_from_low:.2f}% from low")
+            elif bounce_from_low >= 0.25:
+                pullback_score += 1
+                reasons.append(f"Small bounce {bounce_from_low:.2f}%")
+
+            # 4. Green candles in last 3 bars (buying pressure)
+            green_count = sum(1 for b in last_3_bars if get_val(b, 'close') > get_val(b, 'open'))
+            if green_count >= 2:
+                pullback_score += 2
+                reasons.append(f"{green_count}/3 green 5-min candles (buying)")
+            elif green_count >= 1:
+                pullback_score += 1
+                reasons.append(f"{green_count}/3 green candles")
+
+            # ========== REJECTION DETECTION (for puts - turning bearish) ==========
+            # 1. Last 5-min bar is RED (key signal!)
+            if get_val(last_bar, 'close') < get_val(last_bar, 'open'):
+                recovery_score += 3
+                bar_change = ((get_val(last_bar, 'close') - get_val(last_bar, 'open')) / get_val(last_bar, 'open')) * 100
+                reasons.append(f"Last 5-min bar RED ({bar_change:.2f}%) - rejection")
+            else:
+                reasons.append("Waiting for red 5-min candle...")
+
+            # 2. Pulling back from high
+            if pullback_from_high >= 0.15:
+                recovery_score += 2
+                reasons.append(f"Pulled back {pullback_from_high:.2f}% from high")
+
+            # 3. RSI turning down
+            if rsi < 60:
+                recovery_score += 1
+                reasons.append(f"RSI turning down ({rsi:.1f})")
+
+            # 4. Negative 2-bar momentum
+            if len(bars_5min) >= 2:
+                momentum_2 = ((closes[-1] - closes[-2]) / closes[-2]) * 100
+                if momentum_2 < 0:
+                    recovery_score += 2
+                    reasons.append(f"10-min momentum negative ({momentum_2:.2f}%)")
+
+            # 5. Lower high pattern
+            if len(bars_5min) >= 2 and get_val(bars_5min[-1], 'high') < get_val(bars_5min[-2], 'high'):
+                recovery_score += 1
+                reasons.append("Lower high (rejection)")
+
+            indicators['pullback_score'] = pullback_score
+            indicators['recovery_score'] = recovery_score
+
+            pullback_detected = pullback_score >= 3
+            recovery_detected = recovery_score >= 4
+
+            # Safety: Don't enter if RSI too low
+            if rsi < 30:
+                reasons.append(f"RSI oversold ({rsi:.1f}) - skip")
+                return {
+                    'ready_to_enter': False,
+                    'pullback_detected': pullback_detected,
+                    'recovery_detected': recovery_detected,
+                    'pullback_score': pullback_score,
+                    'recovery_score': recovery_score,
+                    'reasons': reasons,
+                    'indicators': indicators
+                }
+
+            # Require red candle for put entries
+            if get_val(last_bar, 'close') >= get_val(last_bar, 'open'):
+                return {
+                    'ready_to_enter': False,
+                    'pullback_detected': pullback_detected,
+                    'recovery_detected': False,
+                    'pullback_score': pullback_score,
+                    'recovery_score': recovery_score,
+                    'reasons': reasons,
+                    'indicators': indicators
+                }
+
+            ready = pullback_detected and recovery_detected
+            if ready:
+                reasons.append(">>> BOUNCE + REJECTION: BUY PUT NOW!")
+
+        return {
+            'ready_to_enter': ready,
+            'pullback_detected': pullback_detected,
+            'recovery_detected': recovery_detected,
+            'pullback_score': pullback_score,
+            'recovery_score': recovery_score,
+            'reasons': reasons,
+            'indicators': indicators
         }

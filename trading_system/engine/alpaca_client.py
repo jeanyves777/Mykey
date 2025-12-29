@@ -156,18 +156,34 @@ class AlpacaClient:
         }
 
     def get_positions(self) -> List[Dict[str, Any]]:
-        """Get all open positions."""
-        positions = self.trading_client.get_all_positions()
-        return [{
-            'symbol': pos.symbol,
-            'qty': float(pos.qty),
-            'side': pos.side,
-            'avg_entry_price': float(pos.avg_entry_price),
-            'market_value': float(pos.market_value),
-            'unrealized_pl': float(pos.unrealized_pl),
-            'unrealized_plpc': float(pos.unrealized_plpc) * 100,  # Convert to percentage
-            'current_price': float(pos.current_price),
-        } for pos in positions]
+        """Get all open positions (stocks and options)."""
+        try:
+            positions = self.trading_client.get_all_positions()
+            print(f"[DEBUG] get_all_positions returned {len(positions)} positions")
+
+            result = []
+            for pos in positions:
+                # Debug: print raw position data
+                print(f"[DEBUG] Position: symbol={pos.symbol}, qty={pos.qty}, "
+                      f"asset_class={getattr(pos, 'asset_class', 'unknown')}")
+
+                result.append({
+                    'symbol': pos.symbol,
+                    'qty': float(pos.qty),
+                    'side': str(pos.side) if pos.side else 'long',
+                    'avg_entry_price': float(pos.avg_entry_price),
+                    'market_value': float(pos.market_value),
+                    'unrealized_pl': float(pos.unrealized_pl),
+                    'unrealized_plpc': float(pos.unrealized_plpc) * 100,  # Convert to percentage
+                    'current_price': float(pos.current_price),
+                    'asset_class': str(getattr(pos, 'asset_class', 'unknown')),
+                })
+            return result
+        except Exception as e:
+            print(f"[DEBUG] Error in get_positions: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
 
     # ==================== Order Management ====================
 
@@ -779,6 +795,46 @@ class AlpacaClient:
         order = self.trading_client.submit_order(order_request)
         return self._order_to_dict(order)
 
+    def submit_option_order(
+        self,
+        symbol: str,
+        qty: int,
+        side: str,
+        order_type: str = "market",
+        limit_price: float = None,
+    ) -> Dict[str, Any]:
+        """
+        Unified option order method - routes to market or limit order.
+
+        Args:
+            symbol: OCC symbol (e.g., 'MARA251212P00012000')
+            qty: Number of contracts
+            side: 'buy' or 'sell'
+            order_type: 'market' or 'limit'
+            limit_price: Required if order_type is 'limit'
+
+        Returns:
+            Order result dict with 'success', 'order_id', 'filled_avg_price'
+        """
+        try:
+            if order_type.lower() == "limit" and limit_price is not None:
+                result = self.submit_option_limit_order(symbol, qty, side, limit_price)
+            else:
+                result = self.submit_option_market_order(symbol, qty, side)
+
+            # Add success flag and normalize response
+            if result:
+                result['success'] = True
+                # Get fill price if available
+                if 'filled_avg_price' not in result and 'avg_fill_price' in result:
+                    result['filled_avg_price'] = result['avg_fill_price']
+                return result
+            else:
+                return {'success': False, 'error': 'No result from order'}
+        except Exception as e:
+            print(f"Error submitting option order: {e}")
+            return {'success': False, 'error': str(e)}
+
     def get_options_positions(self) -> List[Dict[str, Any]]:
         """
         Get all open options positions.
@@ -790,11 +846,20 @@ class AlpacaClient:
             options_positions = []
             for pos in positions:
                 # Options positions have asset_class = 'us_option'
-                if hasattr(pos, 'asset_class') and str(pos.asset_class).lower() == 'us_option':
+                # Also check if symbol looks like an option (long symbol with date/strike)
+                asset_class = str(getattr(pos, 'asset_class', '')).lower()
+                symbol = pos.symbol
+
+                is_option = (
+                    asset_class == 'us_option' or
+                    (len(symbol) >= 15 and any(c.isdigit() for c in symbol))  # Option symbols are long with numbers
+                )
+
+                if is_option:
                     options_positions.append({
                         'symbol': pos.symbol,
                         'qty': int(float(pos.qty)),
-                        'side': pos.side,
+                        'side': str(pos.side) if pos.side else 'long',
                         'avg_entry_price': float(pos.avg_entry_price),
                         'market_value': float(pos.market_value),
                         'unrealized_pl': float(pos.unrealized_pl),
@@ -805,6 +870,60 @@ class AlpacaClient:
             return options_positions
         except Exception as e:
             print(f"Error getting options positions: {e}")
+            return []
+
+    def get_positions_raw(self) -> List[Dict[str, Any]]:
+        """
+        Get all positions via direct REST API call.
+        This bypasses the SDK and may be more reliable.
+        """
+        import requests
+
+        base_url = "https://paper-api.alpaca.markets" if self.paper else "https://api.alpaca.markets"
+        url = f"{base_url}/v2/positions"
+
+        headers = {
+            'APCA-API-KEY-ID': self.api_key,
+            'APCA-API-SECRET-KEY': self.api_secret,
+        }
+
+        try:
+            response = requests.get(url, headers=headers)
+            print(f"[DEBUG] REST /v2/positions status: {response.status_code}")
+
+            if response.status_code == 200:
+                positions = response.json()
+                print(f"[DEBUG] REST API returned {len(positions)} positions")
+
+                # Normalize data to match SDK format
+                for p in positions:
+                    print(f"[DEBUG] REST Position: {p.get('symbol')} qty={p.get('qty')} "
+                          f"asset_class={p.get('asset_class')}")
+
+                    # Convert string values to proper types
+                    if 'qty' in p:
+                        p['qty'] = float(p['qty'])
+                    if 'avg_entry_price' in p:
+                        p['avg_entry_price'] = float(p['avg_entry_price'])
+                    if 'current_price' in p:
+                        p['current_price'] = float(p['current_price'])
+                    if 'market_value' in p:
+                        p['market_value'] = float(p['market_value'])
+                    if 'cost_basis' in p:
+                        p['cost_basis'] = float(p['cost_basis'])
+                    if 'unrealized_pl' in p:
+                        p['unrealized_pl'] = float(p['unrealized_pl'])
+                    if 'unrealized_plpc' in p:
+                        # REST API returns decimal (e.g., -0.021 for -2.1%)
+                        # Convert to percentage to match SDK format
+                        p['unrealized_plpc'] = float(p['unrealized_plpc']) * 100
+
+                return positions
+            else:
+                print(f"[DEBUG] REST API error: {response.text}")
+                return []
+        except Exception as e:
+            print(f"Error in get_positions_raw: {e}")
             return []
 
     def get_position_by_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:

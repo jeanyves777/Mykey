@@ -1182,29 +1182,43 @@ class CryptoPaperTradingEngine:
             print()
 
     def _get_symbol_scores(self) -> Dict[str, int]:
-        """Get current entry score for each symbol from strategy."""
+        """Get current entry score for each symbol using strategy's actual scoring method.
+
+        V17 FIX: Use the same scoring as the strategy's _calculate_entry_score()
+        so the display table matches what the strategy actually uses for entry.
+        """
         scores = {}
         for symbol in self.config.symbols:
             if symbol in self.strategy.symbol_states:
                 state = self.strategy.symbol_states[symbol]
-                # Calculate current score based on indicators
-                score = 0
-                if state.rsi.initialized and state.rsi.value <= 30:
-                    score += 1
-                if state.bb.initialized and state.bb.lower > 0:
-                    quote = self.latest_quotes.get(symbol)
-                    if quote and quote.mid <= state.bb.lower * 1.01:
-                        score += 1
-                if state.stoch.initialized and state.stoch.k <= 20:
-                    score += 1
-                if state.adx.initialized and state.adx.value >= 20:
-                    score += 1
-                if state.macd.initialized and state.macd.histogram > 0:
-                    score += 1
-                # Add volume confirmation if available
-                if hasattr(state, 'volume_ma') and state.volume_ma.initialized:
-                    score += 1
-                scores[symbol] = score
+                if not state.indicators_ready():
+                    scores[symbol] = 0
+                    continue
+
+                # Use the strategy's actual scoring method
+                # Create a mock bar from latest quote for scoring
+                quote = self.latest_quotes.get(symbol)
+                bar = self.latest_bars.get(symbol)
+
+                if bar and state.indicators_ready():
+                    try:
+                        # Call strategy's actual scoring method
+                        from ..core.models import Bar as CoreBar
+                        core_bar = CoreBar(
+                            symbol=symbol,
+                            timestamp=bar.timestamp,
+                            open=bar.open,
+                            high=bar.high,
+                            low=bar.low,
+                            close=bar.close,
+                            volume=bar.volume,
+                        )
+                        score, pattern, signals = self.strategy._calculate_entry_score(state, core_bar)
+                        scores[symbol] = score
+                    except Exception:
+                        scores[symbol] = 0
+                else:
+                    scores[symbol] = 0
             else:
                 scores[symbol] = 0
         return scores
@@ -1287,10 +1301,10 @@ class CryptoPaperTradingEngine:
 
     def _print_scores_table(self):
         """Print a table of current confirmation scores for all symbols (V10 Signal Hierarchy)."""
-        from trading_system.strategies.crypto_scalping import SYMBOL_RISK_PARAMS, CryptoScalping
+        from trading_system.strategies.crypto_scalping import CryptoScalping
 
         scores = self._get_symbol_scores()
-        default_min_score = self.config.min_entry_score
+        min_score = self.config.min_entry_score  # V17: Use config value for all symbols
 
         print()  # New line after status
         print(f"\n{'='*100}")
@@ -1336,10 +1350,8 @@ class CryptoPaperTradingEngine:
                 m0_str = "ERROR"
                 m0_ready = False
 
-            # M1: Technical score (1-min) - V10: show with macro adjustment
+            # M1: Technical score (1-min) - V17: use config value for all symbols
             m1_score = scores.get(symbol, 0)
-            symbol_params = SYMBOL_RISK_PARAMS.get(symbol, {})
-            min_score = symbol_params.get('min_entry_score', default_min_score)
             adjusted_score = m1_score + macro_adj
             m1_str = f"{adjusted_score}/{min_score}"
             m1_ready = adjusted_score >= min_score

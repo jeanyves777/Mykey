@@ -13,6 +13,7 @@ import os
 import signal
 import sys
 from datetime import datetime, time, timedelta
+from decimal import Decimal
 from typing import Optional, Dict, Any, Callable
 from dataclasses import dataclass, field
 import pytz
@@ -93,16 +94,37 @@ class PaperTradingEngine:
         self.latest_underlying_bar: Optional[Bar] = None
         self.latest_option_quote: Optional[Quote] = None
 
-        # Strategy config
+        # Strategy config - Load all parameters from config file
         self.strategy_config = COINDaily0DTEMomentumConfig(
             underlying_symbol=config.underlying_symbol,
             fixed_position_value=config.fixed_position_value,
-            target_profit_pct=config.target_profit_pct,
-            stop_loss_pct=config.stop_loss_pct,
+            target_profit_pct=Decimal(str(config.target_profit_pct)),
+            stop_loss_pct=Decimal(str(config.stop_loss_pct)),
+            # Trailing stop settings
+            trailing_stop_enabled=getattr(config, 'trailing_stop_enabled', True),
+            trailing_trigger_pct=Decimal(str(getattr(config, 'trailing_trigger_pct', 10.0))),
+            trailing_distance_pct=Decimal(str(getattr(config, 'trailing_distance_pct', 15.0))),
+            # Hold time settings
+            min_hold_minutes=getattr(config, 'min_hold_minutes', 5),
             max_hold_minutes=config.max_hold_minutes,
             entry_time_start=config.entry_time_start,
             entry_time_end=config.entry_time_end,
             force_exit_time=config.force_exit_time,
+            # Technical indicator settings
+            fast_ema_period=getattr(config, 'fast_ema_period', 9),
+            slow_ema_period=getattr(config, 'slow_ema_period', 20),
+            rsi_period=getattr(config, 'rsi_period', 14),
+            macd_fast_period=getattr(config, 'macd_fast_period', 12),
+            macd_slow_period=getattr(config, 'macd_slow_period', 26),
+            macd_signal_period=getattr(config, 'macd_signal_period', 9),
+            bb_period=getattr(config, 'bb_period', 20),
+            bb_std_dev=getattr(config, 'bb_std_dev', 2.0),
+            # Option filtering settings
+            min_volume_ratio=getattr(config, 'min_volume_ratio', 1.0),
+            max_bid_ask_spread_pct=getattr(config, 'max_bid_ask_spread_pct', 30.0),
+            min_option_premium=getattr(config, 'min_option_premium', 2.0),
+            max_option_premium=getattr(config, 'max_option_premium', 30.0),
+            max_trades_per_day=getattr(config, 'max_trades_per_day', 1),
         )
 
         # Parse trading times
@@ -162,15 +184,35 @@ class PaperTradingEngine:
         return now >= self.force_exit
 
     def _get_this_weeks_friday(self) -> datetime:
-        """Get this week's Friday for 0DTE expiry."""
+        """
+        Get the optimal Friday expiry to avoid rapid theta decay.
+
+        Strategy:
+        - Monday/Tuesday (days 0-1): Use THIS week's Friday (3-4 DTE)
+        - Wednesday/Thursday/Friday (days 2-4): Use NEXT week's Friday (9-11 DTE)
+
+        This avoids the steepest theta decay in the final 48-72 hours.
+        """
         now = datetime.now(EST)
-        weekday = now.weekday()
+        weekday = now.weekday()  # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri
+
+        # Calculate this week's Friday
         if weekday <= 4:
-            days_to_friday = 4 - weekday
+            days_to_this_friday = 4 - weekday
         else:
-            days_to_friday = (4 - weekday) % 7
-        friday = now + timedelta(days=days_to_friday)
-        return friday.replace(hour=16, minute=0, second=0, microsecond=0)
+            days_to_this_friday = (4 - weekday) % 7
+
+        # SMART EXPIRY SELECTION:
+        # Mon-Tue: Use this week's Friday
+        # Wed-Fri: Use next week's Friday (to avoid rapid theta decay)
+        if weekday <= 1:  # Monday or Tuesday
+            target_friday = now + timedelta(days=days_to_this_friday)
+            self._log(f"  Using THIS week's Friday expiry (Mon/Tue rule)", "INFO")
+        else:  # Wednesday, Thursday, or Friday
+            target_friday = now + timedelta(days=days_to_this_friday + 7)
+            self._log(f"  Using NEXT week's Friday expiry (Wed-Fri rule)", "INFO")
+
+        return target_friday.replace(hour=16, minute=0, second=0, microsecond=0)
 
     def _recover_existing_positions(self):
         """Check for existing positions in Alpaca on startup and recover them.
@@ -339,12 +381,15 @@ class PaperTradingEngine:
 
     def _calculate_signal(self) -> str:
         """
-        Calculate trading signal using DUAL CONFIRMATION from strategy.
+        Calculate trading signal using IMPROVED MOMENTUM-WEIGHTED ANALYSIS.
 
-        METHOD 1: Technical Scoring (EMA, VWAP, RSI, MACD, BB, Volume) - 1-MIN BARS
-        METHOD 2: Price Action (candle patterns, higher highs/lows, momentum) - 5-MIN BARS
+        NEW V3 APPROACH:
+        - METHOD 1: Technical Scoring (EMA, VWAP, RSI, MACD, BB) - 1-MIN BARS
+        - METHOD 2: Price Action (candle patterns, higher highs/lows) - 5-MIN BARS
+        - METHOD 3: REAL-TIME MOMENTUM (last 3-5 bars direction) - HIGHEST WEIGHT!
 
-        Only trades when BOTH methods agree on the same direction.
+        The real-time momentum can OVERRIDE conflicting signals when strong.
+        This fixes the issue where lagging indicators give wrong direction.
 
         Returns: 'BULLISH', 'BEARISH', or 'NEUTRAL'
         """
@@ -372,7 +417,6 @@ class PaperTradingEngine:
             self.latest_underlying_bar = bars_1min[-1]
 
         # Get 5-MINUTE bars for Price Action (Method 2)
-        # Need 60 5-min bars = 5 hours of data, fetch 6 hours to be safe
         start_time_5min = datetime.now(EST) - timedelta(hours=6)
         bars_5min = self.client.get_stock_bars(
             self.config.underlying_symbol,
@@ -390,17 +434,19 @@ class PaperTradingEngine:
         bars_5min = bars_5min[-30:]
 
         # ============================================================
-        # DUAL SIGNAL VALIDATION
+        # V3: IMPROVED SIGNAL ANALYSIS WITH REAL-TIME MOMENTUM
         # ============================================================
         print()
         self._log("=" * 65, "INFO")
-        self._log("  DUAL SIGNAL VALIDATION", "INFO")
+        self._log("  V3 MOMENTUM-WEIGHTED SIGNAL ANALYSIS", "INFO")
         self._log("=" * 65, "INFO")
 
         # ========== METHOD 1: Technical Scoring (1-MIN BARS) ==========
         tech_result = COINDaily0DTEMomentum.calculate_signal_from_bars(bars_1min)
         tech_signal = tech_result['signal']
         tech_confidence = tech_result['confidence']
+        tech_bull_score = tech_result['bullish_score']
+        tech_bear_score = tech_result['bearish_score']
         indicators = tech_result.get('indicators', {})
 
         self._log("  METHOD 1 - Technical Scoring (1-MIN):", "INFO")
@@ -409,12 +455,10 @@ class PaperTradingEngine:
             self._log(f"    EMA9: ${indicators.get('ema_9', 0):.2f} | EMA20: ${indicators.get('ema_20', 0):.2f}", "INFO")
             self._log(f"    RSI: {indicators.get('rsi', 0):.1f} | MACD: {indicators.get('macd_line', 0):.3f}", "INFO")
 
-        self._log(f"    Signal: {tech_signal} | Score: {tech_result['bullish_score']}/17 vs {tech_result['bearish_score']}/17 | Confidence: {tech_confidence}", "INFO")
+        self._log(f"    Signal: {tech_signal} | Score: {tech_bull_score}/17 vs {tech_bear_score}/17 | Confidence: {tech_confidence}", "INFO")
 
-        # Log bullish signals
         for sig in tech_result.get('bullish_signals', []):
             self._log(f"      + {sig}", "SUCCESS")
-        # Log bearish signals
         for sig in tech_result.get('bearish_signals', []):
             self._log(f"      - {sig}", "WARN")
 
@@ -424,9 +468,11 @@ class PaperTradingEngine:
         pa_result = COINDaily0DTEMomentum.calculate_price_action_signal(bars_5min)
         pa_signal = pa_result['signal']
         pa_strength = pa_result['strength']
+        pa_bull_points = pa_result['bullish_points']
+        pa_bear_points = pa_result['bearish_points']
 
         self._log("  METHOD 2 - Price Action (5-MIN):", "INFO")
-        self._log(f"    Signal: {pa_signal} | Strength: {pa_strength} | Points: {pa_result['bullish_points']} bull vs {pa_result['bearish_points']} bear", "INFO")
+        self._log(f"    Signal: {pa_signal} | Strength: {pa_strength} | Points: {pa_bull_points} bull vs {pa_bear_points} bear", "INFO")
 
         for reason in pa_result.get('reasons', []):
             if 'bullish' in reason.lower() or 'green' in reason.lower() or 'higher' in reason.lower() or 'above' in reason.lower() or 'uptrend' in reason.lower() or '+' in reason:
@@ -438,34 +484,343 @@ class PaperTradingEngine:
 
         self._log("-" * 65, "INFO")
 
-        # ========== FINAL DECISION ==========
-        self._log("  FINAL DECISION:", "INFO")
+        # ========== METHOD 3: REAL-TIME MOMENTUM (LAST 5 1-MIN BARS) ==========
+        # This is the KEY FIX: Use the most recent price action to determine direction
+        # Lagging indicators can be wrong, but recent bars show what's ACTUALLY happening NOW
+        self._log("  METHOD 3 - REAL-TIME MOMENTUM (Last 5 bars):", "INFO")
 
-        # Both must agree for confirmed signal
-        if tech_signal == 'BULLISH' and pa_signal == 'BULLISH':
-            final_signal = 'BULLISH'
-            self._log(f"    CONFIRMED BULLISH - BOTH METHODS AGREE", "SUCCESS")
-            self._log(f"    Technical: {tech_signal} ({tech_confidence}) | Price Action: {pa_signal} ({pa_strength})", "SUCCESS")
-            self._log(f"    >>> EXECUTING: BUY CALLS", "SUCCESS")
+        last_5_bars = bars_1min[-5:]
+        momentum_bull_points = 0
+        momentum_bear_points = 0
+        momentum_reasons = []
 
-        elif tech_signal == 'BEARISH' and pa_signal == 'BEARISH':
-            final_signal = 'BEARISH'
-            self._log(f"    CONFIRMED BEARISH - BOTH METHODS AGREE", "WARN")
-            self._log(f"    Technical: {tech_signal} ({tech_confidence}) | Price Action: {pa_signal} ({pa_strength})", "WARN")
-            self._log(f"    >>> EXECUTING: BUY PUTS", "WARN")
+        # 1. Count green vs red candles (last 5 bars)
+        green_count = sum(1 for b in last_5_bars if b.close > b.open)
+        red_count = 5 - green_count
 
-        elif tech_signal == 'NEUTRAL' or pa_signal == 'NEUTRAL':
-            final_signal = 'NEUTRAL'
-            self._log(f"    NO TRADE - One or both methods neutral", "INFO")
-            self._log(f"    Technical: {tech_signal} | Price Action: {pa_signal}", "INFO")
-            self._log(f"    >>> SKIPPING TRADE", "INFO")
+        if green_count >= 4:
+            momentum_bull_points += 4
+            momentum_reasons.append(f"{green_count}/5 bars GREEN (strong bullish)")
+        elif green_count >= 3:
+            momentum_bull_points += 2
+            momentum_reasons.append(f"{green_count}/5 bars green")
+        elif red_count >= 4:
+            momentum_bear_points += 4
+            momentum_reasons.append(f"{red_count}/5 bars RED (strong bearish)")
+        elif red_count >= 3:
+            momentum_bear_points += 2
+            momentum_reasons.append(f"{red_count}/5 bars red")
 
+        # 2. Price change over last 5 bars
+        price_change_5 = ((last_5_bars[-1].close - last_5_bars[0].open) / last_5_bars[0].open) * 100
+        if price_change_5 > 0.2:
+            momentum_bull_points += 3
+            momentum_reasons.append(f"5-bar momentum +{price_change_5:.2f}% (bullish)")
+        elif price_change_5 > 0.1:
+            momentum_bull_points += 2
+            momentum_reasons.append(f"5-bar momentum +{price_change_5:.2f}%")
+        elif price_change_5 < -0.2:
+            momentum_bear_points += 3
+            momentum_reasons.append(f"5-bar momentum {price_change_5:.2f}% (bearish)")
+        elif price_change_5 < -0.1:
+            momentum_bear_points += 2
+            momentum_reasons.append(f"5-bar momentum {price_change_5:.2f}%")
+
+        # 3. Last bar direction (most recent = most important)
+        last_bar = last_5_bars[-1]
+        last_bar_change = ((last_bar.close - last_bar.open) / last_bar.open) * 100
+        if last_bar.close > last_bar.open:
+            momentum_bull_points += 2
+            momentum_reasons.append(f"Last bar GREEN (+{last_bar_change:.2f}%)")
+        elif last_bar.close < last_bar.open:
+            momentum_bear_points += 2
+            momentum_reasons.append(f"Last bar RED ({last_bar_change:.2f}%)")
+
+        # 4. Higher highs / Lower lows in last 5 bars
+        higher_highs = sum(1 for i in range(1, 5) if last_5_bars[i].high > last_5_bars[i-1].high)
+        lower_lows = sum(1 for i in range(1, 5) if last_5_bars[i].low < last_5_bars[i-1].low)
+
+        if higher_highs >= 3:
+            momentum_bull_points += 2
+            momentum_reasons.append(f"{higher_highs}/4 higher highs")
+        if lower_lows >= 3:
+            momentum_bear_points += 2
+            momentum_reasons.append(f"{lower_lows}/4 lower lows")
+
+        # Determine momentum signal
+        if momentum_bull_points >= 6 and momentum_bull_points >= momentum_bear_points + 3:
+            momentum_signal = 'BULLISH'
+            momentum_strength = 'STRONG'
+        elif momentum_bear_points >= 6 and momentum_bear_points >= momentum_bull_points + 3:
+            momentum_signal = 'BEARISH'
+            momentum_strength = 'STRONG'
+        elif momentum_bull_points >= 4 and momentum_bull_points > momentum_bear_points:
+            momentum_signal = 'BULLISH'
+            momentum_strength = 'MODERATE'
+        elif momentum_bear_points >= 4 and momentum_bear_points > momentum_bull_points:
+            momentum_signal = 'BEARISH'
+            momentum_strength = 'MODERATE'
         else:
-            # Conflicting signals
-            final_signal = 'NEUTRAL'
-            self._log(f"    CONFLICTING SIGNALS - NO TRADE", "WARN")
-            self._log(f"    Technical: {tech_signal} ({tech_confidence}) | Price Action: {pa_signal} ({pa_strength})", "WARN")
-            self._log(f"    >>> SKIPPING TRADE (signals disagree)", "WARN")
+            momentum_signal = 'NEUTRAL'
+            momentum_strength = 'WEAK'
+
+        self._log(f"    Signal: {momentum_signal} | Strength: {momentum_strength} | Points: {momentum_bull_points} bull vs {momentum_bear_points} bear", "INFO")
+        for reason in momentum_reasons:
+            if 'bull' in reason.lower() or 'green' in reason.lower() or 'higher' in reason.lower() or '+' in reason:
+                self._log(f"      + {reason}", "SUCCESS")
+            elif 'bear' in reason.lower() or 'red' in reason.lower() or 'lower' in reason.lower():
+                self._log(f"      - {reason}", "WARN")
+            else:
+                self._log(f"      * {reason}", "INFO")
+
+        self._log("-" * 65, "INFO")
+
+        # ========== METHOD 4: HIGHER TIMEFRAME TREND FILTER (30-MIN + 1-HOUR) ==========
+        # This prevents counter-trend trades (e.g., taking CALLS in a bearish market)
+        self._log("  METHOD 4 - Higher Timeframe Trend Filter:", "INFO")
+
+        # Get 30-MINUTE bars (last 6 hours = 12 bars)
+        start_time_30min = datetime.now(EST) - timedelta(hours=6)
+        bars_30min = self.client.get_stock_bars(
+            self.config.underlying_symbol,
+            timeframe='30Min',
+            start=start_time_30min,
+            limit=20
+        )
+
+        # Get 1-HOUR bars (last 12 hours = 12 bars)
+        start_time_1h = datetime.now(EST) - timedelta(hours=12)
+        bars_1h = self.client.get_stock_bars(
+            self.config.underlying_symbol,
+            timeframe='1Hour',
+            start=start_time_1h,
+            limit=15
+        )
+
+        htf_trend = 'NEUTRAL'
+        htf_reasons = []
+        htf_30min_bull = 0
+        htf_30min_bear = 0
+        htf_1h_bull = 0
+        htf_1h_bear = 0
+
+        # Analyze 30-MIN bars
+        if bars_30min and len(bars_30min) >= 6:
+            last_6_bars_30min = bars_30min[-6:]
+
+            # 1. EMA trend on 30-min
+            if len(bars_30min) >= 9:
+                prices_30min = [b.close for b in bars_30min[-9:]]
+                ema_9_30min = sum(prices_30min[-9:]) / 9  # Simple MA approximation
+                current_price_30min = prices_30min[-1]
+
+                if current_price_30min > ema_9_30min * 1.002:
+                    htf_30min_bull += 2
+                    htf_reasons.append(f"30-min: Price above EMA9 (${current_price_30min:.2f} > ${ema_9_30min:.2f})")
+                elif current_price_30min < ema_9_30min * 0.998:
+                    htf_30min_bear += 2
+                    htf_reasons.append(f"30-min: Price below EMA9 (${current_price_30min:.2f} < ${ema_9_30min:.2f})")
+
+            # 2. Higher highs / Lower lows on 30-min
+            higher_highs_30min = sum(1 for i in range(1, 6) if last_6_bars_30min[i].high > last_6_bars_30min[i-1].high)
+            lower_lows_30min = sum(1 for i in range(1, 6) if last_6_bars_30min[i].low < last_6_bars_30min[i-1].low)
+
+            if higher_highs_30min >= 4:
+                htf_30min_bull += 2
+                htf_reasons.append(f"30-min: {higher_highs_30min}/5 higher highs (uptrend)")
+            if lower_lows_30min >= 4:
+                htf_30min_bear += 2
+                htf_reasons.append(f"30-min: {lower_lows_30min}/5 lower lows (downtrend)")
+
+            # 3. 30-min candle color pattern
+            green_count_30min = sum(1 for b in last_6_bars_30min if b.close > b.open)
+            if green_count_30min >= 5:
+                htf_30min_bull += 2
+                htf_reasons.append(f"30-min: {green_count_30min}/6 green candles")
+            elif green_count_30min <= 1:
+                htf_30min_bear += 2
+                htf_reasons.append(f"30-min: {6-green_count_30min}/6 red candles")
+
+        # Analyze 1-HOUR bars
+        if bars_1h and len(bars_1h) >= 6:
+            last_6_bars_1h = bars_1h[-6:]
+
+            # 1. EMA trend on 1-hour
+            if len(bars_1h) >= 9:
+                prices_1h = [b.close for b in bars_1h[-9:]]
+                ema_9_1h = sum(prices_1h[-9:]) / 9  # Simple MA approximation
+                current_price_1h = prices_1h[-1]
+
+                if current_price_1h > ema_9_1h * 1.003:
+                    htf_1h_bull += 2
+                    htf_reasons.append(f"1-hour: Price above EMA9 (${current_price_1h:.2f} > ${ema_9_1h:.2f})")
+                elif current_price_1h < ema_9_1h * 0.997:
+                    htf_1h_bear += 2
+                    htf_reasons.append(f"1-hour: Price below EMA9 (${current_price_1h:.2f} < ${ema_9_1h:.2f})")
+
+            # 2. Higher highs / Lower lows on 1-hour
+            higher_highs_1h = sum(1 for i in range(1, 6) if last_6_bars_1h[i].high > last_6_bars_1h[i-1].high)
+            lower_lows_1h = sum(1 for i in range(1, 6) if last_6_bars_1h[i].low < last_6_bars_1h[i-1].low)
+
+            if higher_highs_1h >= 4:
+                htf_1h_bull += 2
+                htf_reasons.append(f"1-hour: {higher_highs_1h}/5 higher highs (uptrend)")
+            if lower_lows_1h >= 4:
+                htf_1h_bear += 2
+                htf_reasons.append(f"1-hour: {lower_lows_1h}/5 lower lows (downtrend)")
+
+            # 3. 1-hour candle color pattern
+            green_count_1h = sum(1 for b in last_6_bars_1h if b.close > b.open)
+            if green_count_1h >= 5:
+                htf_1h_bull += 2
+                htf_reasons.append(f"1-hour: {green_count_1h}/6 green candles")
+            elif green_count_1h <= 1:
+                htf_1h_bear += 2
+                htf_reasons.append(f"1-hour: {6-green_count_1h}/6 red candles")
+
+        # Determine HTF trend (both timeframes must agree for strong signal)
+        htf_30min_signal = 'NEUTRAL'
+        if htf_30min_bull >= 4 and htf_30min_bull > htf_30min_bear + 2:
+            htf_30min_signal = 'BULLISH'
+        elif htf_30min_bear >= 4 and htf_30min_bear > htf_30min_bull + 2:
+            htf_30min_signal = 'BEARISH'
+
+        htf_1h_signal = 'NEUTRAL'
+        if htf_1h_bull >= 4 and htf_1h_bull > htf_1h_bear + 2:
+            htf_1h_signal = 'BULLISH'
+        elif htf_1h_bear >= 4 and htf_1h_bear > htf_1h_bull + 2:
+            htf_1h_signal = 'BEARISH'
+
+        # Final HTF trend (both timeframes should agree)
+        if htf_30min_signal == htf_1h_signal and htf_30min_signal != 'NEUTRAL':
+            htf_trend = htf_30min_signal
+            self._log(f"    HTF Trend: {htf_trend} ✅ (BOTH 30-min and 1-hour AGREE)", "SUCCESS" if htf_trend == 'BULLISH' else "WARN")
+        elif htf_30min_signal != 'NEUTRAL' and htf_1h_signal == 'NEUTRAL':
+            htf_trend = htf_30min_signal
+            self._log(f"    HTF Trend: {htf_trend} (30-min only, 1-hour neutral)", "INFO")
+        elif htf_1h_signal != 'NEUTRAL' and htf_30min_signal == 'NEUTRAL':
+            htf_trend = htf_1h_signal
+            self._log(f"    HTF Trend: {htf_trend} (1-hour only, 30-min neutral)", "INFO")
+        elif htf_30min_signal != htf_1h_signal:
+            htf_trend = 'NEUTRAL'
+            self._log(f"    HTF Trend: CONFLICTING (30-min={htf_30min_signal}, 1-hour={htf_1h_signal})", "WARN")
+        else:
+            htf_trend = 'NEUTRAL'
+            self._log(f"    HTF Trend: NEUTRAL (no clear trend)", "INFO")
+
+        self._log(f"    Scores: 30-min ({htf_30min_bull}b/{htf_30min_bear}r) | 1-hour ({htf_1h_bull}b/{htf_1h_bear}r)", "INFO")
+
+        for reason in htf_reasons:
+            if 'above' in reason.lower() or 'higher' in reason.lower() or 'green' in reason.lower() or 'uptrend' in reason.lower():
+                self._log(f"      + {reason}", "SUCCESS")
+            elif 'below' in reason.lower() or 'lower' in reason.lower() or 'red' in reason.lower() or 'downtrend' in reason.lower():
+                self._log(f"      - {reason}", "WARN")
+            else:
+                self._log(f"      * {reason}", "INFO")
+
+        self._log("-" * 65, "INFO")
+
+        # ========== V3 FINAL DECISION: MOMENTUM-WEIGHTED ==========
+        self._log("  V3 FINAL DECISION (Momentum-Weighted + HTF Filter):", "INFO")
+
+        # Calculate weighted scores (momentum has highest weight)
+        # Technical: 1x, Price Action: 1x, Real-Time Momentum: 2x (most important!)
+        total_bull = tech_bull_score + pa_bull_points + (momentum_bull_points * 2)
+        total_bear = tech_bear_score + pa_bear_points + (momentum_bear_points * 2)
+
+        self._log(f"    Weighted Scores: BULL={total_bull} vs BEAR={total_bear}", "INFO")
+        self._log(f"    (Tech: {tech_bull_score}b/{tech_bear_score}r + PA: {pa_bull_points}b/{pa_bear_points}r + Mom×2: {momentum_bull_points*2}b/{momentum_bear_points*2}r)", "INFO")
+
+        # DECISION LOGIC V3:
+        # 1. If momentum is STRONG, it can OVERRIDE conflicting weaker signals
+        # 2. Otherwise, require 2 of 3 methods to agree
+        # 3. With conflict and weak momentum, default to momentum direction (it's real-time!)
+
+        final_signal = 'NEUTRAL'
+        high_confidence_signal = False  # Flag for strong signals that can bypass HTF neutral
+
+        # Case 1: All three agree - HIGH CONFIDENCE
+        if tech_signal == momentum_signal == pa_signal and momentum_signal != 'NEUTRAL':
+            final_signal = momentum_signal
+            high_confidence_signal = True  # Can bypass HTF neutral
+            self._log(f"    ✅ ALL THREE METHODS AGREE: {final_signal}", "SUCCESS")
+            self._log(f"    >>> V3 SIGNAL: {'CALLS' if final_signal == 'BULLISH' else 'PUTS'} (checking pullback...)", "INFO")
+
+        # Case 2: Strong momentum OVERRIDES conflicting signals
+        elif momentum_strength == 'STRONG' and momentum_signal != 'NEUTRAL':
+            final_signal = momentum_signal
+            high_confidence_signal = True  # Can bypass HTF neutral
+            self._log(f"    ⚡ STRONG MOMENTUM OVERRIDE: {final_signal}", "SUCCESS")
+            self._log(f"    Real-time momentum is strong ({momentum_bull_points} vs {momentum_bear_points}) - overriding other signals", "SUCCESS")
+            self._log(f"    >>> V3 SIGNAL: {'CALLS' if final_signal == 'BULLISH' else 'PUTS'} (checking pullback...)", "INFO")
+
+        # Case 3: Momentum + one other method agree
+        elif momentum_signal != 'NEUTRAL':
+            if momentum_signal == tech_signal or momentum_signal == pa_signal:
+                final_signal = momentum_signal
+                agreeing_method = "Technical" if momentum_signal == tech_signal else "Price Action"
+                self._log(f"    ✅ MOMENTUM + {agreeing_method.upper()} AGREE: {final_signal}", "SUCCESS")
+                self._log(f"    >>> V3 SIGNAL: {'CALLS' if final_signal == 'BULLISH' else 'PUTS'} (checking pullback...)", "INFO")
+            else:
+                # Momentum disagrees with both - use weighted score as tiebreaker
+                if total_bull > total_bear + 5:
+                    final_signal = 'BULLISH'
+                    self._log(f"    📊 WEIGHTED SCORE DECISION: BULLISH ({total_bull} vs {total_bear})", "SUCCESS")
+                    self._log(f"    >>> V3 SIGNAL: CALLS (checking pullback...)", "INFO")
+                elif total_bear > total_bull + 5:
+                    final_signal = 'BEARISH'
+                    self._log(f"    📊 WEIGHTED SCORE DECISION: BEARISH ({total_bear} vs {total_bull})", "WARN")
+                    self._log(f"    >>> V3 SIGNAL: PUTS (checking pullback...)", "INFO")
+                else:
+                    final_signal = 'NEUTRAL'
+                    self._log(f"    ⚠️ CONFLICTING SIGNALS - NO CLEAR EDGE", "WARN")
+                    self._log(f"    >>> SKIPPING (scores too close: {total_bull} vs {total_bear})", "WARN")
+
+        # Case 4: Weak/neutral momentum - require 2 of 3 methods to agree
+        else:
+            if tech_signal == pa_signal and tech_signal != 'NEUTRAL':
+                final_signal = tech_signal
+                self._log(f"    ✅ TECH + PA AGREE: {final_signal}", "SUCCESS")
+                self._log(f"    >>> V3 SIGNAL: {'CALLS' if final_signal == 'BULLISH' else 'PUTS'} (checking pullback...)", "INFO")
+            else:
+                final_signal = 'NEUTRAL'
+                self._log(f"    ⚠️ NO CONSENSUS - WEAK MOMENTUM & DISAGREEMENT", "WARN")
+                self._log(f"    >>> SKIPPING (no clear direction)", "WARN")
+
+        # ========== APPLY STRICT HTF TREND FILTER ==========
+        # STRICT RULE: HTF must ALIGN with signal direction (neutral = not aligned)
+        # This prevents counter-trend trades and whipsaw entries
+        if final_signal != 'NEUTRAL':
+            if htf_trend == final_signal:
+                # Perfect alignment - APPROVED
+                self._log("", "INFO")
+                self._log(f"    ✅ HTF FILTER: Trade ALIGNED with {htf_trend} HTF trend - APPROVED", "SUCCESS")
+            elif htf_trend == 'BULLISH' and final_signal == 'BEARISH':
+                # Counter-trend - BLOCK
+                self._log("", "INFO")
+                self._log("    🛑 HTF FILTER: BLOCKING BEARISH trade in BULLISH HTF trend", "WARN")
+                self._log(f"    Signal would be PUTS, but HTF is BULLISH - SKIPPING TRADE", "WARN")
+                final_signal = 'NEUTRAL'
+            elif htf_trend == 'BEARISH' and final_signal == 'BULLISH':
+                # Counter-trend - BLOCK
+                self._log("", "INFO")
+                self._log("    🛑 HTF FILTER: BLOCKING BULLISH trade in BEARISH HTF trend", "WARN")
+                self._log(f"    Signal would be CALLS, but HTF is BEARISH - SKIPPING TRADE", "WARN")
+                final_signal = 'NEUTRAL'
+            else:
+                # HTF is NEUTRAL - NO CLEAR TREND
+                # BUT: Allow high confidence signals (all 3 agree OR strong momentum) to bypass
+                if high_confidence_signal:
+                    self._log("", "INFO")
+                    self._log("    ⚡ HTF FILTER: HTF is NEUTRAL, but HIGH CONFIDENCE signal detected", "SUCCESS")
+                    self._log(f"    BYPASS: All methods agree OR strong momentum - ALLOWING TRADE", "SUCCESS")
+                    # Keep final_signal as-is (don't block)
+                else:
+                    self._log("", "INFO")
+                    self._log("    🛑 HTF FILTER: HTF is NEUTRAL (conflicting timeframes)", "WARN")
+                    self._log(f"    STRICT MODE: Trades require HTF ALIGNMENT - SKIPPING TRADE", "WARN")
+                    self._log(f"    Reason: Cannot confirm {final_signal} direction on higher timeframes", "WARN")
+                    final_signal = 'NEUTRAL'
 
         self._log("=" * 65, "INFO")
 
@@ -589,12 +944,106 @@ class PaperTradingEngine:
         return occ_symbol
 
     def _calculate_position_size(self, option_price: float) -> int:
-        """Calculate number of contracts based on fixed position value."""
+        """
+        Calculate number of contracts based on fixed position value and available buying power.
+
+        Ensures we don't exceed account's options buying power.
+        """
         if option_price <= 0:
             return 0
+
+        # Get current account buying power
+        try:
+            account = self.client.get_account()
+            if isinstance(account, dict):
+                options_bp = float(account.get('options_buying_power', account.get('buying_power', 0)))
+            else:
+                options_bp = float(getattr(account, 'options_buying_power', getattr(account, 'buying_power', 0)))
+        except Exception as e:
+            self._log(f"Warning: Could not get buying power ({e}), using config value", "WARN")
+            options_bp = self.config.fixed_position_value
+
         contract_value = option_price * 100
-        contracts = int(self.config.fixed_position_value / contract_value)
-        return max(1, contracts)
+
+        # Calculate based on config target
+        contracts_by_target = int(self.config.fixed_position_value / contract_value)
+
+        # Calculate based on available buying power (leave small buffer)
+        contracts_by_bp = int((options_bp * 0.95) / contract_value)
+
+        # Use the smaller of the two to ensure we don't exceed buying power
+        contracts = min(contracts_by_target, contracts_by_bp)
+
+        # Log the calculation for transparency
+        self._log(f"  Position Sizing: Target={contracts_by_target}, BP-limited={contracts_by_bp}, Final={contracts}", "INFO")
+        self._log(f"  Available BP: ${options_bp:.2f} | Contract cost: ${contract_value:.2f}", "INFO")
+
+        if contracts < 1:
+            self._log(f"Insufficient buying power: Need ${contract_value:.2f}, have ${options_bp:.2f}", "ERROR")
+            return 0
+
+        return contracts
+
+    def _check_pullback_conditions(self, signal: str) -> dict:
+        """
+        Check if pullback conditions are met for better entry.
+
+        This is the V4 PULLBACK DETECTION layer using 5-MIN BARS (HTF = less noise):
+        - For BULLISH: Wait for dip/pullback + recovery (green 5-min candle)
+        - For BEARISH: Wait for bounce/rally + rejection (red 5-min candle)
+
+        Using 5-min bars instead of 1-min reduces noise and gives more reliable signals.
+
+        Returns:
+            dict with ready_to_enter, pullback_detected, recovery_detected, reasons
+        """
+        from datetime import timedelta
+
+        # Get recent 5-min bars for pullback analysis (HTF = less noise)
+        try:
+            start_time = datetime.now(EST) - timedelta(hours=3)
+            bars_5min = self.client.get_stock_bars(
+                self.config.underlying_symbol,
+                timeframe='5Min',
+                start=start_time,
+                limit=40
+            )
+
+            if not bars_5min or len(bars_5min) < 10:
+                self._log("  Not enough 5-min bars for pullback analysis", "WARN")
+                # If we don't have enough data, allow entry to not miss opportunities
+                return {
+                    'ready_to_enter': True,  # Default to allowing entry
+                    'pullback_detected': False,
+                    'recovery_detected': False,
+                    'pullback_score': 0,
+                    'recovery_score': 0,
+                    'reasons': ['Not enough 5-min data - allowing entry']
+                }
+
+            # Use the strategy's HTF (5-min) pullback detection method
+            result = COINDaily0DTEMomentum.check_pullback_entry_htf(bars_5min, signal)
+
+            # Log the analysis
+            self._log(f"  Direction: {signal} (5-min HTF)", "INFO")
+            indicators = result.get('indicators', {})
+            if indicators:
+                self._log(f"  Price: ${indicators.get('price', 0):.2f} | RSI: {indicators.get('rsi', 0):.1f}")
+                self._log(f"  VWAP: ${indicators.get('vwap', 0):.2f} | Pullback from high: {indicators.get('pullback_from_high_pct', 0):.2f}%")
+
+            return result
+
+        except Exception as e:
+            self._log(f"  Error in pullback check: {e}", "ERROR")
+            # On error, allow entry to not miss opportunities
+            return {
+                'ready_to_enter': True,
+                'pullback_detected': False,
+                'recovery_detected': False,
+                'pullback_score': 0,
+                'recovery_score': 0,
+                'reasons': [f'Error: {e} - allowing entry']
+            }
 
     def _enter_position(self, signal: str):
         """Enter a new position with comprehensive logging."""
@@ -788,7 +1237,7 @@ class PaperTradingEngine:
                 # Fetch Greeks from Alpaca snapshot
                 greeks_dict = {}
                 try:
-                    option_greeks = self.alpaca_client.get_option_greeks(occ_symbol)
+                    option_greeks = self.client.get_option_greeks(occ_symbol)
                     if option_greeks:
                         greeks_dict = {
                             'delta': option_greeks.delta,
@@ -797,9 +1246,9 @@ class PaperTradingEngine:
                             'vega': option_greeks.vega,
                             'iv': option_greeks.implied_volatility
                         }
-                        self._log(f"Greeks: Δ={option_greeks.delta:.3f} Γ={option_greeks.gamma:.4f} Θ={option_greeks.theta:.3f} V={option_greeks.vega:.3f} IV={option_greeks.implied_volatility:.1%}", "INFO")
+                        self._log(f"  Greeks: Δ={option_greeks.delta:.3f} Γ={option_greeks.gamma:.4f} Θ={option_greeks.theta:.3f} V={option_greeks.vega:.3f} IV={option_greeks.implied_volatility:.1%}", "TRADE")
                 except Exception as greek_err:
-                    self._log(f"Could not fetch Greeks: {greek_err}", "WARN")
+                    self._log(f"  Could not fetch Greeks: {greek_err}", "WARN")
 
                 self.trade_logger.log_entry(
                     trade_id=trade_id,
@@ -923,21 +1372,76 @@ class PaperTradingEngine:
             pnl_dollars = (current_price - pos.entry_price) * pos.qty * 100
 
         # Update highest price for tracking
+        old_hwm = pos.highest_price_since_entry
         if current_price > pos.highest_price_since_entry:
             pos.highest_price_since_entry = current_price
 
+            # Log HWM update if trailing is active
+            if hasattr(pos, 'trailing_stop_active') and pos.trailing_stop_active:
+                self._log(f"📈 New High Water Mark: ${old_hwm:.2f} -> ${current_price:.2f}", "SUCCESS")
+
         exit_reason = None
 
+        # ========== TRAILING STOP LOGIC ==========
+        if self.strategy_config.trailing_stop_enabled:
+            profit_pct = ((current_price - pos.entry_price) / pos.entry_price) * 100
+
+            # Initialize trailing stop attributes if not present
+            if not hasattr(pos, 'trailing_stop_active'):
+                pos.trailing_stop_active = False
+                pos.trailing_stop_price = None
+
+            # Check if we should ACTIVATE trailing stop
+            if not pos.trailing_stop_active and profit_pct >= float(self.strategy_config.trailing_trigger_pct):
+                pos.trailing_stop_active = True
+                pos.trailing_stop_price = pos.highest_price_since_entry * (1 - float(self.strategy_config.trailing_distance_pct) / 100)
+
+                print()  # New line for visibility
+                self._log("=" * 70, "SUCCESS")
+                self._log("🔄 TRAILING STOP ACTIVATED!", "SUCCESS")
+                self._log("=" * 70, "SUCCESS")
+                self._log(f"    Current Price: ${current_price:.2f}", "SUCCESS")
+                self._log(f"    Entry Price: ${pos.entry_price:.2f}", "SUCCESS")
+                self._log(f"    Profit: +{profit_pct:.1f}% (trigger: +{self.strategy_config.trailing_trigger_pct}%)", "SUCCESS")
+                self._log(f"    High Water Mark: ${pos.highest_price_since_entry:.2f}", "SUCCESS")
+                self._log(f"    Trailing Stop: ${pos.trailing_stop_price:.2f} ({self.strategy_config.trailing_distance_pct}% below HWM)", "SUCCESS")
+                self._log("=" * 70, "SUCCESS")
+                print()
+
+            # Update trailing stop price if active and HWM increased
+            elif pos.trailing_stop_active and current_price > old_hwm:
+                old_trail = pos.trailing_stop_price
+                pos.trailing_stop_price = pos.highest_price_since_entry * (1 - float(self.strategy_config.trailing_distance_pct) / 100)
+                self._log(f"📊 Trailing Stop Updated: ${old_trail:.2f} -> ${pos.trailing_stop_price:.2f}", "SUCCESS")
+
+            # Check if trailing stop is HIT
+            if pos.trailing_stop_active and pos.trailing_stop_price and current_price <= pos.trailing_stop_price:
+                locked_profit_pct = ((pos.trailing_stop_price - pos.entry_price) / pos.entry_price) * 100
+
+                print()  # New line for visibility
+                self._log("=" * 70, "SUCCESS")
+                self._log("🛑 TRAILING STOP HIT!", "SUCCESS")
+                self._log("=" * 70, "SUCCESS")
+                self._log(f"    Entry: ${pos.entry_price:.2f}", "INFO")
+                self._log(f"    High Water Mark: ${pos.highest_price_since_entry:.2f}", "INFO")
+                self._log(f"    Trail Stop: ${pos.trailing_stop_price:.2f}", "INFO")
+                self._log(f"    Current Price: ${current_price:.2f}", "INFO")
+                self._log(f"    Locked Profit: +{locked_profit_pct:.1f}%", "SUCCESS")
+                self._log("=" * 70, "SUCCESS")
+                print()
+
+                exit_reason = "TRAILING_STOP"
+
         # Check take profit
-        if current_price >= pos.take_profit_price:
+        if not exit_reason and current_price >= pos.take_profit_price:
             exit_reason = "TAKE_PROFIT"
 
         # Check stop loss
-        elif current_price <= pos.stop_loss_price:
+        elif not exit_reason and current_price <= pos.stop_loss_price:
             exit_reason = "STOP_LOSS"
 
         # Check force exit time (no max hold time - only TP, SL, or Force Exit)
-        elif self._should_force_exit():
+        elif not exit_reason and self._should_force_exit():
             exit_reason = "FORCE_EXIT"
 
         if exit_reason:
@@ -983,7 +1487,7 @@ class PaperTradingEngine:
         try:
             exit_greeks_dict = {}
             try:
-                option_greeks = self.alpaca_client.get_option_greeks(pos.option_symbol)
+                option_greeks = self.client.get_option_greeks(pos.symbol)
                 if option_greeks:
                     exit_greeks_dict = {
                         'delta': option_greeks.delta,
@@ -992,6 +1496,7 @@ class PaperTradingEngine:
                         'vega': option_greeks.vega,
                         'iv': option_greeks.implied_volatility
                     }
+                    self._log(f"  Exit Greeks: Δ={option_greeks.delta:.3f} Γ={option_greeks.gamma:.4f} Θ={option_greeks.theta:.3f} V={option_greeks.vega:.3f} IV={option_greeks.implied_volatility:.1%}", "INFO")
             except Exception:
                 pass  # Greeks are optional for exit
 
@@ -1020,6 +1525,12 @@ class PaperTradingEngine:
             return
 
         pos = self.session.position
+
+        # Check if position is locked due to PDT protection
+        if hasattr(pos, 'pdt_locked') and pos.pdt_locked:
+            self._log("⚠️  Position locked due to Pattern Day Trading (PDT) protection - cannot exit programmatically", "WARN")
+            return
+
         hold_time = (datetime.now(EST) - pos.entry_time).total_seconds() / 60
         pnl_pct = ((exit_price - pos.entry_price) / pos.entry_price) * 100
 
@@ -1083,7 +1594,7 @@ class PaperTradingEngine:
             try:
                 exit_greeks_dict = {}
                 try:
-                    option_greeks = self.alpaca_client.get_option_greeks(pos.option_symbol)
+                    option_greeks = self.client.get_option_greeks(pos.symbol)
                     if option_greeks:
                         exit_greeks_dict = {
                             'delta': option_greeks.delta,
@@ -1092,6 +1603,7 @@ class PaperTradingEngine:
                             'vega': option_greeks.vega,
                             'iv': option_greeks.implied_volatility
                         }
+                        self._log(f"  Exit Greeks: Δ={option_greeks.delta:.3f} Γ={option_greeks.gamma:.4f} Θ={option_greeks.theta:.3f} V={option_greeks.vega:.3f} IV={option_greeks.implied_volatility:.1%}", "INFO")
                 except Exception:
                     pass  # Greeks are optional for exit
 
@@ -1115,9 +1627,41 @@ class PaperTradingEngine:
             self.session.position = None
 
         except Exception as e:
-            self._log(f"Error exiting position: {e}", "ERROR")
-            import traceback
-            traceback.print_exc()
+            error_msg = str(e)
+
+            # Check if this is a PDT (Pattern Day Trading) error
+            if "40310100" in error_msg or "pattern day trading" in error_msg.lower():
+                # Mark position as PDT-locked to prevent future retry attempts
+                pos.pdt_locked = True
+
+                # Display clear, one-time warning message
+                print()
+                self._log("=" * 70, "ERROR")
+                self._log("🚫 PATTERN DAY TRADING (PDT) PROTECTION ERROR", "ERROR")
+                self._log("=" * 70, "ERROR")
+                self._log("", "ERROR")
+                self._log("Your Alpaca account is protected by PDT rules and cannot execute this trade.", "ERROR")
+                self._log("", "ERROR")
+                self._log("ACTIONABLE SOLUTIONS:", "ERROR")
+                self._log("  1. Manual Close: Log into Alpaca dashboard and manually close this position", "ERROR")
+                self._log("  2. Contact Alpaca: Request to disable PDT protection (requires $25k+ account)", "ERROR")
+                self._log("  3. Wait: Position can be closed tomorrow (next trading day)", "ERROR")
+                self._log("  4. Upgrade: Switch to a cash account (no PDT rules, but slower settlement)", "ERROR")
+                self._log("", "ERROR")
+                self._log(f"Position Details:", "ERROR")
+                self._log(f"  Symbol: {pos.symbol}", "ERROR")
+                self._log(f"  Entry: ${pos.entry_price:.2f}", "ERROR")
+                self._log(f"  Current: ${exit_price:.2f}", "ERROR")
+                self._log(f"  P&L: ${pnl:+.2f} ({pnl_pct:+.2f}%)", "ERROR")
+                self._log("", "ERROR")
+                self._log("⚠️  This position will NOT be closed automatically. Manual action required.", "ERROR")
+                self._log("=" * 70, "ERROR")
+                print()
+            else:
+                # Generic error handling for non-PDT errors
+                self._log(f"Error exiting position: {e}", "ERROR")
+                import traceback
+                traceback.print_exc()
 
     def _print_status(self):
         """Print current status with comprehensive monitoring."""
@@ -1261,6 +1805,21 @@ class PaperTradingEngine:
 
             print(f"    Current: ${current:.2f} | P&L: ${pnl_dollars:+.2f} ({pnl_pct:+.2f}%)")
             print(f"    Hold Time: {hold_minutes:.1f}m | Force Exit: {self.config.force_exit_time} EST")
+
+            # Show trailing stop status
+            if hasattr(pos, 'trailing_stop_active') and pos.trailing_stop_active and hasattr(pos, 'trailing_stop_price'):
+                locked_profit_pct = ((pos.trailing_stop_price - pos.entry_price) / pos.entry_price) * 100
+                locked_profit_dollars = (pos.trailing_stop_price - pos.entry_price) * pos.qty * 100
+                hwm_pct = ((pos.highest_price_since_entry - pos.entry_price) / pos.entry_price) * 100
+                print(f"    🔄 TRAILING STOP: ACTIVE @ ${pos.trailing_stop_price:.2f} ({locked_profit_pct:+.1f}% profit LOCKED)")
+                print(f"       Peak: ${pos.highest_price_since_entry:.2f} ({hwm_pct:+.1f}%) | Locked: ${locked_profit_dollars:+.2f}")
+            elif pnl_pct >= float(self.strategy_config.trailing_trigger_pct):
+                trigger_price = pos.entry_price * (1 + float(self.strategy_config.trailing_trigger_pct) / 100)
+                print(f"    ⏳ TRAILING STOP: Should be active (profit {pnl_pct:.1f}% >= {self.strategy_config.trailing_trigger_pct}%)")
+            else:
+                trigger_price = pos.entry_price * (1 + float(self.strategy_config.trailing_trigger_pct) / 100)
+                print(f"    ⚪ TRAILING STOP: Inactive (needs ${trigger_price:.2f}, +{self.strategy_config.trailing_trigger_pct}%)")
+
             print(f"    SL ${pos.stop_loss_price:.2f} [{bar}] TP ${pos.take_profit_price:.2f}")
             print(f"    Distance: SL {dist_to_sl:.1f}% away | TP {dist_to_tp:.1f}% away")
         else:
@@ -1355,8 +1914,22 @@ class PaperTradingEngine:
                     self._log(f"  SIGNAL: {signal}")
 
                     if signal in ['BULLISH', 'BEARISH']:
-                        self._log(f"  SIGNAL DETECTED: {signal} - Attempting entry...", "SUCCESS")
-                        self._enter_position(signal)
+                        # ========== PULLBACK DETECTION LAYER (5-MIN HTF) ==========
+                        # Wait for better entry by checking pullback conditions on 5-min bars
+                        self._log("-" * 50)
+                        self._log("  V4 PULLBACK DETECTION (5-min HTF)", "INFO")
+
+                        pullback_result = self._check_pullback_conditions(signal)
+
+                        if pullback_result['ready_to_enter']:
+                            self._log(f"  ✅ PULLBACK CONDITIONS MET - Entering {signal}", "SUCCESS")
+                            self._enter_position(signal)
+                        else:
+                            self._log(f"  ⏳ WAITING FOR BETTER ENTRY...", "WARN")
+                            self._log(f"     Pullback: {'YES' if pullback_result['pullback_detected'] else 'NO'} (score: {pullback_result['pullback_score']})")
+                            self._log(f"     Recovery: {'YES' if pullback_result['recovery_detected'] else 'NO'} (score: {pullback_result['recovery_score']})")
+                            for reason in pullback_result.get('reasons', [])[-5:]:  # Show last 5 reasons
+                                self._log(f"       - {reason}")
                     else:
                         self._log(f"  Signal is NEUTRAL - waiting...", "WARN")
                     print()

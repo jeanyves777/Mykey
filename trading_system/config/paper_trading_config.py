@@ -32,6 +32,8 @@ class PaperTradingConfig:
 
     # Trading parameters
     fixed_position_value: float = 2000.0  # Fixed $ amount per trade
+    max_trades_per_day: int = 3  # Allow up to 3 trades per day
+    daily_profit_target_pct: float = 15.0  # Stop trading if daily P&L reaches +15%
 
     # Selected strategy file path
     strategy_file: str = ""
@@ -40,16 +42,36 @@ class PaperTradingConfig:
     underlying_symbol: str = "COIN"
 
     # Trading times (EST)
-    # NOTE: Extended entry window to 15:45 for TESTING purposes only
-    # PRODUCTION should be: entry_time_start="09:30:00", entry_time_end="10:00:00"
     entry_time_start: str = "09:30:00"
-    entry_time_end: str = "15:45:00"  # TESTING: Extended from 10:00 to 15:45
-    force_exit_time: str = "15:50:00"  # Force exit at 3:50 PM EST
+    entry_time_end: str = "15:45:00"
+    force_exit_time: str = "15:50:00"
 
     # Risk parameters
     target_profit_pct: float = 7.5
     stop_loss_pct: float = 25.0
+    min_hold_minutes: int = 5
     max_hold_minutes: int = 30
+
+    # Trailing Stop Configuration
+    trailing_stop_enabled: bool = True
+    trailing_trigger_pct: float = 10.0  # Start trailing after X% profit
+    trailing_distance_pct: float = 5.0  # Trail X% below high water mark (TIGHT to lock profit!)
+
+    # Technical Indicator Settings
+    fast_ema_period: int = 9
+    slow_ema_period: int = 20
+    rsi_period: int = 14
+    macd_fast_period: int = 12
+    macd_slow_period: int = 26
+    macd_signal_period: int = 9
+    bb_period: int = 20
+    bb_std_dev: float = 2.0
+
+    # Option Filtering
+    min_volume_ratio: float = 1.0
+    max_bid_ask_spread_pct: float = 30.0
+    min_option_premium: float = 2.0
+    max_option_premium: float = 30.0
 
     def is_configured(self) -> bool:
         """Check if API credentials are configured."""

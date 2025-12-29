@@ -47,11 +47,34 @@ class LiveTradingConfig:
     # Risk parameters
     target_profit_pct: float = 7.5
     stop_loss_pct: float = 25.0
+    min_hold_minutes: int = 5
     max_hold_minutes: int = 30
+
+    # Trailing Stop Configuration
+    trailing_stop_enabled: bool = True
+    trailing_trigger_pct: float = 10.0  # Start trailing after X% profit
+    trailing_distance_pct: float = 15.0  # Trail X% below high water mark
+
+    # Technical Indicator Settings
+    fast_ema_period: int = 9
+    slow_ema_period: int = 20
+    rsi_period: int = 14
+    macd_fast_period: int = 12
+    macd_slow_period: int = 26
+    macd_signal_period: int = 9
+    bb_period: int = 20
+    bb_std_dev: float = 2.0
+
+    # Option Filtering
+    min_volume_ratio: float = 1.0
+    max_bid_ask_spread_pct: float = 30.0
+    min_option_premium: float = 2.0
+    max_option_premium: float = 30.0
 
     # SAFETY LIMITS for live trading
     max_daily_loss: float = 500.0  # Stop trading if daily loss exceeds this
     max_trades_per_day: int = 0  # 0 = use strategy's max_trades_per_day (recommended)
+    daily_profit_target_pct: float = 15.0  # Stop trading if daily P&L reaches +15%
     max_position_value: float = 2000.0  # Maximum single position value
     require_confirmation: bool = True  # Require confirmation before each trade
 

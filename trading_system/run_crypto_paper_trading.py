@@ -189,24 +189,23 @@ def run_setup_wizard(config: CryptoPaperTradingConfig = None) -> CryptoPaperTrad
 
 def display_config(config: CryptoPaperTradingConfig):
     """Display current configuration."""
-    from trading_system.strategies.crypto_scalping import SYMBOL_RISK_PARAMS
-
-    print("\n--- Current Configuration ---")
+    print("\n--- Current Configuration (V17) ---")
     print(f"  API Key:          {mask_api_key(config.api_key) if config.api_key else 'NOT SET'}")
     print(f"  Trading Mode:     PAPER (Crypto)")
     print(f"  Position Size:    ${config.fixed_position_value:,.2f}")
     print(f"  Max Positions:    {config.max_concurrent_positions}")
     print(f"  Time Filter:      {'ON' if config.use_time_filter else 'OFF'}")
-    print(f"  Exit Modes:       TP and SL only (V6)")
+    print(f"  Exit Modes:       TP and SL only (V17)")
     print(f"  Taker Fee:        {config.taker_fee_pct}%")
     print()
-    print("  Per-Symbol Settings (V6.1):")
+    print(f"  V17 Settings (ALL symbols use config values):")
+    print(f"    TP: {config.target_profit_pct}% | SL: {config.stop_loss_pct}% | MinScore: {config.min_entry_score}")
+    print(f"    Trailing Stop: {'ON' if config.use_trailing_stop else 'OFF'}")
+    print(f"    Max Hold: {'Disabled (wait for TP/SL)' if config.max_hold_minutes == 0 else f'{config.max_hold_minutes} min'}")
+    print()
+    print(f"  Symbols ({len(config.symbols)}):")
     for symbol in config.symbols:
-        params = SYMBOL_RISK_PARAMS.get(symbol, {})
-        tp = params.get('target_profit_pct', config.target_profit_pct)
-        sl = params.get('stop_loss_pct', config.stop_loss_pct)
-        score = params.get('min_entry_score', 7)
-        print(f"    {symbol}: TP={tp}% SL={sl}% MinScore={score}")
+        print(f"    {symbol}")
     print()
 
 

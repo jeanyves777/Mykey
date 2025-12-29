@@ -45,6 +45,11 @@ class Position:
     tp_order_id: str = ""
     entry_underlying_price: float = 0.0
     greeks: Dict[str, float] = field(default_factory=dict)
+    # Real-time data from Alpaca
+    current_price: float = 0.0
+    pnl_pct: float = 0.0
+    pnl_dollars: float = 0.0
+    exit_price: Optional[float] = None
 
 
 @dataclass
@@ -345,7 +350,7 @@ class MARAContinuousTradingEngine:
 
         # Get quote for this option
         try:
-            option_quote = self.client.get_option_quote(occ_symbol)
+            option_quote = self.client.get_latest_option_quote(occ_symbol)
 
             if option_quote:
                 contract = ATMContractInfo(
@@ -384,16 +389,96 @@ class MARAContinuousTradingEngine:
             self._log(f"Error getting ATM quote: {e}", "ERROR")
             return None
 
+    def _check_pullback_htf(self, direction: str) -> dict:
+        """
+        V4 PULLBACK DETECTION LAYER using 5-minute bars (Higher TimeFrame).
+
+        Uses 5-min bars instead of 1-min to reduce noise and give more reliable signals.
+        - For BULLISH: Wait for dip/pullback + recovery (green candle)
+        - For BEARISH: Wait for bounce/rally + rejection (red candle)
+
+        Returns:
+            dict with ready_to_enter, pullback_detected, recovery_detected, reasons
+        """
+        # We already have bars_5min from _fetch_bars(), use them
+        if not self.bars_5min or len(self.bars_5min) < 10:
+            self._log("  Not enough 5-min bars for pullback analysis", "WARN")
+            # If we don't have enough data, allow entry to not miss opportunities
+            return {
+                'ready_to_enter': True,
+                'pullback_detected': False,
+                'recovery_detected': False,
+                'pullback_score': 0,
+                'recovery_score': 0,
+                'reasons': ['Not enough data - allowing entry']
+            }
+
+        try:
+            # Use the strategy's pullback detection method (5-min HTF version)
+            result = MARAContinuousMomentumStrategy.check_pullback_entry_htf(self.bars_5min, direction)
+
+            # Log the analysis
+            self._log(f"  Direction: {direction}", "INFO")
+            indicators = result.get('indicators', {})
+            if indicators:
+                self._log(f"  Price: ${indicators.get('price', 0):.2f} | RSI: {indicators.get('rsi', 0):.1f}")
+                self._log(f"  VWAP: ${indicators.get('vwap', 0):.2f} | Pullback from high: {indicators.get('pullback_from_high_pct', 0):.2f}%")
+
+            return result
+
+        except Exception as e:
+            self._log(f"  Error in pullback check: {e}", "ERROR")
+            # On error, allow entry to not miss opportunities
+            return {
+                'ready_to_enter': True,
+                'pullback_detected': False,
+                'recovery_detected': False,
+                'pullback_score': 0,
+                'recovery_score': 0,
+                'reasons': [f'Error: {e} - allowing entry']
+            }
+
     def _enter_position(self, contract: ATMContractInfo, direction: str) -> bool:
         """Enter a position with the selected contract."""
         if not contract.is_valid:
             return False
 
-        # Calculate position size
-        qty = self.strategy.calculate_position_size(contract.mid)
+        # Check available buying power FIRST
+        try:
+            account = self.client.get_account()
+            buying_power = float(account.get('buying_power', 0))
+            self._log(f"Available buying power: ${buying_power:.2f}")
+
+            if buying_power < 50:
+                self._log(f"INSUFFICIENT BUYING POWER (${buying_power:.2f}) - cannot enter position", "WARN")
+                self._log("Check Alpaca for existing positions or pending orders", "WARN")
+                return False
+        except Exception as e:
+            self._log(f"Could not check buying power: {e}", "WARN")
+
+        # Calculate position size based on available buying power
+        # Use the smaller of configured position value or available buying power
+        available_for_trade = min(self.config.fixed_position_value, buying_power * 0.95)  # Keep 5% buffer
+
+        if contract.mid <= 0:
+            self._log("Invalid contract price", "WARN")
+            return False
+
+        # Calculate how many contracts we can afford
+        cost_per_contract = contract.mid * 100  # Options are 100 shares per contract
+        max_qty = int(available_for_trade / cost_per_contract)
+
+        if max_qty <= 0:
+            self._log(f"Cannot afford any contracts (need ${cost_per_contract:.2f}, have ${available_for_trade:.2f})", "WARN")
+            return False
+
+        # Use strategy's position size but cap at what we can afford
+        qty = min(self.strategy.calculate_position_size(contract.mid), max_qty)
         if qty <= 0:
             self._log("Position size too small", "WARN")
             return False
+
+        self._log(f"Position sizing: ${available_for_trade:.2f} available -> {qty} contracts @ ${contract.mid:.2f}")
 
         self._log("=" * 70, "TRADE")
         self._log(f"ENTERING {direction} POSITION", "TRADE")
@@ -419,10 +504,21 @@ class MARAContinuousTradingEngine:
                 return False
 
             order_id = order_result.get('order_id', '')
-            actual_fill_price = order_result.get('filled_avg_price', contract.mid)
+            # Get fill price - try multiple possible keys
+            actual_fill_price = (
+                order_result.get('filled_avg_price') or
+                order_result.get('avg_fill_price') or
+                order_result.get('filled_price') or
+                contract.mid
+            )
+            # Ensure it's a float
+            if actual_fill_price is None:
+                actual_fill_price = contract.mid
+            actual_fill_price = float(actual_fill_price)
 
             self._log(f"  Order ID: {order_id}", "TRADE")
             self._log(f"  Fill Price: ${actual_fill_price:.2f}", "TRADE")
+            self._log("  >>> POSITION OPENED - Monitoring for TP/SL <<<", "SUCCESS")
 
             # Calculate and place TP limit order
             tp_price = round(actual_fill_price * (1 + self.config.target_profit_pct / 100), 2)
@@ -506,6 +602,8 @@ class MARAContinuousTradingEngine:
         """
         Check position for exit conditions.
         Returns exit reason or None if still holding.
+
+        FETCHES POSITION DATA DIRECTLY FROM ALPACA (like COIN engine).
         """
         if not self.session.position:
             return None
@@ -513,33 +611,89 @@ class MARAContinuousTradingEngine:
         pos = self.session.position
         now = datetime.now(EST)
 
-        # Check if TP limit order was filled
+        # Check if TP limit order was filled FIRST
         if pos.tp_order_id:
             try:
                 order_status = self.client.get_order_status(pos.tp_order_id)
                 if order_status and order_status.get('status') == 'filled':
+                    # Store fill price for exit
+                    fill_price = order_status.get('filled_avg_price')
+                    if fill_price:
+                        pos.exit_price = float(fill_price)
                     return "TAKE_PROFIT"
             except:
                 pass
 
-        # Get current option quote
-        try:
-            option_quote = self.client.get_option_quote(pos.option_symbol)
-            if option_quote:
-                self.latest_option_quote = option_quote
-                current_price = option_quote.mid
+        # FETCH POSITION DATA DIRECTLY FROM ALPACA for accurate real-time data
+        # (Like COIN engine does - use direct symbol lookup)
+        alpaca_pos = self.client.get_position_by_symbol(pos.option_symbol)
 
-                # Check stop loss
-                pnl_pct = (current_price - pos.entry_price) / pos.entry_price * 100
-                if pnl_pct <= -self.config.stop_loss_pct:
-                    return "STOP_LOSS"
+        # If position is gone from Alpaca but we have a TP order, check if it filled
+        if not alpaca_pos and pos.tp_order_id:
+            try:
+                tp_order = self.client.get_order(pos.tp_order_id)
+                tp_status = tp_order.get('status', 'unknown') if tp_order else 'unknown'
 
-                # Log current status periodically
-                self._log(f"Position: {pos.option_symbol} Entry=${pos.entry_price:.2f} "
-                         f"Current=${current_price:.2f} P&L={pnl_pct:+.1f}%")
+                if tp_status == 'filled':
+                    fill_price = float(tp_order.get('filled_avg_price', pos.entry_price * 1.075))
+                    pos.exit_price = fill_price
+                    self._log(f"TP LIMIT ORDER FILLED @ ${fill_price:.2f}!", "SUCCESS")
+                    return "TAKE_PROFIT"
+                elif tp_status in ['canceled', 'expired', 'rejected']:
+                    self._log(f"Position gone, TP order {tp_status}", "WARN")
+                    self.session.position = None
+                    return None
+            except Exception as e:
+                self._log(f"Error checking TP order: {e}", "WARN")
 
-        except Exception as e:
-            self._log(f"Error checking position: {e}", "WARN")
+        # Use Alpaca data if available (like COIN does)
+        if alpaca_pos:
+            current_price = float(alpaca_pos.get('current_price', 0))
+            pnl_pct = float(alpaca_pos.get('unrealized_plpc', 0))
+            pnl_dollars = float(alpaca_pos.get('unrealized_pl', 0))
+            entry_price = float(alpaca_pos.get('avg_entry_price', pos.entry_price))
+            market_value = float(alpaca_pos.get('market_value', 0))
+            cost_basis = float(alpaca_pos.get('cost_basis', 0))
+
+            # Update local position with Alpaca's actual entry price
+            if abs(entry_price - pos.entry_price) > 0.01:
+                self._log(f"Updating entry from Alpaca: ${pos.entry_price:.2f} -> ${entry_price:.2f}", "INFO")
+                pos.entry_price = entry_price
+
+            # Store current data for exit
+            pos.current_price = current_price
+            pos.pnl_pct = pnl_pct
+            pos.pnl_dollars = pnl_dollars
+
+            # Log status with Alpaca data
+            self._log(f"[ALPACA] {pos.option_symbol} Entry=${entry_price:.2f} Current=${current_price:.2f} "
+                     f"P&L=${pnl_dollars:+.2f} ({pnl_pct:+.1f}%) MktVal=${market_value:.2f}")
+
+            # Check stop loss using Alpaca P&L
+            if pnl_pct <= -self.config.stop_loss_pct:
+                return "STOP_LOSS"
+
+        else:
+            # Fallback to quote-based pricing if Alpaca position not found
+            try:
+                option_quote = self.client.get_latest_option_quote(pos.option_symbol)
+                if option_quote:
+                    self.latest_option_quote = option_quote
+                    current_price = option_quote.mid
+                    pnl_pct = (current_price - pos.entry_price) / pos.entry_price * 100
+                    pnl_dollars = (current_price - pos.entry_price) * pos.qty * 100
+
+                    pos.current_price = current_price
+                    pos.pnl_pct = pnl_pct
+                    pos.pnl_dollars = pnl_dollars
+
+                    self._log(f"[QUOTE] {pos.option_symbol} Entry=${pos.entry_price:.2f} Current=${current_price:.2f} "
+                             f"P&L=${pnl_dollars:+.2f} ({pnl_pct:+.1f}%)")
+
+                    if pnl_pct <= -self.config.stop_loss_pct:
+                        return "STOP_LOSS"
+            except Exception as e:
+                self._log(f"Error getting quote: {e}", "WARN")
 
         # Check max hold time
         hold_minutes = (now - pos.entry_time).total_seconds() / 60
@@ -572,19 +726,27 @@ class MARAContinuousTradingEngine:
             except:
                 pass
 
-        # Get exit price
-        exit_price = pos.entry_price  # Default
+        # Get exit price - use stored exit_price if available (e.g., from TP fill)
+        exit_price = pos.exit_price if pos.exit_price else pos.current_price
         exit_order_id = ""
 
+        # Use stored Alpaca P&L data if available (from _check_position)
+        pnl_dollars_from_alpaca = pos.pnl_dollars if pos.pnl_dollars else None
+        pnl_pct_from_alpaca = pos.pnl_pct if pos.pnl_pct else None
+
         if reason == "TAKE_PROFIT":
-            # TP was filled, get fill price
+            # TP was filled, get fill price from order
             try:
                 order_status = self.client.get_order_status(pos.tp_order_id)
                 if order_status:
-                    exit_price = order_status.get('filled_avg_price', pos.entry_price * 1.075)
+                    fill_price = order_status.get('filled_avg_price')
+                    if fill_price is not None:
+                        exit_price = float(fill_price)
                     exit_order_id = pos.tp_order_id
             except:
-                exit_price = pos.entry_price * (1 + self.config.target_profit_pct / 100)
+                # Fallback to expected TP price
+                if not exit_price:
+                    exit_price = pos.entry_price * (1 + self.config.target_profit_pct / 100)
         else:
             # Market sell
             try:
@@ -595,18 +757,42 @@ class MARAContinuousTradingEngine:
                     order_type="market"
                 )
                 if sell_result and sell_result.get('success'):
-                    exit_price = sell_result.get('filled_avg_price', pos.entry_price)
+                    fill_price = sell_result.get('filled_avg_price')
+                    if fill_price is not None:
+                        exit_price = float(fill_price)
                     exit_order_id = sell_result.get('order_id', '')
+                    self._log(f"  Sell order placed: {exit_order_id}", "TRADE")
             except Exception as e:
                 self._log(f"  Error selling: {e}", "ERROR")
-                if self.latest_option_quote:
-                    exit_price = self.latest_option_quote.mid
 
-        # Calculate P&L
-        gross_pnl = (exit_price - pos.entry_price) * pos.qty * 100
-        fees = pos.qty * 1.30  # Estimated fees
-        net_pnl = gross_pnl - fees
-        pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
+        # Final fallback - try to get current quote
+        if not exit_price or exit_price <= 0:
+            try:
+                current_quote = self.client.get_latest_option_quote(pos.option_symbol)
+                if current_quote:
+                    exit_price = current_quote.mid
+            except:
+                pass
+
+        # Last resort fallback
+        if not exit_price or exit_price <= 0:
+            exit_price = pos.entry_price
+            self._log(f"  Warning: Using entry price as exit price fallback", "WARN")
+
+        # Use Alpaca P&L if available, otherwise calculate
+        if pnl_dollars_from_alpaca is not None and pnl_pct_from_alpaca is not None:
+            gross_pnl = pnl_dollars_from_alpaca
+            pnl_pct = pnl_pct_from_alpaca
+            fees = pos.qty * 1.30  # Estimated fees
+            net_pnl = gross_pnl - fees
+            self._log(f"  [ALPACA P&L] Gross: ${gross_pnl:+.2f} ({pnl_pct:+.1f}%)", "TRADE")
+        else:
+            # Calculate P&L manually as fallback
+            gross_pnl = (exit_price - pos.entry_price) * pos.qty * 100
+            fees = pos.qty * 1.30  # Estimated fees
+            net_pnl = gross_pnl - fees
+            pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100 if pos.entry_price > 0 else 0
+
         hold_minutes = (now - pos.entry_time).total_seconds() / 60
 
         self._log(f"  Exit Price: ${exit_price:.2f}", "TRADE")
@@ -664,6 +850,247 @@ class MARAContinuousTradingEngine:
             self._log(f"  MARA: ${self.latest_underlying_quote.mid:.2f}")
         print()
 
+    def _resume_existing_positions(self):
+        """Check for and resume any existing MARA options positions from Alpaca.
+
+        Uses multiple methods like COIN engine:
+        1. Direct positions API (REST + SDK)
+        2. Open SELL orders as backup (TP orders indicate position exists)
+        3. Cancel orphaned TP orders if position is gone
+        """
+        self._log("Checking for existing MARA options positions...")
+        try:
+            # Method 0: Try direct REST API first (most reliable)
+            self._log("  Trying direct REST API...")
+            all_positions = self.client.get_positions_raw()
+
+            # Method 1: Also try SDK if REST returned nothing
+            if not all_positions:
+                self._log("  REST returned nothing, trying SDK...")
+                all_positions = self.client.get_positions()
+
+            # METHOD 2: If positions API is empty, check open SELL orders as backup
+            # (Like COIN engine does - if there's a TP SELL order, position MUST exist)
+            if not all_positions:
+                self._log("  Positions API empty - checking open orders as backup...", "INFO")
+                try:
+                    open_orders = self.client.get_open_orders("MARA")
+                    self._log(f"  Found {len(open_orders)} open orders for MARA")
+
+                    for order in open_orders:
+                        symbol = order.get('symbol', '')
+                        side = order.get('side', '')
+                        order_id = order.get('id', '')
+
+                        # Look for SELL orders (these are TP orders) - position MUST exist!
+                        if side == 'sell' and 'MARA' in symbol and len(symbol) > 10:
+                            self._log(f"  FOUND TP ORDER (position must exist): {symbol}", "WARN")
+                            self._log(f"    Order ID: {order_id}", "WARN")
+                            self._log(f"    Limit Price: ${float(order.get('limit_price', 0)):.2f}", "WARN")
+                            self._log(f"    Qty: {order.get('qty')}", "WARN")
+
+                            # Recover position from TP order info (like COIN does)
+                            qty = int(float(order.get('qty', 0)))
+                            tp_price = float(order.get('limit_price', 0))
+                            # Estimate entry price from TP price (TP = entry * 1.075)
+                            estimated_entry = tp_price / (1 + self.config.target_profit_pct / 100)
+
+                            # Parse OCC symbol for strike and expiry
+                            # Format: MARA251212P00012000
+                            try:
+                                opt_type = 'put' if 'P' in symbol[10:12] else 'call'
+                                strike = int(symbol[-8:]) / 1000
+                                expiry_str = symbol[4:10]  # YYMMDD
+                                expiry = datetime.strptime(f"20{expiry_str}", "%Y%m%d")
+                            except Exception:
+                                opt_type = 'put'
+                                strike = 12.0
+                                expiry = datetime.now(EST)
+
+                            # Create position object from TP order
+                            self.session.position = Position(
+                                symbol=self.config.underlying_symbol,
+                                option_symbol=symbol,
+                                option_type=opt_type,
+                                strike=strike,
+                                expiration=expiry,
+                                entry_price=estimated_entry,
+                                entry_time=datetime.now(EST),  # Approximation
+                                qty=qty,
+                                entry_order_id='recovered',
+                                tp_order_id=order_id,  # Keep the existing TP order!
+                                entry_underlying_price=0
+                            )
+
+                            self._log("=" * 70, "SUCCESS")
+                            self._log(f">>> POSITION RECOVERED FROM TP ORDER", "SUCCESS")
+                            self._log(f"    Symbol: {symbol}", "SUCCESS")
+                            self._log(f"    Type: {opt_type.upper()} | Strike: ${strike:.2f}", "SUCCESS")
+                            self._log(f"    Qty: {qty} | Est. Entry: ${estimated_entry:.2f}", "SUCCESS")
+                            self._log(f"    TP: ${tp_price:.2f} | SL: ${estimated_entry * (1 - self.config.stop_loss_pct / 100):.2f}", "SUCCESS")
+                            self._log(f"    TP Order ID: {order_id}", "SUCCESS")
+                            self._log("=" * 70, "SUCCESS")
+                            self._log(">>> RESUMING POSITION MANAGEMENT <<<", "SUCCESS")
+
+                            self.session.trades_today = 1
+                            return True
+
+                except Exception as e:
+                    self._log(f"  Error checking open orders: {e}", "WARN")
+
+            self._log(f"  Found {len(all_positions)} total positions (all asset classes)")
+
+            # Log what we see for debugging
+            for p in all_positions:
+                self._log(f"    Position: {p.get('symbol', '?')} qty={p.get('qty', 0)}")
+
+            # Method 2: Try direct symbol lookup for specific MARA options
+            # Generate possible symbols based on current date
+            now = datetime.now(EST)
+            direct_symbols = []
+
+            # Check this week and next week
+            for week_offset in [0, 7]:
+                # Find Friday
+                days_until_friday = (4 - now.weekday()) % 7
+                if days_until_friday == 0 and now.hour >= 16:
+                    days_until_friday = 7
+                expiry = now + timedelta(days=days_until_friday + week_offset)
+                expiry_str = expiry.strftime("%y%m%d")
+
+                # Check common strikes around $12 (MARA's typical price)
+                for strike in [11.0, 11.5, 12.0, 12.5, 13.0]:
+                    strike_int = int(strike * 1000)
+                    for opt_type in ['P', 'C']:
+                        symbol = f"MARA{expiry_str}{opt_type}{strike_int:08d}"
+                        direct_symbols.append(symbol)
+
+            self._log(f"  Checking {len(direct_symbols)} possible MARA option symbols...")
+
+            mara_positions = []
+
+            # First check all_positions for MARA symbols
+            for pos in all_positions:
+                symbol = pos.get('symbol', '')
+                if symbol.startswith('MARA') and len(symbol) > 10:  # Option symbols are long
+                    qty = int(float(pos.get('qty', 0)))  # Convert string to int
+                    if qty > 0:
+                        pos['qty'] = qty  # Update with converted value
+                        mara_positions.append(pos)
+                        self._log(f"    Found in all_positions: {symbol}", "SUCCESS")
+
+            # Also try direct lookup for each potential symbol
+            for sym in direct_symbols:
+                try:
+                    direct_pos = self.client.get_position_by_symbol(sym)
+                    if direct_pos:
+                        qty = int(float(direct_pos.get('qty', 0)))  # Convert string to int
+                        if qty > 0:
+                            direct_pos['qty'] = qty  # Update with converted value
+                            # Check not already in list
+                            if not any(p.get('symbol') == sym for p in mara_positions):
+                                mara_positions.append(direct_pos)
+                                self._log(f"    Found via direct lookup: {sym}", "SUCCESS")
+                except Exception as e:
+                    pass  # Symbol not found is expected for most
+
+            # Also try to get options positions specifically
+            try:
+                opt_positions = self.client.get_options_positions()
+                self._log(f"  get_options_positions() returned {len(opt_positions)} positions")
+                for pos in opt_positions:
+                    symbol = pos.get('symbol', '')
+                    if symbol.startswith('MARA'):
+                        if not any(p.get('symbol') == symbol for p in mara_positions):
+                            mara_positions.append(pos)
+                            self._log(f"    Found via options API: {symbol}", "SUCCESS")
+            except Exception as e:
+                self._log(f"  get_options_positions error: {e}", "WARN")
+
+            # Process any MARA positions found
+            for pos in mara_positions:
+                symbol = pos.get('symbol', '')
+                qty = int(float(pos.get('qty', 0)))  # Ensure qty is int
+
+                if qty <= 0:
+                    continue  # Skip closed positions
+
+                entry_price = float(pos.get('avg_entry_price', 0))
+                current_price = float(pos.get('current_price', entry_price))
+                market_value = float(pos.get('market_value', 0))
+                cost_basis = float(pos.get('cost_basis', entry_price * qty * 100))
+
+                # P&L from Alpaca (already normalized by get_positions_raw)
+                # unrealized_pl is dollar P&L, unrealized_plpc is percentage
+                unrealized_pnl = float(pos.get('unrealized_pl', 0))
+                pnl_pct = float(pos.get('unrealized_plpc', 0))
+
+                # Parse option type from symbol (C for call, P for put after date)
+                # Symbol format: MARA251212P00012000
+                opt_type = 'put' if 'P' in symbol[10:12] else 'call'
+
+                # Parse strike from symbol (last 8 chars / 1000)
+                try:
+                    strike = int(symbol[-8:]) / 1000
+                except:
+                    strike = 0
+
+                self._log("=" * 70)
+                self._log(f">>> FOUND EXISTING POSITION: {symbol}", "SUCCESS")
+                self._log(f"    Type: {opt_type.upper()} | Strike: ${strike:.2f}", "SUCCESS")
+                self._log(f"    Qty: {qty} | Entry: ${entry_price:.2f} | Current: ${current_price:.2f}", "SUCCESS")
+                self._log(f"    Cost Basis: ${cost_basis:.2f} | Market Value: ${market_value:.2f}", "SUCCESS")
+                self._log(f"    P&L: ${unrealized_pnl:.2f} ({pnl_pct:+.1f}%)", "SUCCESS")
+                self._log("=" * 70)
+
+                # Create position object to track it
+                self.session.position = Position(
+                    symbol=self.config.underlying_symbol,
+                    option_symbol=symbol,
+                    option_type=opt_type,
+                    strike=strike,
+                    expiration=datetime.now(EST),  # Placeholder
+                    entry_price=float(entry_price),
+                    entry_time=datetime.now(EST),  # We don't know actual entry time
+                    qty=int(qty),
+                    entry_order_id='resumed',
+                    tp_order_id='',
+                    entry_underlying_price=0
+                )
+                self._log(">>> RESUMING POSITION MANAGEMENT <<<", "SUCCESS")
+                return True
+
+            # Check buying power to see if funds are tied up (indicates position exists)
+            try:
+                account = self.client.get_account()
+                buying_power = float(account.get('buying_power', 0))
+                cash = float(account.get('cash', 0))
+                equity = float(account.get('equity', 0))
+                self._log(f"  Account: Cash=${cash:.2f} | BP=${buying_power:.2f} | Equity=${equity:.2f}")
+
+                # If buying power is very low but we didn't find a position,
+                # something is wrong - maybe check recent orders
+                if buying_power < 50:
+                    self._log("  >>> LOW BUYING POWER - checking recent orders...", "WARN")
+                    try:
+                        recent_orders = self.client.get_orders(status='all', limit=10)
+                        for order in recent_orders:
+                            if 'MARA' in order.get('symbol', ''):
+                                self._log(f"    Recent order: {order.get('symbol')} {order.get('side')} "
+                                         f"qty={order.get('qty')} status={order.get('status')}", "WARN")
+                    except:
+                        pass
+            except Exception as e:
+                self._log(f"  Account check error: {e}", "WARN")
+
+            self._log("No existing MARA positions found.")
+            return False
+        except Exception as e:
+            self._log(f"Error checking positions: {e}", "ERROR")
+            import traceback
+            traceback.print_exc()
+            return False
+
     def run(self):
         """Main trading loop."""
         self._log("Starting MARA Continuous Trading Engine")
@@ -672,6 +1099,9 @@ class MARAContinuousTradingEngine:
         self._log(f"  Cooldown: {self.config.cooldown_minutes}m between trades")
         self._log(f"  Max Trades/Day: {self.config.max_trades_per_day}")
         self._log(f"  Expiry: Weekly (min {self.config.min_days_to_expiry} DTE)")
+
+        # Check for existing positions on startup
+        self._resume_existing_positions()
 
         self.session.is_running = True
         poll_count = 0
@@ -738,16 +1168,31 @@ class MARAContinuousTradingEngine:
                                      f"Vol: {volume_analysis.trend}({volume_analysis.volume_ratio:.1f}x)")
 
                             if should_enter:
-                                self._log(f"ENTRY SIGNAL: {direction}", "SIGNAL")
+                                self._log(f"V3 SIGNAL: {direction} -> {'CALLS' if direction == 'BULLISH' else 'PUTS'}", "SIGNAL")
                                 self._log(f"  Reasons: {', '.join(reasons)}", "SIGNAL")
 
-                                # Find ATM contract
-                                contract = self._find_atm_strike_manual(direction)
+                                # ========== V4 PULLBACK DETECTION LAYER (5-MIN HTF) ==========
+                                self._log("-" * 50)
+                                self._log("V4 PULLBACK DETECTION (5-min HTF)", "INFO")
 
-                                if contract and contract.is_valid:
-                                    self._enter_position(contract, direction)
+                                pullback_result = self._check_pullback_htf(direction)
+
+                                if pullback_result['ready_to_enter']:
+                                    self._log(f"  ✅ PULLBACK CONDITIONS MET - Entering {direction}", "SUCCESS")
+
+                                    # Find ATM contract
+                                    contract = self._find_atm_strike_manual(direction)
+
+                                    if contract and contract.is_valid:
+                                        self._enter_position(contract, direction)
+                                    else:
+                                        self._log("Could not find valid ATM contract", "WARN")
                                 else:
-                                    self._log("Could not find valid ATM contract", "WARN")
+                                    self._log(f"  ⏳ WAITING FOR BETTER ENTRY...", "WARN")
+                                    self._log(f"     Pullback: {'YES' if pullback_result['pullback_detected'] else 'NO'} (score: {pullback_result['pullback_score']})")
+                                    self._log(f"     Recovery: {'YES' if pullback_result['recovery_detected'] else 'NO'} (score: {pullback_result['recovery_score']})")
+                                    for reason in pullback_result.get('reasons', [])[-5:]:
+                                        self._log(f"       - {reason}")
                             else:
                                 if direction in ["CONFLICT", "NEUTRAL", "NONE"]:
                                     self._log(f"  No entry: {direction} - {', '.join(reasons)}")

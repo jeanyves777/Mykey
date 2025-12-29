@@ -12,6 +12,7 @@ import asyncio
 import signal
 import sys
 from datetime import datetime, time, timedelta
+from decimal import Decimal
 from typing import Optional, Dict, Any, Callable
 from dataclasses import dataclass, field
 import pytz
@@ -101,16 +102,37 @@ class LiveTradingEngine:
             paper=False  # LIVE TRADING
         )
 
-        # Strategy config (for max_trades_per_day and other strategy-specific settings)
+        # Strategy config - Load all parameters from config file
         self.strategy_config = COINDaily0DTEMomentumConfig(
             underlying_symbol=config.underlying_symbol,
             fixed_position_value=config.fixed_position_value,
-            target_profit_pct=config.target_profit_pct,
-            stop_loss_pct=config.stop_loss_pct,
+            target_profit_pct=Decimal(str(config.target_profit_pct)),
+            stop_loss_pct=Decimal(str(config.stop_loss_pct)),
+            # Trailing stop settings
+            trailing_stop_enabled=getattr(config, 'trailing_stop_enabled', True),
+            trailing_trigger_pct=Decimal(str(getattr(config, 'trailing_trigger_pct', 10.0))),
+            trailing_distance_pct=Decimal(str(getattr(config, 'trailing_distance_pct', 15.0))),
+            # Hold time settings
+            min_hold_minutes=getattr(config, 'min_hold_minutes', 5),
             max_hold_minutes=config.max_hold_minutes,
             entry_time_start=config.entry_time_start,
             entry_time_end=config.entry_time_end,
             force_exit_time=config.force_exit_time,
+            # Technical indicator settings
+            fast_ema_period=getattr(config, 'fast_ema_period', 9),
+            slow_ema_period=getattr(config, 'slow_ema_period', 20),
+            rsi_period=getattr(config, 'rsi_period', 14),
+            macd_fast_period=getattr(config, 'macd_fast_period', 12),
+            macd_slow_period=getattr(config, 'macd_slow_period', 26),
+            macd_signal_period=getattr(config, 'macd_signal_period', 9),
+            bb_period=getattr(config, 'bb_period', 20),
+            bb_std_dev=getattr(config, 'bb_std_dev', 2.0),
+            # Option filtering settings
+            min_volume_ratio=getattr(config, 'min_volume_ratio', 1.0),
+            max_bid_ask_spread_pct=getattr(config, 'max_bid_ask_spread_pct', 30.0),
+            min_option_premium=getattr(config, 'min_option_premium', 2.0),
+            max_option_premium=getattr(config, 'max_option_premium', 30.0),
+            max_trades_per_day=getattr(config, 'max_trades_per_day', 1),
         )
 
         # Get max_trades_per_day from strategy (if config value is 0, use strategy default)

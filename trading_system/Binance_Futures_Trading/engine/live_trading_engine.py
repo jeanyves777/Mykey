@@ -1,0 +1,3332 @@
+"""
+Binance Futures Live Trading Engine
+===================================
+Real trading with actual orders on Binance Futures
+"""
+
+import os
+import sys
+import json
+import time
+import pandas as pd
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+from dataclasses import dataclass
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config.trading_config import (
+    FUTURES_SYMBOLS, FUTURES_SYMBOLS_LIVE, FUTURES_SYMBOLS_DEMO,
+    STRATEGY_CONFIG, RISK_CONFIG, DCA_CONFIG,
+    LOGGING_CONFIG, MOMENTUM_CONFIG, BINANCE_CONFIG, SYMBOL_SETTINGS
+)
+from engine.binance_client import BinanceClient
+from engine.momentum_signal import MasterMomentumSignal, MultiTimeframeMomentumSignal, TradingSignal, SignalType
+
+
+@dataclass
+class LivePosition:
+    """Represents a live position on Binance"""
+    symbol: str
+    side: str                      # "LONG" or "SHORT"
+    entry_price: float
+    quantity: float
+    entry_time: datetime
+    stop_loss_order_id: Optional[int] = None
+    take_profit_order_id: Optional[int] = None
+    dca_count: int = 0
+    avg_entry_price: float = 0.0
+    margin_used: float = 0.0       # Total margin used for this symbol
+    # Trailing TP tracking
+    peak_roi: float = 0.0          # Highest ROI reached
+    trailing_active: bool = False  # True when trailing TP is activated
+    tp_cancelled: bool = False     # True when Binance TP order was cancelled for trailing
+    # Hedge tracking
+    is_hedged: bool = False        # True if this position has a hedge open
+    hedge_side: Optional[str] = None  # Side of hedge position ("LONG" or "SHORT")
+    waiting_for_breakeven: bool = False  # True if waiting to exit at breakeven
+    hedge_start_time: Optional[datetime] = None  # When hedge was opened
+
+
+class BinanceLiveTradingEngine:
+    """
+    Live Trading Engine for Binance Futures
+
+    WARNING: This engine places REAL orders with REAL money!
+    Use with caution. Always test on testnet first.
+    """
+
+    def __init__(self, testnet: bool = True, use_mtf: bool = True):
+        """
+        Initialize live trading engine
+
+        Args:
+            testnet: If True, use Binance testnet (RECOMMENDED for testing)
+            use_mtf: Use multi-timeframe signal confirmation
+        """
+        # Initialize client
+        self.client = BinanceClient(testnet=testnet)
+        self.testnet = testnet
+
+        # Select symbols based on mode (LIVE = DOTUSDT only, DEMO = all symbols)
+        if testnet:
+            self.symbols = FUTURES_SYMBOLS_DEMO
+        else:
+            self.symbols = FUTURES_SYMBOLS_LIVE
+            print(f"[LIVE MODE] Trading only: {', '.join(self.symbols)}")
+
+        # Initialize signal generator
+        if use_mtf:
+            self.signal_generator = MultiTimeframeMomentumSignal()
+        else:
+            self.signal_generator = MasterMomentumSignal()
+        self.use_mtf = use_mtf
+
+        # Track our positions locally
+        self.positions: Dict[str, LivePosition] = {}
+
+        # Dynamic Fund Allocation
+        self.num_symbols = len(self.symbols)
+        self.symbol_budgets: Dict[str, float] = {}      # Max budget per symbol
+        self.symbol_margin_used: Dict[str, float] = {}  # Current margin used per symbol
+        self.leverage = STRATEGY_CONFIG["leverage"]      # Fixed 20x leverage
+
+        # Daily tracking
+        self.daily_trades = 0
+        self.daily_pnl = 0.0
+        self.daily_wins = 0
+        self.daily_losses = 0
+        self.starting_balance = 0.0
+        self.daily_start_balance = 0.0  # Balance at start of day (for daily loss limit)
+        self.last_reset_date = datetime.now().date()
+
+        # Symbol tracking
+        self.last_check_time: Dict[str, datetime] = {}
+        self.symbol_check_interval = 60  # seconds
+
+        # Data buffer for SMART DCA (stores recent market data per symbol)
+        self.data_buffer: Dict[str, any] = {}
+
+        # Hybrid Hold + Trade System tracking
+        self.current_trend: Dict[str, str] = {}   # Current detected trend per symbol ("BULLISH"/"BEARISH")
+        self.last_trend_check: Dict[str, datetime] = {}  # Last trend check time per symbol
+        self.trend_check_interval = 60  # Check trend every 60 seconds
+        self.last_flip_time: Dict[str, datetime] = {}  # Last flip time per symbol (for cooldown)
+
+        # Pending re-entry after TP (for ALWAYS HOLD strategy)
+        self.pending_reentry: Dict[str, str] = {}  # symbol -> side to re-enter ("LONG"/"SHORT")
+
+        # HEDGE MODE: Track positions by symbol_side key (e.g., "BTCUSDT_LONG", "BTCUSDT_SHORT")
+        # When hedge_mode enabled, we track BOTH LONG and SHORT positions per symbol
+        self.hedge_mode = DCA_CONFIG.get("hedge_mode", {}).get("enabled", False)
+        self.hedge_budget_split = DCA_CONFIG.get("hedge_mode", {}).get("budget_split", 0.5)
+
+        # Logging
+        self.log_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "Binance_Futures_Trading",
+            LOGGING_CONFIG["log_dir"]
+        )
+        os.makedirs(self.log_dir, exist_ok=True)
+
+        # Trade history
+        self.trades = []
+
+        self.running = False
+
+    def log(self, message: str, level: str = "INFO"):
+        """Print log message with timestamp"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        mode = "TESTNET" if self.testnet else "LIVE"
+        print(f"[{timestamp}] [{mode}] [{level}] {message}")
+
+    def log_trade(self, symbol: str, side: str, entry_price: float, exit_price: float,
+                  quantity: float, pnl: float, exit_type: str, dca_level: int = 0):
+        """
+        Log a closed trade to JSON file for permanent record.
+        This ensures we track all trades even if the bot restarts.
+        """
+        trade_record = {
+            "timestamp": datetime.now().isoformat(),
+            "symbol": symbol,
+            "side": side,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "quantity": quantity,
+            "pnl": pnl,
+            "pnl_pct": (pnl / (entry_price * quantity / self.leverage)) * 100 if entry_price > 0 else 0,
+            "exit_type": exit_type,  # "TP", "SL", "AUTO_CLOSE", "MANUAL"
+            "dca_level": dca_level,
+            "leverage": self.leverage,
+            "testnet": self.testnet
+        }
+
+        # Add to in-memory list
+        self.trades.append(trade_record)
+
+        # Save to JSON file
+        trade_log_path = os.path.join(self.log_dir, LOGGING_CONFIG["trade_log_file"])
+        try:
+            # Load existing trades
+            if os.path.exists(trade_log_path):
+                with open(trade_log_path, 'r') as f:
+                    all_trades = json.load(f)
+            else:
+                all_trades = []
+
+            # Append new trade
+            all_trades.append(trade_record)
+
+            # Save back
+            with open(trade_log_path, 'w') as f:
+                json.dump(all_trades, f, indent=2)
+
+            self.log(f"Trade logged: {symbol} {side} | P&L: ${pnl:+.2f} | Exit: {exit_type}")
+
+        except Exception as e:
+            self.log(f"Error logging trade: {e}", level="WARN")
+
+    def setup_symbol(self, symbol: str):
+        """Set up a symbol for trading (leverage, margin type)"""
+        try:
+            # Set leverage
+            leverage = STRATEGY_CONFIG["leverage"]
+            self.client.set_leverage(symbol, leverage)
+            self.log(f"Set leverage for {symbol}: {leverage}x")
+
+            # Set margin type (ISOLATED for safety)
+            try:
+                self.client.set_margin_type(symbol, "ISOLATED")
+                self.log(f"Set margin type for {symbol}: ISOLATED")
+            except Exception as e:
+                # May fail if already set
+                pass
+
+        except Exception as e:
+            self.log(f"Error setting up {symbol}: {e}", level="WARN")
+
+    def initialize_dynamic_allocation(self):
+        """
+        Initialize dynamic fund allocation based on current balance.
+        Divides balance equally among all symbols.
+        """
+        # If hedge mode is enabled, ensure Binance account is set to Hedge Mode
+        if self.hedge_mode:
+            self.log("HEDGE MODE: Checking Binance position mode...", level="INFO")
+            if self.client.ensure_hedge_mode():
+                self.log("HEDGE MODE: Binance account is in Hedge Mode (Dual Side Position)", level="INFO")
+            else:
+                self.log("HEDGE MODE: WARNING - Could not enable Hedge Mode on Binance!", level="WARN")
+                self.log("  You may need to close all positions first, then enable manually", level="WARN")
+
+        balance = self.client.get_balance()
+
+        # Apply buffer for fees/safety
+        buffer = RISK_CONFIG.get("allocation_buffer_pct", 0.05)
+        available_balance = balance * (1 - buffer)
+
+        # Calculate budget per symbol
+        budget_per_symbol = available_balance / self.num_symbols
+
+        self.log(f"Dynamic Allocation: ${balance:.2f} balance")
+        self.log(f"  Buffer: {buffer*100:.1f}% reserved for fees")
+        self.log(f"  Available: ${available_balance:.2f}")
+        self.log(f"  Symbols: {self.num_symbols}")
+        self.log(f"  Budget per symbol: ${budget_per_symbol:.2f}")
+        if self.hedge_mode:
+            self.log(f"  HEDGE MODE: ${budget_per_symbol * self.hedge_budget_split:.2f} per side (LONG + SHORT)")
+        self.log(f"  Leverage: {self.leverage}x (ISOLATED)")
+
+        # Initialize budgets for each symbol
+        for symbol in self.symbols:
+            self.symbol_budgets[symbol] = budget_per_symbol
+            self.symbol_margin_used[symbol] = 0.0
+
+        return budget_per_symbol
+
+    # =========================================================================
+    # HEDGE MODE HELPER FUNCTIONS
+    # =========================================================================
+
+    def get_position_key(self, symbol: str, side: str = None) -> str:
+        """
+        Get position tracking key.
+        In hedge mode: returns 'SYMBOL_SIDE' (e.g., 'BTCUSDT_LONG')
+        In normal mode: returns 'SYMBOL' (e.g., 'BTCUSDT')
+        """
+        if self.hedge_mode and side:
+            return f"{symbol}_{side}"
+        return symbol
+
+    def get_symbol_from_key(self, key: str) -> str:
+        """Extract symbol from position key (handles both 'BTCUSDT' and 'BTCUSDT_LONG')"""
+        if "_LONG" in key:
+            return key.replace("_LONG", "")
+        if "_SHORT" in key:
+            return key.replace("_SHORT", "")
+        return key
+
+    def get_side_from_key(self, key: str) -> str:
+        """Extract side from position key"""
+        if "_LONG" in key:
+            return "LONG"
+        if "_SHORT" in key:
+            return "SHORT"
+        return None
+
+    def has_position(self, symbol: str, side: str = None) -> bool:
+        """
+        Check if we have a position in this symbol (optionally for specific side).
+        In hedge mode, checks for specific side.
+        In normal mode, checks for any position.
+        """
+        if self.hedge_mode:
+            if side:
+                key = self.get_position_key(symbol, side)
+                return key in self.positions
+            else:
+                # Check if any position exists for this symbol
+                return f"{symbol}_LONG" in self.positions or f"{symbol}_SHORT" in self.positions
+        else:
+            return symbol in self.positions
+
+    def get_position(self, symbol: str, side: str = None) -> Optional[LivePosition]:
+        """Get position for symbol (and optionally side in hedge mode)"""
+        key = self.get_position_key(symbol, side)
+        return self.positions.get(key)
+
+    def get_all_positions_for_symbol(self, symbol: str) -> List[LivePosition]:
+        """Get all positions for a symbol (both LONG and SHORT in hedge mode)"""
+        if self.hedge_mode:
+            positions = []
+            if f"{symbol}_LONG" in self.positions:
+                positions.append(self.positions[f"{symbol}_LONG"])
+            if f"{symbol}_SHORT" in self.positions:
+                positions.append(self.positions[f"{symbol}_SHORT"])
+            return positions
+        else:
+            if symbol in self.positions:
+                return [self.positions[symbol]]
+            return []
+
+    def get_hedge_entry_margin(self, symbol: str) -> float:
+        """Get margin for hedge mode entry (split between LONG and SHORT)"""
+        if symbol not in self.symbol_budgets:
+            return 0.0
+        budget = self.symbol_budgets[symbol]
+        entry_pct = RISK_CONFIG.get("initial_entry_pct", 0.20)
+        # In hedge mode, split the budget between LONG and SHORT
+        hedge_split = self.hedge_budget_split  # 0.5 = 50% each side
+        return budget * entry_pct * hedge_split
+
+    def get_entry_margin(self, symbol: str, side: str = None) -> float:
+        """Get margin for initial entry (20% of symbol budget, or 10% per side in hedge mode)."""
+        if symbol not in self.symbol_budgets:
+            return 0.0
+        budget = self.symbol_budgets[symbol]
+
+        # In hedge mode, split the budget between LONG and SHORT
+        if self.hedge_mode:
+            budget = budget * self.hedge_budget_split
+        entry_pct = RISK_CONFIG.get("initial_entry_pct", 0.20)
+        return budget * entry_pct
+
+    def get_dca_margin(self, symbol: str, dca_level: int, side: str = None) -> float:
+        """Get margin for DCA level (1-4). In hedge mode, split by side."""
+        if symbol not in self.symbol_budgets:
+            return 0.0
+        budget = self.symbol_budgets[symbol]
+
+        # In hedge mode, split the budget between LONG and SHORT
+        if self.hedge_mode:
+            budget = budget * self.hedge_budget_split
+
+        dca_pcts = {
+            1: RISK_CONFIG.get("dca1_pct", 0.25),
+            2: RISK_CONFIG.get("dca2_pct", 0.20),
+            3: RISK_CONFIG.get("dca3_pct", 0.20),
+            4: RISK_CONFIG.get("dca4_pct", 0.15),
+        }
+        return budget * dca_pcts.get(dca_level, 0.0)
+
+    def get_remaining_budget(self, symbol: str) -> float:
+        """Get remaining budget for a symbol."""
+        if symbol not in self.symbol_budgets:
+            return 0.0
+        return self.symbol_budgets[symbol] - self.symbol_margin_used.get(symbol, 0.0)
+
+    def can_afford_dca(self, symbol: str, dca_level: int) -> bool:
+        """Check if we have budget for this DCA level."""
+        required_margin = self.get_dca_margin(symbol, dca_level)
+        remaining = self.get_remaining_budget(symbol)
+        return remaining >= required_margin
+
+    def detect_dca_level_from_margin(self, symbol: str, actual_margin: float) -> int:
+        """
+        Auto-detect DCA level based on margin used.
+        This allows recovery of DCA state after bot restart.
+
+        Margin distribution:
+        - Initial entry: 10% of budget
+        - DCA 1: +15% = 25% cumulative
+        - DCA 2: +20% = 45% cumulative
+        - DCA 3: +25% = 70% cumulative
+        - DCA 4: +30% = 100% cumulative
+        """
+        if symbol not in self.symbol_budgets or actual_margin <= 0:
+            return 0
+
+        budget = self.symbol_budgets[symbol]
+
+        # Calculate cumulative margin thresholds
+        entry_pct = RISK_CONFIG.get("initial_entry_pct", 0.10)
+        dca1_pct = RISK_CONFIG.get("dca1_pct", 0.15)
+        dca2_pct = RISK_CONFIG.get("dca2_pct", 0.20)
+        dca3_pct = RISK_CONFIG.get("dca3_pct", 0.25)
+        dca4_pct = RISK_CONFIG.get("dca4_pct", 0.30)
+
+        # Cumulative thresholds (with 10% tolerance)
+        threshold_0 = budget * entry_pct * 1.1                          # ~11% = DCA 0
+        threshold_1 = budget * (entry_pct + dca1_pct) * 1.1             # ~27.5% = DCA 1
+        threshold_2 = budget * (entry_pct + dca1_pct + dca2_pct) * 1.1  # ~49.5% = DCA 2
+        threshold_3 = budget * (entry_pct + dca1_pct + dca2_pct + dca3_pct) * 1.1  # ~77% = DCA 3
+
+        # Determine DCA level
+        if actual_margin > threshold_3:
+            return 4
+        elif actual_margin > threshold_2:
+            return 3
+        elif actual_margin > threshold_1:
+            return 2
+        elif actual_margin > threshold_0:
+            return 1
+        else:
+            return 0
+
+    def check_daily_reset(self):
+        """Reset daily counters at midnight"""
+        today = datetime.now().date()
+        if today > self.last_reset_date:
+            self.log(f"Daily reset - Previous day P&L: ${self.daily_pnl:.2f} (W:{self.daily_wins}/L:{self.daily_losses})")
+            self.daily_trades = 0
+            self.daily_pnl = 0.0
+            self.daily_wins = 0
+            self.daily_losses = 0
+            current_balance = self.client.get_balance()
+            self.daily_start_balance = current_balance  # Reset daily loss limit baseline
+            self.last_reset_date = today
+
+    def can_trade(self, symbol: str) -> tuple:
+        """
+        Check if trading is allowed.
+        Returns (can_trade: bool, reason: str)
+        """
+        try:
+            # Check daily trade limit
+            if self.daily_trades >= STRATEGY_CONFIG["max_trades_per_day"]:
+                return False, "DAILY_LIMIT"
+
+            # Check daily loss limit (use daily_start_balance, not session start)
+            current_balance = self.client.get_balance()
+            if self.daily_start_balance > 0:
+                daily_loss_pct = (self.daily_start_balance - current_balance) / self.daily_start_balance
+                if daily_loss_pct >= RISK_CONFIG["max_daily_loss_pct"]:
+                    return False, "DAILY_LOSS_LIMIT"
+
+            # Check max positions
+            positions = self.client.get_positions()
+            if len(positions) >= RISK_CONFIG["max_total_positions"]:
+                return False, "MAX_POSITIONS"
+
+            # Check if already have position in this symbol
+            # In hedge mode, we can have BOTH LONG and SHORT, so check differently
+            if self.hedge_mode:
+                # In hedge mode, we allow up to 2 positions per symbol (LONG + SHORT)
+                has_long = f"{symbol}_LONG" in self.positions
+                has_short = f"{symbol}_SHORT" in self.positions
+                if has_long and has_short:
+                    return False, "HAS_BOTH_POSITIONS"
+            else:
+                # Normal mode - only one position per symbol
+                if symbol in self.positions:
+                    return False, "HAS_POSITION"
+
+            # Check symbol cooldown
+            last_check = self.last_check_time.get(symbol, datetime.min)
+            cooldown_remaining = self.symbol_check_interval - (datetime.now() - last_check).total_seconds()
+            if cooldown_remaining > 0:
+                return False, f"COOLDOWN_{int(cooldown_remaining)}s"
+
+            return True, "OK"
+        except Exception as e:
+            # If we can't check, allow trading but log the error
+            self.log(f"Warning: can_trade check failed for {symbol}: {e}", level="WARN")
+            return True, "OK"
+
+    # =========================================================================
+    # HYBRID HOLD + TRADE SYSTEM - TREND DETECTION
+    # =========================================================================
+
+    def detect_trend(self, symbol: str, df: pd.DataFrame = None, strict: bool = True) -> str:
+        """
+        Detect current market trend for a symbol.
+
+        Args:
+            symbol: Trading pair
+            df: Optional DataFrame with OHLCV data
+            strict: If True, use strict detection (for trend flip detection)
+                    If False, use simple detection (for auto-entry - ALWAYS returns a direction)
+
+        STRICT MODE (for detecting trend changes):
+        - EMA crossover with separation threshold
+        - Price position relative to EMAs
+        - RSI confirmation
+        - ADX trend strength
+        - Multiple candles confirming
+        - Can return "NEUTRAL"
+
+        SIMPLE MODE (for auto-entry):
+        - Just looks at EMA direction
+        - ALWAYS returns "BULLISH" or "BEARISH" (never NEUTRAL)
+
+        Returns: "BULLISH", "BEARISH", or "NEUTRAL" (only in strict mode)
+        """
+        try:
+            # Get market data if not provided
+            if df is None:
+                market_data = self.client.get_market_data(symbol)
+                if not market_data or "1m" not in market_data:
+                    return "BULLISH" if not strict else "NEUTRAL"  # Default to BULLISH for auto-entry
+                df = market_data["1m"]
+
+            if df is None or len(df) < 50:
+                return "BULLISH" if not strict else "NEUTRAL"
+
+            # Get trend detection config
+            trend_config = DCA_CONFIG.get("trend_detection", {})
+            ema_fast_period = trend_config.get("ema_fast", 12)
+            ema_slow_period = trend_config.get("ema_slow", 26)
+
+            # Calculate EMAs
+            ema_fast = df["close"].ewm(span=ema_fast_period, adjust=False).mean()
+            ema_slow = df["close"].ewm(span=ema_slow_period, adjust=False).mean()
+
+            current_ema_fast = ema_fast.iloc[-1]
+            current_ema_slow = ema_slow.iloc[-1]
+
+            # Check for NaN
+            if pd.isna(current_ema_fast) or pd.isna(current_ema_slow):
+                return "BULLISH" if not strict else "NEUTRAL"
+
+            # ================================================================
+            # SIMPLE MODE: Just EMA direction (for auto-entry)
+            # Always returns a direction - NEVER neutral
+            # ================================================================
+            if not strict:
+                if current_ema_fast >= current_ema_slow:
+                    return "BULLISH"
+                else:
+                    return "BEARISH"
+
+            # ================================================================
+            # STRICT MODE: Full confirmation (for trend change detection)
+            # ================================================================
+            bullish_rsi_min = trend_config.get("bullish_rsi_min", 50)
+            bearish_rsi_max = trend_config.get("bearish_rsi_max", 50)
+            confirmation_candles = trend_config.get("confirmation_candles", 5)
+            ema_separation_pct = trend_config.get("ema_separation_pct", 0.002)
+            use_adx = trend_config.get("use_adx_filter", True)
+            adx_min = trend_config.get("adx_min_trend", 20)
+
+            # Calculate RSI
+            delta = df["close"].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+            current_rsi = rsi.iloc[-1]
+
+            if pd.isna(current_rsi):
+                return "NEUTRAL"
+
+            # Calculate ADX for trend strength
+            adx_value = 25  # Default if not calculated
+            if use_adx:
+                try:
+                    high_low = df["high"] - df["low"]
+                    high_close = (df["high"] - df["close"].shift()).abs()
+                    low_close = (df["low"] - df["close"].shift()).abs()
+                    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+                    atr = tr.rolling(window=14).mean()
+
+                    plus_dm = df["high"].diff()
+                    minus_dm = df["low"].diff().abs() * -1
+                    plus_dm = plus_dm.where((plus_dm > minus_dm.abs()) & (plus_dm > 0), 0)
+                    minus_dm = minus_dm.abs().where((minus_dm.abs() > plus_dm) & (minus_dm < 0), 0)
+
+                    plus_di = 100 * (plus_dm.rolling(window=14).mean() / atr)
+                    minus_di = 100 * (minus_dm.rolling(window=14).mean() / atr)
+                    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+                    adx = dx.rolling(window=14).mean()
+                    adx_value = adx.iloc[-1] if not pd.isna(adx.iloc[-1]) else 25
+                except:
+                    adx_value = 25  # Default on error
+
+            # Get latest values
+            current_price = df["close"].iloc[-1]
+
+            # Calculate EMA separation
+            ema_separation = abs(current_ema_fast - current_ema_slow) / current_ema_slow
+
+            # Check 1: EMA separation must be significant (avoid noise at crossover)
+            if ema_separation < ema_separation_pct:
+                return "NEUTRAL"  # EMAs too close, no clear trend
+
+            # Check 2: ADX must show trending market
+            if use_adx and adx_value < adx_min:
+                return "NEUTRAL"  # Market not trending strongly enough
+
+            # Check 3: Multiple candles must confirm (look back N candles)
+            bullish_confirms = 0
+            bearish_confirms = 0
+            for i in range(-confirmation_candles, 0):
+                if i >= -len(ema_fast):
+                    if ema_fast.iloc[i] > ema_slow.iloc[i]:
+                        bullish_confirms += 1
+                    elif ema_fast.iloc[i] < ema_slow.iloc[i]:
+                        bearish_confirms += 1
+
+            # Need ALL confirmation candles to agree
+            strong_bullish = bullish_confirms >= confirmation_candles
+            strong_bearish = bearish_confirms >= confirmation_candles
+
+            # BULLISH: All conditions met
+            if (strong_bullish and
+                current_ema_fast > current_ema_slow and
+                current_price > current_ema_slow and
+                current_rsi > bullish_rsi_min):
+                return "BULLISH"
+
+            # BEARISH: All conditions met
+            if (strong_bearish and
+                current_ema_fast < current_ema_slow and
+                current_price < current_ema_slow and
+                current_rsi < bearish_rsi_max):
+                return "BEARISH"
+
+            return "NEUTRAL"
+
+        except Exception as e:
+            self.log(f"Trend detection error for {symbol}: {e}", level="WARN")
+            return "BULLISH" if not strict else "NEUTRAL"
+
+    def check_trend_change(self, symbol: str, position: LivePosition) -> bool:
+        """
+        Check if trend has changed against our position (WITH COOLDOWN).
+        Returns True if we should close and flip.
+
+        LONG position + BEARISH trend = Close and flip to SHORT
+        SHORT position + BULLISH trend = Close and flip to LONG
+        """
+        try:
+            hybrid_config = DCA_CONFIG.get("hybrid_hold", {})
+            trend_config = DCA_CONFIG.get("trend_detection", {})
+
+            if not hybrid_config.get("flip_on_trend_change", True):
+                return False
+
+            # ================================================================
+            # COOLDOWN CHECK: Don't flip too soon after last flip
+            # ================================================================
+            flip_cooldown_minutes = trend_config.get("flip_cooldown_minutes", 30)
+            if symbol in self.last_flip_time:
+                time_since_flip = (datetime.now() - self.last_flip_time[symbol]).total_seconds() / 60
+                if time_since_flip < flip_cooldown_minutes:
+                    # Still in cooldown, don't check for flip
+                    return False
+
+            # Get market data for trend detection
+            market_data = self.client.get_market_data(symbol)
+            if not market_data or "1m" not in market_data:
+                return False
+
+            df = market_data["1m"]
+            current_trend = self.detect_trend(symbol, df)
+
+            # Store current trend
+            self.current_trend[symbol] = current_trend
+
+            # If trend is NEUTRAL, don't flip (strict detection didn't confirm)
+            if current_trend == "NEUTRAL":
+                return False
+
+            # Check if trend is opposite to our position
+            if position.side == "LONG" and current_trend == "BEARISH":
+                self.log(f"TREND CHANGE {symbol}: Strong BEARISH detected while LONG (confirmed)", level="TRADE")
+                self.last_flip_time[symbol] = datetime.now()  # Record flip time
+                return True
+
+            if position.side == "SHORT" and current_trend == "BULLISH":
+                self.log(f"TREND CHANGE {symbol}: Strong BULLISH detected while SHORT (confirmed)", level="TRADE")
+                self.last_flip_time[symbol] = datetime.now()  # Record flip time
+                return True
+
+            return False
+
+        except Exception as e:
+            self.log(f"Trend change check error for {symbol}: {e}", level="WARN")
+            return False
+
+    def auto_enter_hedge_positions(self, symbol: str) -> bool:
+        """
+        HEDGE MODE: Auto-enter BOTH LONG and SHORT positions on the same symbol.
+        Each side gets 50% of the symbol budget.
+
+        Returns True if positions were entered.
+        """
+        try:
+            hedge_config = DCA_CONFIG.get("hedge_mode", {})
+            if not hedge_config.get("enabled", True):
+                return False
+
+            # Check if already have positions on this symbol
+            long_key = f"{symbol}_LONG"
+            short_key = f"{symbol}_SHORT"
+
+            entered_any = False
+
+            # Enter LONG if not already present
+            if long_key not in self.positions:
+                can, reason = self.can_trade(symbol)
+                if can or "HAS_POSITION" in reason:
+                    self.log(f"HEDGE AUTO-ENTER: Opening LONG {symbol}", level="TRADE")
+                    long_signal = TradingSignal(
+                        signal="BUY",
+                        signal_type=SignalType.MOMENTUM,
+                        confidence=0.8,
+                        reason="HEDGE_AUTO_ENTER_LONG",
+                        momentum_value=0.5,
+                        ema_trend="BULLISH",
+                        rsi_value=50.0,
+                        adx_value=25.0
+                    )
+                    self.enter_position(symbol, long_signal, is_hedge=True)
+                    entered_any = True
+                    time.sleep(0.5)  # Brief pause between orders
+
+            # Enter SHORT if not already present
+            if short_key not in self.positions:
+                can, reason = self.can_trade(symbol)
+                if can or "HAS_POSITION" in reason:
+                    self.log(f"HEDGE AUTO-ENTER: Opening SHORT {symbol}", level="TRADE")
+                    short_signal = TradingSignal(
+                        signal="SELL",
+                        signal_type=SignalType.MOMENTUM,
+                        confidence=0.8,
+                        reason="HEDGE_AUTO_ENTER_SHORT",
+                        momentum_value=0.5,
+                        ema_trend="BEARISH",
+                        rsi_value=50.0,
+                        adx_value=25.0
+                    )
+                    self.enter_position(symbol, short_signal, is_hedge=True)
+                    entered_any = True
+
+            if entered_any:
+                self.log(f"HEDGE: Opened positions for {symbol} (LONG + SHORT)", level="TRADE")
+
+            return entered_any
+
+        except Exception as e:
+            self.log(f"Hedge auto-enter error for {symbol}: {e}", level="ERROR")
+            return False
+
+    def auto_enter_on_trend(self, symbol: str) -> bool:
+        """
+        Auto-enter position based on detected trend.
+        Called on startup or after trend flip to immediately enter market.
+
+        Returns True if position was entered.
+        """
+        try:
+            hybrid_config = DCA_CONFIG.get("hybrid_hold", {})
+            if not hybrid_config.get("auto_enter_on_start", True):
+                return False
+
+            # Skip if already have position
+            if symbol in self.positions:
+                return False
+
+            # Check if can trade
+            can, reason = self.can_trade(symbol)
+            if not can:
+                self.log(f"Auto-enter {symbol} blocked: {reason}", level="INFO")
+                return False
+
+            # Get market data
+            market_data = self.client.get_market_data(symbol)
+            if not market_data or "1m" not in market_data:
+                self.log(f"Auto-enter {symbol}: No market data available", level="WARN")
+                return False
+
+            df = market_data["1m"]
+            # Use SIMPLE mode (strict=False) for auto-entry - ALWAYS get a direction
+            trend = self.detect_trend(symbol, df, strict=False)
+
+            # Store trend
+            self.current_trend[symbol] = trend
+
+            # Create signal based on trend
+            signal_type = "BUY" if trend == "BULLISH" else "SELL"
+
+            # Create a TradingSignal object for enter_position
+            signal = TradingSignal(
+                signal=signal_type,
+                signal_type=SignalType.MOMENTUM,
+                confidence=0.7,
+                reason="HYBRID_AUTO_ENTER",
+                momentum_value=0.5,
+                ema_trend=trend,
+                rsi_value=50.0,
+                adx_value=25.0
+            )
+
+            self.log(f"AUTO-ENTER {symbol}: Detected {trend} trend, entering {signal_type}", level="TRADE")
+
+            # Enter position
+            self.enter_position(symbol, signal)
+
+            return True
+
+        except Exception as e:
+            self.log(f"Auto-enter error for {symbol}: {e}", level="ERROR")
+            return False
+
+    def close_and_flip(self, symbol: str, position: LivePosition, new_trend: str):
+        """
+        Close current position and immediately enter opposite direction.
+        Called when trend changes.
+        """
+        try:
+            self.log(f"FLIP {symbol}: Closing {position.side}, entering {new_trend}", level="TRADE")
+
+            # Cancel existing SL/TP orders
+            if position.stop_loss_order_id:
+                try:
+                    self.client.cancel_order(symbol, position.stop_loss_order_id, is_algo_order=True)
+                except:
+                    pass
+
+            if position.take_profit_order_id:
+                try:
+                    self.client.cancel_order(symbol, position.take_profit_order_id, is_algo_order=True)
+                except:
+                    pass
+
+            # Close current position (in hedge mode, include positionSide)
+            close_side = "SELL" if position.side == "LONG" else "BUY"
+            position_side = position.side if self.hedge_mode else None
+
+            order_result = self.client.place_market_order(symbol, close_side, position.quantity, position_side=position_side)
+
+            if "orderId" in order_result:
+                fill_price = float(order_result.get("avgPrice", 0))
+                if fill_price == 0:
+                    price_data = self.client.get_current_price(symbol)
+                    fill_price = price_data["price"]
+
+                # Calculate P&L
+                if position.side == "LONG":
+                    pnl = (fill_price - position.avg_entry_price) * position.quantity
+                else:
+                    pnl = (position.avg_entry_price - fill_price) * position.quantity
+
+                # Update daily stats
+                self.daily_pnl += pnl
+                if pnl > 0:
+                    self.daily_wins += 1
+                else:
+                    self.daily_losses += 1
+                self.daily_trades += 1
+
+                # Log the close
+                self.log(
+                    f"FLIP CLOSE {symbol}: {position.side} @ ${fill_price:,.4f} | "
+                    f"P&L: ${pnl:+,.2f} | Reason: TREND_CHANGE to {new_trend}",
+                    level="TRADE"
+                )
+
+                # Log trade
+                self.log_trade(
+                    symbol=symbol,
+                    side=position.side,
+                    entry_price=position.avg_entry_price,
+                    exit_price=fill_price,
+                    quantity=position.quantity,
+                    pnl=pnl,
+                    exit_type="TREND_FLIP",
+                    dca_level=position.dca_count
+                )
+
+                # Release margin
+                self.symbol_margin_used[symbol] = 0.0
+
+                # Remove position
+                del self.positions[symbol]
+
+            # Wait a moment for exchange to process
+            time.sleep(0.5)
+
+            # Now enter new position in opposite direction
+            new_signal_type = "BUY" if new_trend == "BULLISH" else "SELL"
+
+            signal = TradingSignal(
+                signal=new_signal_type,
+                signal_type=SignalType.MOMENTUM,
+                confidence=0.7,
+                reason="HYBRID_TREND_FLIP",
+                momentum_value=0.5,
+                ema_trend=new_trend,
+                rsi_value=50.0,
+                adx_value=25.0
+            )
+
+            self.log(f"FLIP ENTER {symbol}: Entering {new_signal_type} following {new_trend} trend", level="TRADE")
+            self.enter_position(symbol, signal)
+
+        except Exception as e:
+            self.log(f"Close and flip error for {symbol}: {e}", level="ERROR")
+
+    def hedge_on_trend_flip(self, symbol: str, position: LivePosition, new_trend: str):
+        """
+        Hedge strategy for DCA positions when trend flips.
+        Instead of closing at a loss, we:
+        1. Tighten SL to minimize max loss
+        2. Open hedge position in new trend direction (initial size)
+        3. Set breakeven TP on losing position
+        4. Wait for breakeven exit, then keep hedge running
+        """
+        try:
+            hybrid_config = DCA_CONFIG.get("hybrid_hold", {})
+            leverage = STRATEGY_CONFIG["leverage"]
+
+            self.log(
+                f"HEDGE STRATEGY {symbol}: DCA L{position.dca_count} {position.side} | "
+                f"Opening {new_trend} hedge instead of closing at loss",
+                level="TRADE"
+            )
+
+            # ================================================================
+            # STEP 1: Cancel old SL/TP orders
+            # ================================================================
+            try:
+                self.client.cancel_all_orders(symbol)
+                self.log(f"HEDGE: Cancelled all existing orders for {symbol}")
+            except Exception as e:
+                self.log(f"HEDGE: Could not cancel orders: {e}", level="WARN")
+
+            # ================================================================
+            # STEP 2: Place TIGHT SL to minimize max loss
+            # ================================================================
+            tight_sl_roi = hybrid_config.get("hedge_tighten_sl_roi", 0.15)  # -15% ROI
+            sl_price_pct = tight_sl_roi / leverage
+
+            if position.side == "LONG":
+                new_sl_price = position.avg_entry_price * (1 - sl_price_pct)
+                sl_side = "SELL"
+            else:
+                new_sl_price = position.avg_entry_price * (1 + sl_price_pct)
+                sl_side = "BUY"
+
+            # In hedge mode, include positionSide
+            hedge_position_side = position.side if self.hedge_mode else None
+            sl_order = self.client.place_stop_loss(symbol, sl_side, position.quantity, new_sl_price, position_side=hedge_position_side)
+            if "orderId" in sl_order:
+                position.stop_loss_order_id = sl_order.get("orderId")
+                self.log(f"HEDGE: Tight SL placed @ ${new_sl_price:,.4f} (-{tight_sl_roi*100:.0f}% ROI)")
+            else:
+                self.log(f"HEDGE: Failed to place tight SL: {sl_order}", level="ERROR")
+
+            # ================================================================
+            # STEP 3: Place BREAKEVEN TP on losing position
+            # ================================================================
+            breakeven_buffer = hybrid_config.get("hedge_breakeven_buffer", 0.005)  # 0.5%
+
+            if position.side == "LONG":
+                # For LONG, exit slightly above entry (breakeven + buffer)
+                breakeven_tp_price = position.avg_entry_price * (1 + breakeven_buffer)
+                tp_side = "SELL"
+            else:
+                # For SHORT, exit slightly below entry (breakeven + buffer)
+                breakeven_tp_price = position.avg_entry_price * (1 - breakeven_buffer)
+                tp_side = "BUY"
+
+            tp_order = self.client.place_take_profit(symbol, tp_side, position.quantity, breakeven_tp_price, position_side=hedge_position_side)
+            if "orderId" in tp_order:
+                position.take_profit_order_id = tp_order.get("orderId")
+                self.log(f"HEDGE: Breakeven TP placed @ ${breakeven_tp_price:,.4f} (entry was ${position.avg_entry_price:,.4f})")
+            else:
+                self.log(f"HEDGE: Failed to place breakeven TP: {tp_order}", level="ERROR")
+
+            # ================================================================
+            # STEP 4: Mark position as hedged and waiting for breakeven
+            # ================================================================
+            position.is_hedged = True
+            position.hedge_side = "LONG" if new_trend == "BULLISH" else "SHORT"
+            position.waiting_for_breakeven = True
+            position.hedge_start_time = datetime.now()
+
+            # ================================================================
+            # STEP 5: Open HEDGE position in new trend direction
+            # This uses the INITIAL entry size (small position)
+            # ================================================================
+            hedge_signal_type = "BUY" if new_trend == "BULLISH" else "SELL"
+
+            signal = TradingSignal(
+                signal=hedge_signal_type,
+                signal_type=SignalType.MOMENTUM,
+                confidence=0.7,
+                reason="HYBRID_HEDGE_ENTRY",
+                momentum_value=0.5,
+                ema_trend=new_trend,
+                rsi_value=50.0,
+                adx_value=25.0
+            )
+
+            self.log(
+                f"HEDGE ENTER {symbol}: Opening {hedge_signal_type} hedge following {new_trend} trend",
+                level="TRADE"
+            )
+
+            # Note: enter_position will create a NEW position entry
+            # The old position stays open with tight SL and breakeven TP
+            # Binance hedge mode allows both LONG and SHORT simultaneously
+            self.enter_position(symbol, signal, is_hedge=True)
+
+            self.log(
+                f"HEDGE ACTIVE {symbol}: {position.side} waiting for breakeven | "
+                f"{position.hedge_side} hedge running",
+                level="TRADE"
+            )
+
+        except Exception as e:
+            self.log(f"Hedge on trend flip error for {symbol}: {e}", level="ERROR")
+            # Fallback: just do normal close and flip
+            self.log(f"HEDGE FALLBACK: Executing normal close and flip", level="WARN")
+            self.close_and_flip(symbol, position, new_trend)
+
+    def manage_hedged_position(self, symbol: str, position: LivePosition, current_price: float):
+        """
+        Manage a hedged position - check if breakeven was hit or max wait time exceeded.
+        Called from manage_positions() for hedged positions.
+        """
+        if not position.is_hedged or not position.waiting_for_breakeven:
+            return False  # Not a hedged position waiting for exit
+
+        hybrid_config = DCA_CONFIG.get("hybrid_hold", {})
+        max_wait_hours = hybrid_config.get("hedge_max_wait_hours", 4)
+
+        # Check how long we've been waiting
+        if position.hedge_start_time:
+            wait_time = datetime.now() - position.hedge_start_time
+            wait_hours = wait_time.total_seconds() / 3600
+
+            if wait_hours >= max_wait_hours:
+                # Max wait time exceeded - close at current price (cut loss)
+                self.log(
+                    f"HEDGE TIMEOUT {symbol}: Waited {wait_hours:.1f}h (max {max_wait_hours}h) | "
+                    f"Closing {position.side} at market",
+                    level="TRADE"
+                )
+
+                # Close the losing position at market (in hedge mode, include positionSide)
+                close_side = "SELL" if position.side == "LONG" else "BUY"
+                hedge_position_side = position.side if self.hedge_mode else None
+                order_result = self.client.place_market_order(symbol, close_side, position.quantity, position_side=hedge_position_side)
+
+                if "orderId" in order_result:
+                    fill_price = float(order_result.get("avgPrice", current_price))
+
+                    # Calculate P&L
+                    if position.side == "LONG":
+                        pnl = (fill_price - position.avg_entry_price) * position.quantity
+                    else:
+                        pnl = (position.avg_entry_price - fill_price) * position.quantity
+
+                    # Update daily stats
+                    self.daily_pnl += pnl
+                    self.daily_trades += 1
+                    if pnl > 0:
+                        self.daily_wins += 1
+                    else:
+                        self.daily_losses += 1
+
+                    self.log(
+                        f"HEDGE CLOSED {symbol}: {position.side} @ ${fill_price:,.4f} | "
+                        f"P&L: ${pnl:+,.2f} | Reason: HEDGE_TIMEOUT",
+                        level="TRADE"
+                    )
+
+                    # Log trade
+                    self.log_trade(
+                        symbol=symbol,
+                        side=position.side,
+                        entry_price=position.avg_entry_price,
+                        exit_price=fill_price,
+                        quantity=position.quantity,
+                        pnl=pnl,
+                        exit_type="HEDGE_TIMEOUT",
+                        dca_level=position.dca_count
+                    )
+
+                    # Cancel any remaining orders for this side
+                    try:
+                        if position.stop_loss_order_id:
+                            self.client.cancel_order(symbol, position.stop_loss_order_id, is_algo_order=True)
+                        if position.take_profit_order_id:
+                            self.client.cancel_order(symbol, position.take_profit_order_id, is_algo_order=True)
+                    except:
+                        pass
+
+                    # Remove from tracking (hedge position continues)
+                    self.symbol_margin_used[symbol] -= position.margin_used
+                    del self.positions[symbol]
+
+                    return True  # Position was closed
+
+        return False  # Position still waiting
+
+    def reenter_after_tp(self, symbol: str, closed_side: str):
+        """
+        Re-enter position in same direction after TP hit.
+        Keeps us in the trend after taking profit.
+        ALWAYS HOLD STRATEGY: Re-enter immediately, no momentum check needed!
+        """
+        try:
+            hybrid_config = DCA_CONFIG.get("hybrid_hold", {})
+            if not hybrid_config.get("reenter_on_tp", True):
+                self.log(f"Re-enter {symbol}: Disabled in config", level="INFO")
+                return
+
+            # Brief pause to let position clear on Binance side
+            time.sleep(1.0)
+
+            # Check if can trade (but ignore HAS_POSITION since we just cleared it)
+            can, reason = self.can_trade(symbol)
+            if not can and "HAS_POSITION" not in reason:
+                self.log(f"Re-enter {symbol} blocked: {reason} - adding to pending queue", level="INFO")
+                # Add to pending re-entry for next scan cycle
+                self.pending_reentry[symbol] = closed_side
+                return
+
+            # Optional: Check trend for direction (but ALWAYS re-enter regardless)
+            entry_side = closed_side  # Default: same direction
+            try:
+                market_data = self.client.get_market_data(symbol)
+                if market_data and "1m" in market_data:
+                    current_trend = self.detect_trend(symbol, market_data["1m"], strict=False)
+                    expected_trend = "BULLISH" if closed_side == "LONG" else "BEARISH"
+
+                    if current_trend != expected_trend:
+                        # Trend changed - follow the NEW trend
+                        entry_side = "LONG" if current_trend == "BULLISH" else "SHORT"
+                        self.log(f"Re-enter {symbol}: Trend flipped to {current_trend}, entering {entry_side}", level="INFO")
+            except Exception as e:
+                self.log(f"Re-enter {symbol}: Trend check failed ({e}), using original direction {closed_side}", level="WARN")
+
+            # Create signal for immediate re-entry
+            signal_type = "BUY" if entry_side == "LONG" else "SELL"
+            trend = "BULLISH" if entry_side == "LONG" else "BEARISH"
+
+            signal = TradingSignal(
+                signal=signal_type,
+                signal_type=SignalType.MOMENTUM,
+                confidence=0.8,
+                reason="ALWAYS_HOLD_REENTRY",
+                momentum_value=0.5,
+                ema_trend=trend,
+                rsi_value=50.0,
+                adx_value=25.0
+            )
+
+            self.log(f">>> RE-ENTERING {symbol} {entry_side} <<< (ALWAYS HOLD strategy)", level="TRADE")
+            self.enter_position(symbol, signal)
+
+            # Clear from pending if it was there
+            if symbol in self.pending_reentry:
+                del self.pending_reentry[symbol]
+
+        except Exception as e:
+            self.log(f"Re-enter error for {symbol}: {e} - adding to pending queue", level="ERROR")
+            # Add to pending so next scan cycle can try again
+            self.pending_reentry[symbol] = closed_side
+
+    def check_hybrid_dca_filter(self, symbol: str, position: LivePosition, dca_level: int, df: pd.DataFrame) -> tuple:
+        """
+        Check DCA filter based on level (Easy for 1-2, Strict for 3-4).
+
+        Returns: (can_dca: bool, reason: str)
+        """
+        try:
+            filter_config = DCA_CONFIG.get("hybrid_dca_filters", {})
+            easy_levels = filter_config.get("easy_levels", [1, 2])
+            strict_levels = filter_config.get("strict_levels", [3, 4])
+
+            # Calculate basic indicators
+            delta = df["close"].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+            current_rsi = rsi.iloc[-1]
+
+            # Calculate momentum (rate of change)
+            momentum = df["close"].pct_change(periods=5).iloc[-1] * 100
+            prev_momentum = df["close"].pct_change(periods=5).iloc[-2] * 100 if len(df) > 6 else momentum
+
+            # Momentum weakening check
+            momentum_weakening = abs(momentum) < abs(prev_momentum)
+            momentum_reduction = 1 - (abs(momentum) / abs(prev_momentum)) if abs(prev_momentum) > 0 else 0
+
+            # EASY FILTER (DCA 1-2): Just check momentum weakening
+            if dca_level in easy_levels:
+                easy_threshold = filter_config.get("easy_momentum_threshold", 0.3)
+
+                if momentum_weakening or momentum_reduction >= easy_threshold:
+                    return True, f"L{dca_level} EASY: Mom weak {momentum_reduction*100:.0f}%"
+                else:
+                    return True, f"L{dca_level} EASY: Allowed (fast avg)"  # Easy levels always allowed
+
+            # STRICT FILTER (DCA 3-4): Require multiple confirmations
+            if dca_level in strict_levels:
+                strict_threshold = filter_config.get("strict_momentum_threshold", 0.5)
+                require_reversal = filter_config.get("strict_require_reversal", True)
+                require_rsi_extreme = filter_config.get("strict_require_rsi_extreme", True)
+                rsi_oversold = filter_config.get("strict_rsi_oversold", 25)
+                rsi_overbought = filter_config.get("strict_rsi_overbought", 75)
+
+                reasons = []
+                passed = True
+
+                # Check momentum
+                if momentum_reduction < strict_threshold and not momentum_weakening:
+                    passed = False
+                    reasons.append(f"Mom not weak ({momentum_reduction*100:.0f}%<{strict_threshold*100:.0f}%)")
+
+                # Check RSI extreme (for LONG DCA, need oversold; for SHORT DCA, need overbought)
+                if require_rsi_extreme:
+                    if position.side == "LONG" and current_rsi > rsi_oversold:
+                        passed = False
+                        reasons.append(f"RSI not oversold ({current_rsi:.0f}>{rsi_oversold})")
+                    elif position.side == "SHORT" and current_rsi < rsi_overbought:
+                        passed = False
+                        reasons.append(f"RSI not overbought ({current_rsi:.0f}<{rsi_overbought})")
+
+                # Check reversal candle
+                if require_reversal:
+                    last_candle = df.iloc[-1]
+                    prev_candle = df.iloc[-2]
+
+                    if position.side == "LONG":
+                        # Need bullish reversal (green candle after red)
+                        is_reversal = (last_candle["close"] > last_candle["open"] and
+                                      prev_candle["close"] < prev_candle["open"])
+                    else:
+                        # Need bearish reversal (red candle after green)
+                        is_reversal = (last_candle["close"] < last_candle["open"] and
+                                      prev_candle["close"] > prev_candle["open"])
+
+                    if not is_reversal:
+                        passed = False
+                        reasons.append("No reversal candle")
+
+                if passed:
+                    return True, f"L{dca_level} STRICT: All checks passed"
+                else:
+                    return False, f"L{dca_level} STRICT BLOCKED: {', '.join(reasons)}"
+
+            # Default: use existing signal generator
+            return self.signal_generator.can_dca(df, position.side, dca_level)
+
+        except Exception as e:
+            self.log(f"Hybrid DCA filter error: {e}", level="WARN")
+            return True, "Filter error, allowing DCA"
+
+    def calculate_position_size(self, symbol: str, price: float, is_dca: bool = False, dca_level: int = 0) -> float:
+        """
+        Calculate position size based on dynamic allocation.
+        Uses margin-based allocation with leverage.
+        """
+        # Get margin for this entry type
+        if is_dca and dca_level > 0:
+            margin = self.get_dca_margin(symbol, dca_level)
+        else:
+            margin = self.get_entry_margin(symbol)
+
+        # Check if we have enough budget
+        remaining = self.get_remaining_budget(symbol)
+        if margin > remaining:
+            margin = remaining
+
+        if margin <= 0:
+            return 0.0
+
+        # Calculate position value with leverage
+        position_value = margin * self.leverage
+
+        # Convert to quantity
+        quantity = position_value / price
+
+        return quantity
+
+    def enter_position(self, symbol: str, signal: TradingSignal, is_hedge: bool = False):
+        """
+        Enter a new position with dynamic margin allocation.
+
+        Args:
+            symbol: Trading pair
+            signal: Trading signal with direction
+            is_hedge: If True, this is a hedge position (tracking is handled differently)
+        """
+        try:
+            side = "BUY" if signal.signal == "BUY" else "SELL"
+            position_side = "LONG" if side == "BUY" else "SHORT"
+
+            # Get margin for initial entry
+            margin = self.get_entry_margin(symbol)
+            remaining = self.get_remaining_budget(symbol)
+
+            if margin > remaining or margin <= 0:
+                self.log(f"Skip {symbol}: Insufficient budget (need ${margin:.2f}, have ${remaining:.2f})", level="WARN")
+                return
+
+            # Get current price
+            price_data = self.client.get_current_price(symbol)
+            current_price = price_data["price"]
+
+            # Calculate position size based on margin + leverage
+            quantity = self.calculate_position_size(symbol, current_price)
+
+            if quantity <= 0:
+                self.log(f"Skip {symbol}: Position size too small", level="WARN")
+                return
+
+            budget = self.symbol_budgets.get(symbol, 0)
+            self.log(f"Entering {position_side} {symbol}: {quantity} @ ~${current_price:,.2f} | Margin: ${margin:.2f}/{budget:.2f}")
+
+            # Place market order
+            # In hedge mode, pass positionSide to enable dual positions
+            hedge_position_side = position_side if (self.hedge_mode or is_hedge) else None
+            order_result = self.client.place_market_order(symbol, side, quantity, position_side=hedge_position_side)
+
+            if "orderId" not in order_result:
+                self.log(f"Order failed: {order_result}", level="ERROR")
+                return
+
+            # Get actual fill price - market orders may return 0 initially
+            fill_price = float(order_result.get("avgPrice", 0))
+            filled_qty = float(order_result.get("executedQty", 0))
+
+            # If avgPrice is 0, retry multiple times to get actual entry price
+            max_retries = 5
+            retry_delay = 0.5
+
+            for retry in range(max_retries):
+                if fill_price > 0 and filled_qty > 0:
+                    break
+
+                import time
+                time.sleep(retry_delay)
+
+                # In hedge mode, filter by position side to get correct position
+                hedge_side = position_side if (self.hedge_mode or is_hedge) else None
+                position = self.client.get_position(symbol, position_side=hedge_side)
+                if position and position.get("entry_price", 0) > 0:
+                    fill_price = position["entry_price"]
+                    filled_qty = position["quantity"]
+                    self.log(f"Got fill price from position query (retry {retry + 1}): ${fill_price:,.2f}")
+                    break
+
+                if retry == max_retries - 1:
+                    # Last resort: use current market price
+                    fill_price = current_price
+                    filled_qty = quantity
+                    self.log(f"Could not get actual fill price after {max_retries} retries, using market price ${fill_price:,.2f}", level="WARN")
+
+            # Track margin used
+            self.symbol_margin_used[symbol] = margin
+
+            # VALIDATE fill price before placing SL/TP
+            sl_order_id = None
+            tp_order_id = None
+
+            if fill_price <= 0:
+                self.log(f"CRITICAL: fill_price is {fill_price} - cannot place SL/TP orders!", level="ERROR")
+            else:
+                # Calculate SL/TP prices using ROI-BASED calculation for leveraged scalping
+                # Formula: price_move = roi / leverage
+                leverage = STRATEGY_CONFIG["leverage"]  # 20x
+
+                if DCA_CONFIG["enabled"]:
+                    # ROI-based: 15% ROI TP, 80% ROI SL (wide for DCA)
+                    tp_roi = DCA_CONFIG["take_profit_roi"]    # 15% ROI
+                    sl_roi = DCA_CONFIG["stop_loss_roi"]      # 80% ROI
+                    tp_price_pct = tp_roi / leverage          # 15% / 20 = 0.75% price move
+                    sl_price_pct = sl_roi / leverage          # 80% / 20 = 4% price move
+                else:
+                    # Price-based for non-DCA (legacy)
+                    tp_price_pct = STRATEGY_CONFIG["take_profit_pct"]  # 2% price move
+                    sl_price_pct = STRATEGY_CONFIG["stop_loss_pct"]    # 1% price move
+
+                if position_side == "LONG":
+                    stop_loss_price = fill_price * (1 - sl_price_pct)
+                    take_profit_price = fill_price * (1 + tp_price_pct)
+                    sl_side = "SELL"
+                    tp_side = "SELL"
+                else:
+                    stop_loss_price = fill_price * (1 + sl_price_pct)
+                    take_profit_price = fill_price * (1 - tp_price_pct)
+                    sl_side = "BUY"
+                    tp_side = "BUY"
+
+                # ================================================================
+                # LIQUIDATION PROTECTION: Ensure SL is ALWAYS before liquidation
+                # ================================================================
+                position_data = self.client.get_position(symbol, position_side=hedge_side)
+                if position_data:
+                    liq_price = float(position_data.get("liquidation_price", 0))
+                    if liq_price > 0:
+                        buffer_pct = DCA_CONFIG.get("liquidation_buffer_pct", 0.01)  # 1% buffer
+                        if position_side == "LONG":
+                            # For LONG: SL must be ABOVE liquidation price
+                            min_sl_price = liq_price * (1 + buffer_pct)
+                            if stop_loss_price < min_sl_price:
+                                self.log(f"SL ${stop_loss_price:,.2f} too close to liquidation ${liq_price:,.2f}, adjusting to ${min_sl_price:,.2f}", level="WARN")
+                                stop_loss_price = min_sl_price
+                        else:
+                            # For SHORT: SL must be BELOW liquidation price
+                            max_sl_price = liq_price * (1 - buffer_pct)
+                            if stop_loss_price > max_sl_price:
+                                self.log(f"SL ${stop_loss_price:,.2f} too close to liquidation ${liq_price:,.2f}, adjusting to ${max_sl_price:,.2f}", level="WARN")
+                                stop_loss_price = max_sl_price
+
+                # Log with ROI context
+                if DCA_CONFIG["enabled"]:
+                    self.log(f"ROI-Based SL/TP for {symbol}: TP={tp_roi*100:.1f}% ROI (${take_profit_price:,.2f}), SL={sl_roi*100:.0f}% ROI (${stop_loss_price:,.2f})")
+
+                # Place stop loss order (pass position_side for hedge mode)
+                sl_order = self.client.place_stop_loss(symbol, sl_side, filled_qty, stop_loss_price,
+                                                        position_side=hedge_position_side)
+                if "orderId" in sl_order:
+                    sl_order_id = sl_order.get("orderId")
+                    self.log(f"SL order placed: ID={sl_order_id}")
+                else:
+                    self.log(f"SL order FAILED: {sl_order}", level="ERROR")
+
+                # Place take profit order (pass position_side for hedge mode)
+                tp_order = self.client.place_take_profit(symbol, tp_side, filled_qty, take_profit_price,
+                                                          position_side=hedge_position_side)
+                if "orderId" in tp_order:
+                    tp_order_id = tp_order.get("orderId")
+                    self.log(f"TP order placed: ID={tp_order_id}")
+                else:
+                    self.log(f"TP order FAILED: {tp_order}", level="ERROR")
+
+            # Track position
+            # For hedge mode, use symbol_SIDE as key (e.g., DOTUSDT_LONG, DOTUSDT_SHORT)
+            # For normal mode, just use symbol
+            if self.hedge_mode or is_hedge:
+                position_key = f"{symbol}_{position_side}"
+            else:
+                position_key = symbol
+
+            self.positions[position_key] = LivePosition(
+                symbol=symbol,
+                side=position_side,
+                entry_price=fill_price if fill_price > 0 else current_price,
+                quantity=filled_qty if filled_qty > 0 else quantity,
+                entry_time=datetime.now(),
+                stop_loss_order_id=sl_order_id,
+                take_profit_order_id=tp_order_id,
+                avg_entry_price=fill_price if fill_price > 0 else current_price,
+                margin_used=margin
+            )
+
+            # NOTE: daily_trades is counted on position CLOSE, not entry
+            # This ensures trades/wins/losses are all counted consistently
+
+            # Set signal cooldown AFTER successful trade entry
+            # This prevents rapid-fire signals on the same symbol
+            self.signal_generator.set_cooldown_time(symbol)
+
+            # Build status message
+            entry_price_display = fill_price if fill_price > 0 else current_price
+            if sl_order_id:
+                sl_status = f"SL: ${stop_loss_price:,.2f}"
+            else:
+                sl_status = "SL: FAILED"
+            if tp_order_id:
+                tp_status = f"TP: ${take_profit_price:,.2f}"
+            else:
+                tp_status = "TP: FAILED"
+
+            hedge_label = " [HEDGE]" if is_hedge else ""
+            self.log(
+                f"ENTERED {position_side} {symbol}{hedge_label} @ ${entry_price_display:,.2f} | "
+                f"Qty: {filled_qty:.6f} | Margin: ${margin:.2f}/{budget:.2f} | "
+                f"Leverage: {self.leverage}x | {sl_status} | {tp_status}",
+                level="TRADE"
+            )
+
+        except Exception as e:
+            self.log(f"Error entering position {symbol}: {e}", level="ERROR")
+
+    def sync_positions(self):
+        """Sync local positions with Binance and release margin for closed positions"""
+        try:
+            binance_positions = self.client.get_positions()
+
+            # Check for closed positions OR position side changes (LONG->SHORT or SHORT->LONG)
+            for position_key in list(self.positions.keys()):
+                local_pos = self.positions[position_key]
+
+                # Extract actual symbol from key (handles both 'DOTUSDT' and 'DOTUSDT_LONG')
+                actual_symbol = self.get_symbol_from_key(position_key)
+
+                found = False
+                side_changed = False
+                binance_pos = None
+
+                for pos in binance_positions:
+                    if pos["symbol"] == actual_symbol and pos["side"] == local_pos.side:
+                        # In hedge mode, match BOTH symbol AND side
+                        found = True
+                        binance_pos = pos
+                        break
+                    elif pos["symbol"] == actual_symbol and not self.hedge_mode:
+                        # In non-hedge mode, just match symbol
+                        found = True
+                        binance_pos = pos
+                        if pos["side"] != local_pos.side:
+                            side_changed = True
+                            self.log(f"Position {position_key} SIDE CHANGED: {local_pos.side} -> {pos['side']}")
+                        break
+
+                if not found or side_changed:
+                    # Position was closed (SL/TP hit)
+                    # local_pos is already set above from position_key
+                    margin_released = local_pos.margin_used
+                    closed_side = local_pos.side
+
+                    # ============================================
+                    # GET ACTUAL REALIZED PNL AND EXIT PRICE FROM BINANCE
+                    # ============================================
+                    realized_pnl = 0.0
+                    exit_price = 0.0
+                    exit_type = "SL/TP"
+                    try:
+                        # Get recent income (realized PNL) for this symbol
+                        # In hedge mode, get more records to find the right one
+                        income_records = self.client.get_income_history(actual_symbol, "REALIZED_PNL", limit=10)
+                        if income_records:
+                            # Get most recent realized PNL for this symbol
+                            # Sort by time to get the most recent
+                            for record in income_records:
+                                if record.get("symbol") == actual_symbol:
+                                    realized_pnl = float(record.get("income", 0))
+                                    break
+
+                        # Get exit price from recent trades
+                        try:
+                            recent_trades = self.client.get_recent_trades(actual_symbol, limit=5)
+                            if recent_trades:
+                                exit_price = float(recent_trades[0].get("price", 0))
+                        except:
+                            # Estimate from current price
+                            price_data = self.client.get_current_price(actual_symbol)
+                            exit_price = price_data["price"]
+
+                        # Determine if TP or SL hit based on PNL and price movement
+                        # If realized_pnl is 0 but we have exit price, calculate from position
+                        if realized_pnl == 0 and exit_price > 0:
+                            if closed_side == "LONG":
+                                realized_pnl = (exit_price - local_pos.avg_entry_price) * local_pos.quantity
+                            else:
+                                realized_pnl = (local_pos.avg_entry_price - exit_price) * local_pos.quantity
+
+                        if realized_pnl > 0:
+                            exit_type = "TP"
+                            self.daily_wins += 1
+                        elif realized_pnl < 0:
+                            exit_type = "SL"
+                            self.daily_losses += 1
+                        else:
+                            # Breakeven - count as win (no loss)
+                            exit_type = "BE"
+                            self.daily_wins += 1
+
+                    except Exception as e:
+                        # Fallback: estimate PNL from entry price and current price
+                        self.log(f"  Could not get realized PNL: {e}", level="WARN")
+                        # Try to estimate win/loss from position direction
+                        try:
+                            price_data = self.client.get_current_price(actual_symbol)
+                            exit_price = price_data["price"]
+                            if local_pos.side == "LONG":
+                                estimated_pnl = (exit_price - local_pos.avg_entry_price) * local_pos.quantity
+                            else:
+                                estimated_pnl = (local_pos.avg_entry_price - exit_price) * local_pos.quantity
+                            realized_pnl = estimated_pnl
+                            if estimated_pnl >= 0:
+                                exit_type = "TP"
+                                self.daily_wins += 1
+                            else:
+                                exit_type = "SL"
+                                self.daily_losses += 1
+                        except:
+                            # Last resort - count as loss to be conservative
+                            exit_type = "UNKNOWN"
+                            self.daily_losses += 1
+
+                    # Update daily stats
+                    self.daily_pnl += realized_pnl
+                    self.daily_trades += 1
+
+                    hedge_label = f" [{closed_side}]" if self.hedge_mode else ""
+                    self.log(
+                        f"Position {actual_symbol}{hedge_label} CLOSED ({exit_type}) | "
+                        f"P&L: ${realized_pnl:+.2f} | Margin released: ${margin_released:.2f}",
+                        level="TRADE"
+                    )
+
+                    # ============================================
+                    # LOG TRADE TO FILE FOR PERMANENT RECORD
+                    # ============================================
+                    self.log_trade(
+                        symbol=actual_symbol,
+                        side=local_pos.side,
+                        entry_price=local_pos.avg_entry_price,
+                        exit_price=exit_price,
+                        quantity=local_pos.quantity,
+                        pnl=realized_pnl,
+                        exit_type=exit_type,
+                        dca_level=local_pos.dca_count
+                    )
+
+                    # ============================================
+                    # CANCEL ALL REMAINING ORDERS FOR THIS SYMBOL
+                    # When TP hits, SL remains open and vice versa
+                    # Use cancel_all_orders to ensure all algo orders are cancelled too
+                    # NOTE: In hedge mode, we should NOT cancel orders for the OTHER side!
+                    # For now, we only cancel if NOT in hedge mode
+                    # ============================================
+                    if not self.hedge_mode:
+                        try:
+                            self.client.cancel_all_orders(actual_symbol)
+                            self.log(f"  Cancelled all remaining orders for {actual_symbol}")
+                        except Exception as e:
+                            self.log(f"  Warning: Could not cancel orders for {actual_symbol}: {e}")
+
+                    # closed_side already set above
+
+                    # Release symbol margin (for hedge mode, track per-side)
+                    if self.hedge_mode:
+                        # Only reduce margin by this side's portion
+                        current_margin = self.symbol_margin_used.get(actual_symbol, 0)
+                        self.symbol_margin_used[actual_symbol] = max(0, current_margin - margin_released)
+                    else:
+                        self.symbol_margin_used[actual_symbol] = 0.0
+
+                    # Remove position from tracking
+                    del self.positions[position_key]
+
+                    # ============================================
+                    # HEDGE MODE or HYBRID HOLD: RE-ENTER AFTER TP
+                    # If TP hit (profitable close), re-enter same direction
+                    # ============================================
+                    hedge_config = DCA_CONFIG.get("hedge_mode", {})
+                    hybrid_config = DCA_CONFIG.get("hybrid_hold", {})
+
+                    # Re-enter if TP hit OR if exit was profitable (in case exit_type detection failed)
+                    is_profitable_exit = exit_type == "TP" or exit_type == "BE" or realized_pnl >= 0
+
+                    if self.hedge_mode and hedge_config.get("reenter_on_tp", True) and is_profitable_exit:
+                        # HEDGE MODE: Re-enter the SAME SIDE that just closed
+                        self.log(f"HEDGE: TP hit for {actual_symbol} [{closed_side}], IMMEDIATE RE-ENTRY", level="TRADE")
+                        self.pending_reentry[position_key] = closed_side
+                        # Try immediate re-entry
+                        self.reenter_after_tp(actual_symbol, closed_side)
+
+                    elif (hybrid_config.get("enabled", False) and
+                          hybrid_config.get("reenter_on_tp", True) and
+                          is_profitable_exit):
+                        # HYBRID MODE: Re-enter same direction
+                        self.log(f"HYBRID: TP hit for {actual_symbol}, IMMEDIATE RE-ENTRY {closed_side}", level="TRADE")
+                        self.pending_reentry[actual_symbol] = closed_side
+                        self.reenter_after_tp(actual_symbol, closed_side)
+
+            # Check for new positions (from DCA or manual) or positions with changed side
+            for pos in binance_positions:
+                binance_symbol = pos["symbol"]
+                binance_side = pos["side"]
+
+                # Determine the position key based on mode
+                if self.hedge_mode:
+                    pos_key = f"{binance_symbol}_{binance_side}"
+                else:
+                    pos_key = binance_symbol
+
+                # Check if we need to sync this position
+                need_sync = False
+                if pos_key not in self.positions:
+                    need_sync = True
+                elif not self.hedge_mode and binance_side != self.positions[pos_key].side:
+                    # Side changed in non-hedge mode
+                    need_sync = True
+
+                if need_sync:
+                    # Get actual margin from Binance
+                    margin_used = float(pos.get("isolated_wallet", 0)) or float(pos.get("isolatedWallet", 0))
+
+                    # Auto-detect DCA level from margin used
+                    dca_level = self.detect_dca_level_from_margin(binance_symbol, margin_used)
+
+                    self.positions[pos_key] = LivePosition(
+                        symbol=binance_symbol,
+                        side=binance_side,
+                        entry_price=pos["entry_price"],
+                        quantity=pos["quantity"],
+                        entry_time=datetime.now(),
+                        avg_entry_price=pos["entry_price"],
+                        margin_used=margin_used,
+                        dca_count=dca_level
+                    )
+
+                    # Update margin tracking
+                    if self.hedge_mode:
+                        current_margin = self.symbol_margin_used.get(binance_symbol, 0)
+                        self.symbol_margin_used[binance_symbol] = current_margin + margin_used
+                    else:
+                        self.symbol_margin_used[binance_symbol] = margin_used
+
+                    hedge_label = f" [{binance_side}]" if self.hedge_mode else ""
+                    self.log(f"Synced position: {binance_symbol}{hedge_label} | Margin: ${margin_used:.2f} | DCA Level: {dca_level}/4")
+
+                    # Ensure SL/TP orders are placed for synced positions
+                    self._ensure_sl_tp_orders(binance_symbol, pos, dca_level, position_key=pos_key)
+
+        except Exception as e:
+            self.log(f"Error syncing positions: {e}", level="ERROR")
+
+    def check_dca(self, symbol: str, position: LivePosition, current_price: float):
+        """Check and execute DCA with margin-based allocation and pair-specific volatility"""
+        if not DCA_CONFIG["enabled"]:
+            return
+
+        # Skip invalid positions
+        if position.avg_entry_price <= 0:
+            return
+
+        if position.dca_count >= len(DCA_CONFIG["levels"]):
+            return
+
+        dca_level = position.dca_count + 1  # Next DCA level (1-4)
+
+        # Check if we can afford this DCA level
+        if not self.can_afford_dca(symbol, dca_level):
+            return
+
+        # Calculate current ROI (for leveraged positions)
+        leverage = STRATEGY_CONFIG["leverage"]  # 20x
+        if position.side == "LONG":
+            price_drawdown = (position.avg_entry_price - current_price) / position.avg_entry_price
+        else:
+            price_drawdown = (current_price - position.avg_entry_price) / position.avg_entry_price
+
+        # Convert to ROI: ROI = price_change * leverage
+        current_roi_loss = price_drawdown * leverage  # e.g., 0.5% price loss * 20 = 10% ROI loss
+
+        # Check if DCA level triggered (ROI-based) with PAIR-SPECIFIC VOLATILITY MULTIPLIER
+        level = DCA_CONFIG["levels"][position.dca_count]
+        base_trigger_roi = abs(level["trigger_roi"])  # e.g., 0.20 = 20% ROI loss
+
+        # Apply volatility multiplier for this symbol (wider triggers for volatile pairs)
+        symbol_settings = SYMBOL_SETTINGS.get(symbol, {})
+        volatility_mult = symbol_settings.get("dca_volatility_mult", 1.0)
+        trigger_roi = base_trigger_roi * volatility_mult  # e.g., 0.20 * 1.8 = 0.36 (36% ROI for DOT)
+
+        if current_roi_loss >= trigger_roi:
+            # =================================================================
+            # HYBRID DCA FILTER: Easy for L1-2, Strict for L3-4
+            # =================================================================
+            if symbol in self.data_buffer and self.data_buffer[symbol] is not None:
+                df = self.data_buffer[symbol].get("1m") if isinstance(self.data_buffer[symbol], dict) else self.data_buffer[symbol]
+                if df is not None:
+                    # Use HYBRID filter (easy for L1-2, strict for L3-4)
+                    can_dca, reason = self.check_hybrid_dca_filter(symbol, position, dca_level, df)
+
+                    if not can_dca:
+                        # Filter blocked DCA
+                        self.log(
+                            f"DCA {dca_level} {symbol}: BLOCKED - {reason}",
+                            level="DCA"
+                        )
+                        self.log(
+                            f"       >>> Waiting for conditions to improve before adding to position",
+                            level="DCA"
+                        )
+                        return
+
+                    self.log(f"DCA {dca_level} {symbol}: Signal validated - {reason}", level="DCA")
+
+            try:
+                # Get DCA margin for this level
+                dca_margin = self.get_dca_margin(symbol, dca_level)
+
+                # Calculate DCA quantity based on margin + leverage
+                dca_qty = self.calculate_position_size(symbol, current_price, is_dca=True, dca_level=dca_level)
+
+                if dca_qty <= 0:
+                    self.log(f"DCA {dca_level} skipped for {symbol}: Quantity too small", level="WARN")
+                    return
+
+                # Place DCA order (in hedge mode, include positionSide)
+                side = "BUY" if position.side == "LONG" else "SELL"
+                position_side = position.side if self.hedge_mode else None
+                order_result = self.client.place_market_order(symbol, side, dca_qty, position_side=position_side)
+
+                if "orderId" in order_result:
+                    fill_price = float(order_result.get("avgPrice", current_price))
+                    filled_qty = float(order_result.get("executedQty", dca_qty))
+
+                    # Update margin tracking
+                    self.symbol_margin_used[symbol] += dca_margin
+                    position.margin_used += dca_margin
+
+                    # ================================================================
+                    # CRITICAL: Get ACTUAL break-even price from Binance after DCA
+                    # Don't calculate locally - use Binance's actual entry price!
+                    # ================================================================
+                    time.sleep(0.5)  # Wait for Binance to update position
+
+                    # Retry to get accurate position data from Binance
+                    max_retries = 3
+                    actual_entry_price = 0.0
+                    actual_quantity = 0.0
+
+                    for retry in range(max_retries):
+                        # In hedge mode, filter by position side to get correct position
+                        position_data = self.client.get_position(symbol, position_side=position_side)
+                        if position_data:
+                            actual_entry_price = float(position_data.get("entry_price", 0))
+                            actual_quantity = float(position_data.get("quantity", 0))
+                            if actual_entry_price > 0 and actual_quantity > 0:
+                                break
+                        time.sleep(0.3)
+
+                    # Use Binance's actual values if available, otherwise fallback to calculation
+                    if actual_entry_price > 0 and actual_quantity > 0:
+                        position.avg_entry_price = actual_entry_price
+                        position.quantity = actual_quantity
+                        self.log(f"DCA {dca_level}: Using Binance break-even price: ${actual_entry_price:,.4f}")
+                    else:
+                        # Fallback: calculate locally (less accurate)
+                        dca_position_value = dca_margin * self.leverage
+                        old_cost = position.avg_entry_price * position.quantity
+                        position.quantity += filled_qty
+                        position.avg_entry_price = (old_cost + dca_position_value) / position.quantity
+                        self.log(f"DCA {dca_level}: Using calculated avg price: ${position.avg_entry_price:,.4f} (Binance not available)", level="WARN")
+
+                    position.dca_count = dca_level
+
+                    # Cancel old SL/TP and place new ones
+                    if position.stop_loss_order_id:
+                        try:
+                            cancel_result = self.client.cancel_order(symbol, position.stop_loss_order_id)
+                            if cancel_result and "orderId" in cancel_result:
+                                self.log(f"DCA {dca_level}: Cancelled old SL order {position.stop_loss_order_id}")
+                            else:
+                                self.log(f"DCA {dca_level}: Old SL order already gone (filled/expired)")
+                        except Exception as e:
+                            self.log(f"DCA {dca_level}: Old SL already gone: {e}")
+                        position.stop_loss_order_id = None
+
+                    if position.take_profit_order_id:
+                        try:
+                            cancel_result = self.client.cancel_order(symbol, position.take_profit_order_id)
+                            if cancel_result and "orderId" in cancel_result:
+                                self.log(f"DCA {dca_level}: Cancelled old TP order {position.take_profit_order_id}")
+                            else:
+                                self.log(f"DCA {dca_level}: Old TP order already gone (filled/expired)")
+                        except Exception as e:
+                            self.log(f"DCA {dca_level}: Old TP already gone: {e}")
+                        position.take_profit_order_id = None
+
+                    # ================================================================
+                    # ROI-BASED SL/TP after DCA with LIQUIDATION PROTECTION
+                    # REDUCED TP: Exit faster to reduce exposure on DCA positions
+                    # ================================================================
+                    leverage = STRATEGY_CONFIG["leverage"]
+
+                    # Use tighter SL after DCA (cost basis improved)
+                    sl_roi_after_dca = DCA_CONFIG["sl_after_dca_roi"]  # 20% ROI
+
+                    # Get REDUCED TP from DCA level config (exit faster to reduce exposure)
+                    dca_level_config = DCA_CONFIG["levels"][dca_level - 1]  # dca_level is 1-indexed
+                    tp_roi = dca_level_config.get("tp_roi", DCA_CONFIG["take_profit_roi"])
+
+                    sl_price_pct = sl_roi_after_dca / leverage  # 20% / 20 = 1% price move
+                    tp_price_pct = tp_roi / leverage            # e.g., 10% / 20 = 0.5% price move
+
+                    if position.side == "LONG":
+                        new_sl = position.avg_entry_price * (1 - sl_price_pct)
+                        new_tp = position.avg_entry_price * (1 + tp_price_pct)
+                        sl_side = "SELL"
+                    else:
+                        new_sl = position.avg_entry_price * (1 + sl_price_pct)
+                        new_tp = position.avg_entry_price * (1 - tp_price_pct)
+                        sl_side = "BUY"
+
+                    # ================================================================
+                    # GET NEW LIQUIDATION PRICE after DCA (position size changed!)
+                    # ================================================================
+                    if position_data:
+                        new_liq_price = float(position_data.get("liquidation_price", 0))
+                        if new_liq_price > 0:
+                            buffer_pct = DCA_CONFIG.get("liquidation_buffer_pct", 0.01)
+                            if position.side == "LONG":
+                                min_sl_price = new_liq_price * (1 + buffer_pct)
+                                if new_sl < min_sl_price:
+                                    self.log(f"DCA {dca_level}: SL ${new_sl:,.2f} adjusted to ${min_sl_price:,.2f} (liq: ${new_liq_price:,.2f})", level="WARN")
+                                    new_sl = min_sl_price
+                            else:
+                                max_sl_price = new_liq_price * (1 - buffer_pct)
+                                if new_sl > max_sl_price:
+                                    self.log(f"DCA {dca_level}: SL ${new_sl:,.2f} adjusted to ${max_sl_price:,.2f} (liq: ${new_liq_price:,.2f})", level="WARN")
+                                    new_sl = max_sl_price
+
+                            self.log(f"DCA {dca_level}: New liquidation price: ${new_liq_price:,.2f}")
+
+                    # Place new SL/TP orders with retry
+                    sl_order = None
+                    tp_order = None
+
+                    for retry in range(3):
+                        if sl_order is None or "orderId" not in sl_order:
+                            sl_order = self.client.place_stop_loss(symbol, sl_side, position.quantity, new_sl, position_side=position_side)
+                            if "orderId" in sl_order:
+                                position.stop_loss_order_id = sl_order.get("orderId")
+                                self.log(f"DCA {dca_level}: New SL placed @ ${new_sl:,.4f} (ID: {sl_order.get('orderId')})")
+                            else:
+                                self.log(f"DCA {dca_level}: SL order failed (attempt {retry+1}): {sl_order}", level="WARN")
+                                time.sleep(0.3)
+
+                        if tp_order is None or "orderId" not in tp_order:
+                            tp_order = self.client.place_take_profit(symbol, sl_side, position.quantity, new_tp, position_side=position_side)
+                            if "orderId" in tp_order:
+                                position.take_profit_order_id = tp_order.get("orderId")
+                                self.log(f"DCA {dca_level}: New TP placed @ ${new_tp:,.4f} (ID: {tp_order.get('orderId')})")
+                            else:
+                                self.log(f"DCA {dca_level}: TP order failed (attempt {retry+1}): {tp_order}", level="WARN")
+                                time.sleep(0.3)
+
+                        if sl_order and "orderId" in sl_order and tp_order and "orderId" in tp_order:
+                            break
+
+                    self.log(f"DCA {dca_level}: SL @ ${new_sl:,.4f} ({sl_roi_after_dca*100:.0f}% ROI), TP @ ${new_tp:,.4f} ({tp_roi*100:.0f}% ROI)")
+
+                    budget = self.symbol_budgets.get(symbol, 0)
+                    # Use actual Binance entry price for display (fill_price may be 0 from API response)
+                    display_price = position.avg_entry_price if position.avg_entry_price > 0 else fill_price
+                    self.log(
+                        f"DCA {dca_level} {symbol} @ ${display_price:,.4f} | "
+                        f"Margin: +${dca_margin:.2f} (${position.margin_used:.2f}/{budget:.2f}) | "
+                        f"Total Qty: {position.quantity:.6f} | Avg: ${position.avg_entry_price:,.4f}",
+                        level="DCA"
+                    )
+
+            except Exception as e:
+                self.log(f"DCA error for {symbol}: {e}", level="ERROR")
+
+    def manage_positions(self):
+        """Manage all open positions - check TP/SL, Trailing TP, Trend Change, and DCA"""
+        # Sync with Binance
+        self.sync_positions()
+
+        # Check each position
+        for position_key, position in list(self.positions.items()):
+            try:
+                # Extract actual symbol from key (handles both 'DOTUSDT' and 'DOTUSDT_LONG')
+                symbol = self.get_symbol_from_key(position_key)
+                price_data = self.client.get_current_price(symbol)
+                current_price = price_data["price"]
+
+                # ================================================================
+                # HEDGE MANAGEMENT: Check if position is waiting for breakeven
+                # ================================================================
+                hybrid_config = DCA_CONFIG.get("hybrid_hold", {})
+                if position.is_hedged and position.waiting_for_breakeven:
+                    if self.manage_hedged_position(symbol, position, current_price):
+                        continue  # Position was closed due to timeout, skip to next
+
+                # ================================================================
+                # HYBRID HOLD: Check for TREND CHANGE first
+                # If trend reversed, either close+flip OR hedge (for DCA positions)
+                # ================================================================
+                if hybrid_config.get("enabled", False) and hybrid_config.get("flip_on_trend_change", True):
+                    # Skip trend change check if already hedged
+                    if not position.is_hedged and self.check_trend_change(symbol, position):
+                        # Trend has changed
+                        new_trend = self.current_trend.get(symbol, "NEUTRAL")
+                        if new_trend != "NEUTRAL":
+                            # Check if we should use HEDGE strategy (for DCA positions)
+                            hedge_enabled = hybrid_config.get("hedge_on_dca_flip", True)
+                            min_dca_for_hedge = hybrid_config.get("hedge_min_dca_level", 1)
+
+                            if hedge_enabled and position.dca_count >= min_dca_for_hedge:
+                                # Use HEDGE strategy: don't close, open opposite position
+                                self.log(
+                                    f"TREND FLIP {symbol}: DCA L{position.dca_count} detected | "
+                                    f"Using HEDGE strategy instead of close",
+                                    level="TRADE"
+                                )
+                                self.hedge_on_trend_flip(symbol, position, new_trend)
+                            else:
+                                # Normal close and flip (no DCA or hedge disabled)
+                                self.close_and_flip(symbol, position, new_trend)
+                            continue  # Position handled, skip to next
+
+                # ================================================================
+                # STALE EXIT: Close positions held too long at min profit
+                # ================================================================
+                if position.avg_entry_price > 0:
+                    should_close = self._check_stale_exit(symbol, position, current_price)
+                    if should_close:
+                        continue  # Position was closed, skip to next
+
+                # ================================================================
+                # TRAILING TP: Check if we should trail and close on pullback
+                # This runs BEFORE auto-close check to capture profits at peak
+                # ================================================================
+                if position.avg_entry_price > 0:
+                    should_close = self._check_trailing_tp(symbol, position, current_price)
+                    if should_close:
+                        continue  # Position was closed, skip to next
+
+                # ================================================================
+                # AUTO-CLOSE: Check if price is past TP target
+                # If TP order failed or is missing, close position with market order
+                # ================================================================
+                if position.avg_entry_price > 0:
+                    should_close = self._check_auto_close_tp(symbol, position, current_price)
+                    if should_close:
+                        continue  # Position was closed, skip to next
+
+                # Refresh market data for SMART DCA validation
+                if symbol not in self.data_buffer or self.data_buffer[symbol] is None:
+                    try:
+                        market_data = self.client.get_market_data(symbol)
+                        if market_data and "1m" in market_data:
+                            self.data_buffer[symbol] = market_data
+                    except:
+                        pass  # Continue with DCA check even without fresh data
+
+                self.check_dca(symbol, position, current_price)
+
+            except Exception as e:
+                self.log(f"Error managing {symbol}: {e}", level="ERROR")
+
+    def _check_stale_exit(self, symbol: str, position: LivePosition, current_price: float) -> bool:
+        """
+        Close positions held too long once they reach min profit ROI.
+        Returns True if position was closed, False otherwise.
+        """
+        stale_config = DCA_CONFIG.get("stale_exit", {})
+        if not stale_config.get("enabled", False):
+            return False
+
+        max_hold_hours = stale_config.get("max_hold_hours", 4)
+        min_exit_roi = stale_config.get("min_exit_roi", 0.10)
+
+        # Check how long position has been held
+        hold_time = datetime.now() - position.entry_time
+        hold_hours = hold_time.total_seconds() / 3600
+
+        if hold_hours < max_hold_hours:
+            return False  # Not stale yet
+
+        # Position is stale - check if profitable enough to exit
+        margin = position.margin_used
+        if margin <= 0:
+            return False
+
+        # Calculate current ROI
+        if position.side == "LONG":
+            pnl = (current_price - position.avg_entry_price) * position.quantity
+        else:
+            pnl = (position.avg_entry_price - current_price) * position.quantity
+
+        current_roi = pnl / margin
+
+        if current_roi < min_exit_roi:
+            return False  # Not profitable enough yet
+
+        # Position is stale AND profitable - close it!
+        self.log(
+            f"STALE EXIT {symbol}: Held {hold_hours:.1f}h (>{max_hold_hours}h) | "
+            f"ROI: {current_roi*100:.1f}% >= {min_exit_roi*100:.0f}%",
+            level="TRADE"
+        )
+
+        # Close position with market order (in hedge mode, include positionSide)
+        close_side = "SELL" if position.side == "LONG" else "BUY"
+        hedge_position_side = position.side if self.hedge_mode else None
+        order_result = self.client.place_market_order(symbol, close_side, position.quantity, position_side=hedge_position_side)
+
+        if "orderId" in order_result:
+            fill_price = float(order_result.get("avgPrice", current_price))
+
+            # Calculate final PNL
+            if position.side == "LONG":
+                final_pnl = (fill_price - position.avg_entry_price) * position.quantity
+            else:
+                final_pnl = (position.avg_entry_price - fill_price) * position.quantity
+
+            final_roi = final_pnl / margin * 100
+
+            self.log(
+                f"STALE EXIT CLOSED {symbol} @ ${fill_price:,.4f} | "
+                f"P&L: ${final_pnl:+.2f} ({final_roi:+.1f}% ROI) | "
+                f"Held: {hold_hours:.1f} hours",
+                level="TRADE"
+            )
+
+            # Cancel remaining orders
+            try:
+                self.client.cancel_all_orders(symbol)
+            except:
+                pass
+
+            # Log trade
+            self.log_trade(
+                symbol=symbol,
+                side=position.side,
+                entry_price=position.avg_entry_price,
+                exit_price=fill_price,
+                quantity=position.quantity,
+                pnl=final_pnl,
+                exit_type="STALE_EXIT",
+                dca_level=position.dca_count
+            )
+
+            # Update stats
+            self.daily_pnl += final_pnl
+            self.daily_trades += 1
+            if final_pnl > 0:
+                self.daily_wins += 1
+            else:
+                self.daily_losses += 1
+
+            # Release margin and remove position
+            self.symbol_margin_used[symbol] = 0.0
+            del self.positions[symbol]
+
+            return True
+        else:
+            self.log(f"STALE EXIT FAILED {symbol}: {order_result}", level="ERROR")
+            return False
+
+    def _check_trailing_tp(self, symbol: str, position: LivePosition, current_price: float) -> bool:
+        """
+        Check trailing take profit and close position if price pulls back from peak.
+        Returns True if position was closed, False otherwise.
+
+        Logic:
+        1. Calculate current ROI
+        2. Update peak ROI if current is higher
+        3. If peak ROI >= activation threshold, activate trailing
+        4. If trailing active and ROI drops by trail_distance from peak, close position
+        """
+        trailing_config = DCA_CONFIG.get("trailing_tp", {})
+        if not trailing_config.get("enabled", False):
+            return False
+
+        leverage = STRATEGY_CONFIG["leverage"]
+        margin = position.margin_used
+
+        if margin <= 0:
+            return False
+
+        # Calculate current ROI
+        if position.side == "LONG":
+            pnl = (current_price - position.avg_entry_price) * position.quantity
+        else:
+            pnl = (position.avg_entry_price - current_price) * position.quantity
+
+        current_roi = pnl / margin  # ROI as decimal (0.20 = 20%)
+
+        # Update peak ROI (only track positive ROI)
+        if current_roi > position.peak_roi:
+            position.peak_roi = current_roi
+
+        activation_roi = trailing_config.get("activation_roi", 0.20)
+        trail_distance = trailing_config.get("trail_distance_roi", 0.15)
+        min_profit = trailing_config.get("min_profit_roi", 0.10)
+
+        # Check if we should activate trailing
+        if not position.trailing_active and position.peak_roi >= activation_roi:
+            position.trailing_active = True
+            self.log(
+                f"TRAILING TP ACTIVATED {symbol}: Peak ROI {position.peak_roi*100:.1f}% >= {activation_roi*100:.0f}%",
+                level="TRAIL"
+            )
+
+            # Cancel Binance TP order - we'll manage exit manually
+            if position.take_profit_order_id and not position.tp_cancelled:
+                try:
+                    self.client.cancel_order(symbol, position.take_profit_order_id)
+                    position.tp_cancelled = True
+                    self.log(f"  Cancelled Binance TP order {position.take_profit_order_id} - using trailing TP")
+                except Exception as e:
+                    self.log(f"  Could not cancel TP order: {e}", level="WARN")
+
+        # Check if trailing triggered (pullback from peak)
+        if position.trailing_active:
+            roi_from_peak = position.peak_roi - current_roi
+
+            # Close if pullback exceeds trail distance AND still profitable
+            if roi_from_peak >= trail_distance and current_roi >= min_profit:
+                self.log(
+                    f"TRAILING TP TRIGGERED {symbol}: "
+                    f"Peak {position.peak_roi*100:.1f}% -> Current {current_roi*100:.1f}% "
+                    f"(Pullback: {roi_from_peak*100:.1f}% >= {trail_distance*100:.0f}%)",
+                    level="TRADE"
+                )
+
+                # Close position with market order (in hedge mode, include positionSide)
+                close_side = "SELL" if position.side == "LONG" else "BUY"
+                hedge_position_side = position.side if self.hedge_mode else None
+                order_result = self.client.place_market_order(symbol, close_side, position.quantity, position_side=hedge_position_side)
+
+                if "orderId" in order_result:
+                    fill_price = float(order_result.get("avgPrice", current_price))
+
+                    # Calculate final PNL
+                    if position.side == "LONG":
+                        final_pnl = (fill_price - position.avg_entry_price) * position.quantity
+                    else:
+                        final_pnl = (position.avg_entry_price - fill_price) * position.quantity
+
+                    final_roi = final_pnl / margin * 100
+
+                    self.log(
+                        f"TRAILING TP CLOSED {symbol} @ ${fill_price:,.4f} | "
+                        f"P&L: ${final_pnl:+.2f} ({final_roi:+.1f}% ROI) | "
+                        f"Peak was {position.peak_roi*100:.1f}%",
+                        level="TRADE"
+                    )
+
+                    # Cancel remaining SL orders
+                    try:
+                        self.client.cancel_all_orders(symbol)
+                        self.log(f"  Cancelled remaining orders for {symbol}")
+                    except:
+                        pass
+
+                    # Log trade
+                    self.log_trade(
+                        symbol=symbol,
+                        side=position.side,
+                        entry_price=position.avg_entry_price,
+                        exit_price=fill_price,
+                        quantity=position.quantity,
+                        pnl=final_pnl,
+                        exit_type="TRAILING_TP",
+                        dca_level=position.dca_count
+                    )
+
+                    # Update stats
+                    self.daily_pnl += final_pnl
+                    self.daily_trades += 1
+                    if final_pnl > 0:
+                        self.daily_wins += 1
+                    else:
+                        self.daily_losses += 1
+
+                    # Release margin and remove position
+                    self.symbol_margin_used[symbol] = 0.0
+                    del self.positions[symbol]
+
+                    return True
+                else:
+                    self.log(f"TRAILING TP CLOSE FAILED {symbol}: {order_result}", level="ERROR")
+                    return False
+
+        return False
+
+    def _check_auto_close_tp(self, symbol: str, position: LivePosition, current_price: float) -> bool:
+        """
+        Check if position should be auto-closed because price is past TP target.
+        Returns True if position was closed, False otherwise.
+        """
+        leverage = STRATEGY_CONFIG["leverage"]
+
+        # Calculate expected TP based on DCA level
+        dca_level = position.dca_count
+        if dca_level > 0 and dca_level <= len(DCA_CONFIG["levels"]):
+            # Use reduced TP from DCA level config
+            dca_level_config = DCA_CONFIG["levels"][dca_level - 1]
+            tp_roi = dca_level_config.get("tp_roi", DCA_CONFIG["take_profit_roi"])
+        else:
+            tp_roi = DCA_CONFIG["take_profit_roi"]
+
+        tp_price_pct = tp_roi / leverage
+
+        # Calculate expected TP price
+        if position.side == "LONG":
+            expected_tp = position.avg_entry_price * (1 + tp_price_pct)
+            price_past_tp = current_price >= expected_tp
+        else:
+            expected_tp = position.avg_entry_price * (1 - tp_price_pct)
+            price_past_tp = current_price <= expected_tp
+
+        if not price_past_tp:
+            return False
+
+        # Price is past TP - check if we have a valid TP order
+        try:
+            orders = self.client.get_open_orders(symbol)
+            has_valid_tp = False
+
+            for order in orders:
+                order_type = order.get("type", "")
+                order_qty = float(order.get("origQty", 0))
+
+                if order_type == "TAKE_PROFIT_MARKET":
+                    # Check if quantity matches (within 1% tolerance)
+                    if abs(order_qty - position.quantity) <= position.quantity * 0.01:
+                        has_valid_tp = True
+                        break
+
+            if has_valid_tp:
+                # TP order exists with correct qty - Binance should execute it
+                return False
+
+            # NO valid TP order and price is past target - AUTO CLOSE!
+            self.log(f"AUTO-CLOSE {symbol}: Price ${current_price:,.4f} past TP ${expected_tp:,.4f} (no valid TP order)", level="TRADE")
+
+            # Calculate actual P&L
+            if position.side == "LONG":
+                pnl = (current_price - position.avg_entry_price) * position.quantity
+            else:
+                pnl = (position.avg_entry_price - current_price) * position.quantity
+
+            # Close position with market order (in hedge mode, include positionSide)
+            close_side = "SELL" if position.side == "LONG" else "BUY"
+            hedge_position_side = position.side if self.hedge_mode else None
+            order_result = self.client.place_market_order(symbol, close_side, position.quantity, position_side=hedge_position_side)
+
+            if "orderId" in order_result:
+                # Get actual fill price from order result
+                fill_price = float(order_result.get("avgPrice", current_price))
+
+                self.log(f"AUTO-CLOSE {symbol}: CLOSED @ ${fill_price:,.4f} | P&L: ${pnl:+,.2f}", level="TRADE")
+
+                # Cancel any remaining SL orders
+                try:
+                    self.client.cancel_all_orders(symbol)
+                    self.log(f"AUTO-CLOSE {symbol}: Cancelled remaining orders")
+                except:
+                    pass
+
+                # LOG TRADE TO FILE
+                self.log_trade(
+                    symbol=symbol,
+                    side=position.side,
+                    entry_price=position.avg_entry_price,
+                    exit_price=fill_price,
+                    quantity=position.quantity,
+                    pnl=pnl,
+                    exit_type="AUTO_CLOSE",
+                    dca_level=position.dca_count
+                )
+
+                # Update stats
+                self.daily_pnl += pnl
+                self.daily_trades += 1
+                if pnl > 0:
+                    self.daily_wins += 1
+                else:
+                    self.daily_losses += 1
+
+                # Release margin and remove position
+                self.symbol_margin_used[symbol] = 0.0
+                del self.positions[symbol]
+
+                return True
+            else:
+                self.log(f"AUTO-CLOSE {symbol}: FAILED to close - {order_result}", level="ERROR")
+                return False
+
+        except Exception as e:
+            self.log(f"AUTO-CLOSE {symbol}: Error checking TP - {e}", level="ERROR")
+            return False
+
+    def check_entry_signals(self):
+        """Check for entry signals with verbose logging like OANDA/Alpaca system"""
+        # Get balance info
+        balance = self.client.get_balance()
+        open_count = len(self.positions)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+
+        # Print scan header
+        print("\n" + "="*70)
+        print(f"[{timestamp}] SCANNING {len(self.symbols)} SYMBOLS | Balance: ${balance:,.2f} | Positions: {open_count}")
+        print("="*70)
+
+        total_unrealized_pnl = 0.0
+
+        for symbol in self.symbols:
+            try:
+                # Get market data first (need it for logging even if can't trade)
+                market_data = self.client.get_market_data(symbol)
+
+                if not market_data or "1m" not in market_data:
+                    print(f"  {symbol}: NO DATA")
+                    continue
+
+                # Store market data for SMART DCA validation
+                self.data_buffer[symbol] = market_data
+
+                # Get current price and calculate indicators
+                df = market_data["1m"]
+                current_price = df["close"].iloc[-1] if len(df) > 0 else 0
+
+                # Calculate momentum
+                momentum_threshold = MOMENTUM_CONFIG.get("momentum_threshold", 0.08)
+                if len(df) >= 4:
+                    momentum = ((df["close"].iloc[-1] - df["close"].iloc[-4]) / df["close"].iloc[-4]) * 100
+                else:
+                    momentum = 0.0
+
+                # Calculate RSI and ADX for display
+                rsi_val = 50.0
+                adx_val = 20.0
+                if hasattr(self.signal_generator, 'calculate_rsi') and len(df) >= 14:
+                    rsi_series = self.signal_generator.calculate_rsi(df["close"], 14)
+                    if len(rsi_series) > 0:
+                        rsi_val = rsi_series.iloc[-1] if not pd.isna(rsi_series.iloc[-1]) else 50.0
+                if hasattr(self.signal_generator, 'calculate_adx') and len(df) >= 14:
+                    adx_series = self.signal_generator.calculate_adx(df["high"], df["low"], df["close"], 14)
+                    if len(adx_series) > 0:
+                        adx_val = adx_series.iloc[-1] if not pd.isna(adx_series.iloc[-1]) else 20.0
+
+                mom_sign = "+" if momentum >= 0 else ""
+
+                # Get positions for this symbol (handles both normal and hedge mode)
+                symbol_positions = self.get_all_positions_for_symbol(symbol)
+
+                if symbol_positions:
+                    # In hedge mode, we might have BOTH LONG and SHORT positions
+                    price_data = self.client.get_current_price(symbol)
+                    current_price = price_data["price"]
+
+                    for pos in symbol_positions:
+                        # Skip invalid positions (entry price = 0)
+                        if pos.avg_entry_price <= 0:
+                            print(f"  {symbol}: {pos.side} (INVALID - syncing...)")
+                            continue
+
+                        # Calculate P&L
+                        if pos.side == "LONG":
+                            pnl_pct = ((current_price - pos.avg_entry_price) / pos.avg_entry_price) * 100
+                            pnl_dollar = (current_price - pos.avg_entry_price) * pos.quantity
+                        else:
+                            pnl_pct = ((pos.avg_entry_price - current_price) / pos.avg_entry_price) * 100
+                            pnl_dollar = (pos.avg_entry_price - current_price) * pos.quantity
+
+                        total_unrealized_pnl += pnl_dollar
+                        pnl_sign = "+" if pnl_pct >= 0 else ""
+
+                        # Calculate next DCA trigger (ROI-based)
+                        dca_level = pos.dca_count
+                        next_dca_roi = 0.0
+                        if dca_level < len(DCA_CONFIG["levels"]):
+                            next_dca_roi = abs(DCA_CONFIG["levels"][dca_level]["trigger_roi"]) * 100
+
+                        # Calculate current ROI (pnl_pct is already ROI for leveraged positions)
+                        leverage = STRATEGY_CONFIG["leverage"]
+                        current_roi = pnl_pct  # This is already the ROI %
+
+                        # Print position line with ROI (show side for hedge mode)
+                        if self.hedge_mode:
+                            print(f"  {symbol} [{pos.side}]: @ ${pos.avg_entry_price:,.2f} | P&L: ${pnl_dollar:+.2f} ({pnl_sign}{current_roi:.2f}% ROI) | DCA: {dca_level}/4")
+                        else:
+                            print(f"  {symbol}: {pos.side} @ ${pos.avg_entry_price:,.2f} | P&L: ${pnl_dollar:+.2f} ({pnl_sign}{current_roi:.2f}% ROI) | DCA: {dca_level}/4")
+                        print(f"    RSI: {rsi_val:.1f} | ADX: {adx_val:.1f} | Mom: {mom_sign}{momentum:.2f}% | Next DCA: -{next_dca_roi:.0f}% ROI")
+
+                    # In hedge mode, don't skip to next symbol - we may still need to check for missing sides
+                    if not self.hedge_mode:
+                        continue
+
+                    # Check if we have BOTH sides in hedge mode
+                    has_long = f"{symbol}_LONG" in self.positions
+                    has_short = f"{symbol}_SHORT" in self.positions
+                    if has_long and has_short:
+                        continue  # Both sides present, skip to next symbol
+
+                # ============================================
+                # CHECK FOR PENDING RE-ENTRY (ALWAYS HOLD / HEDGE STRATEGY)
+                # If TP just hit, re-enter IMMEDIATELY - no momentum check needed!
+                # ============================================
+                # Check for pending re-entries (handles both 'SYMBOL' and 'SYMBOL_SIDE' keys)
+                pending_keys = []
+                if self.hedge_mode:
+                    # Check for hedge mode keys
+                    if f"{symbol}_LONG" in self.pending_reentry:
+                        pending_keys.append(f"{symbol}_LONG")
+                    if f"{symbol}_SHORT" in self.pending_reentry:
+                        pending_keys.append(f"{symbol}_SHORT")
+                elif symbol in self.pending_reentry:
+                    pending_keys.append(symbol)
+
+                for pending_key in pending_keys:
+                    pending_side = self.pending_reentry[pending_key]
+                    mode_label = "HEDGE" if self.hedge_mode else "ALWAYS HOLD"
+                    print(f"  {symbol}: >>> RE-ENTERING {pending_side} <<< (TP hit, {mode_label})")
+
+                    # Create signal for re-entry
+                    signal_type = "BUY" if pending_side == "LONG" else "SELL"
+                    trend = "BULLISH" if pending_side == "LONG" else "BEARISH"
+
+                    signal = TradingSignal(
+                        signal=signal_type,
+                        signal_type=SignalType.MOMENTUM,
+                        confidence=0.8,
+                        reason=f"{mode_label}_REENTRY",
+                        momentum_value=0.5,
+                        ema_trend=trend,
+                        rsi_value=50.0,
+                        adx_value=25.0
+                    )
+
+                    # Enter position immediately (in hedge mode, pass is_hedge=True)
+                    self.enter_position(symbol, signal, is_hedge=self.hedge_mode)
+
+                    # Remove from pending
+                    del self.pending_reentry[pending_key]
+
+                if pending_keys:
+                    continue
+
+                # No position - check if we can trade
+                can_trade_result, trade_reason = self.can_trade(symbol)
+
+                if not can_trade_result:
+                    if trade_reason == "DAILY_LIMIT":
+                        print(f"  {symbol}: DAILY LIMIT REACHED")
+                    elif trade_reason == "MAX_POSITIONS":
+                        print(f"  {symbol}: MAX POSITIONS REACHED")
+                    elif trade_reason.startswith("COOLDOWN"):
+                        # Show as momentum check with cooldown timer
+                        print(f"  {symbol}: MOM-CHECK @ ${current_price:,.2f} ({mom_sign}{momentum:.2f}% vs {momentum_threshold:.2f}%)")
+                        print(f"    RSI: {rsi_val:.1f} | ADX: {adx_val:.1f} | {trade_reason.replace('_', ' ')}")
+                    else:
+                        print(f"  {symbol}: {trade_reason} @ ${current_price:,.2f}")
+                    continue
+
+                self.last_check_time[symbol] = datetime.now()
+
+                # Generate signal
+                if self.use_mtf:
+                    signal = self.signal_generator.generate_signal_mtf(symbol, market_data)
+                else:
+                    signal = self.signal_generator.generate_signal(symbol, market_data["1m"])
+
+                if signal.signal is not None:
+                    # SIGNAL FOUND!
+                    print(f"  {symbol}: >>> {signal.signal} SIGNAL <<< Conf={signal.confidence:.0%} @ ${current_price:,.2f}")
+                    print(f"    RSI: {rsi_val:.1f} | ADX: {adx_val:.1f} | Mom: {mom_sign}{momentum:.2f}%")
+                    print(f"    Reason: {signal.reason}")
+                    self.enter_position(symbol, signal)
+                else:
+                    # No signal - show detailed reason
+                    reason = signal.reason if signal.reason else "Filter failed"
+
+                    if "Cooldown" in reason:
+                        # Bar-based signal cooldown
+                        print(f"  {symbol}: SIGNAL COOLDOWN @ ${current_price:,.2f} | Mom: {mom_sign}{momentum:.2f}%")
+                        print(f"    RSI: {rsi_val:.1f} | ADX: {adx_val:.1f} | {reason}")
+                    elif abs(momentum) < momentum_threshold:
+                        # No momentum spike
+                        print(f"  {symbol}: MOM-CHECK: No spike ({mom_sign}{momentum:.2f}% < {momentum_threshold:.2f}%) @ ${current_price:,.2f}")
+                        print(f"    RSI: {rsi_val:.1f} | ADX: {adx_val:.1f}")
+                    elif "Trend not aligned" in reason:
+                        # Momentum but wrong trend
+                        print(f"  {symbol}: WAIT @ ${current_price:,.2f} | Mom: {mom_sign}{momentum:.2f}% (Trend mismatch)")
+                        print(f"    RSI: {rsi_val:.1f} | ADX: {adx_val:.1f} | {reason}")
+                    elif "RSI" in reason:
+                        # RSI filter
+                        print(f"  {symbol}: WAIT @ ${current_price:,.2f} | Mom: {mom_sign}{momentum:.2f}% (RSI filter)")
+                        print(f"    RSI: {rsi_val:.1f} | ADX: {adx_val:.1f} | {reason}")
+                    elif "ADX" in reason or "Weak trend" in reason:
+                        # ADX filter
+                        print(f"  {symbol}: WAIT @ ${current_price:,.2f} | Mom: {mom_sign}{momentum:.2f}% (Weak trend)")
+                        print(f"    RSI: {rsi_val:.1f} | ADX: {adx_val:.1f} | {reason}")
+                    else:
+                        # Generic hold
+                        print(f"  {symbol}: HOLD @ ${current_price:,.2f} | Mom: {mom_sign}{momentum:.2f}%")
+                        print(f"    RSI: {rsi_val:.1f} | ADX: {adx_val:.1f} | {reason}")
+
+            except Exception as e:
+                print(f"  {symbol}: ERROR - {e}")
+
+        # Show detailed position info from BINANCE (fresh data)
+        if self.positions:
+            mode_label = "LIVE" if not self.testnet else "TESTNET"
+            print(f"\n--- BINANCE {mode_label} POSITIONS ({len(self.positions)}) ---")
+            leverage = STRATEGY_CONFIG["leverage"]
+            total_pnl_from_binance = 0.0  # Track actual total PNL
+
+            for position_key, pos in self.positions.items():
+                try:
+                    # Extract actual symbol from key (handles both 'DOTUSDT' and 'DOTUSDT_LONG')
+                    symbol = self.get_symbol_from_key(position_key)
+                    side = pos.side
+                    dca_level = pos.dca_count
+
+                    # Get FRESH data from Binance API (in hedge mode, specify position side)
+                    if self.hedge_mode:
+                        binance_pos = self.client.get_position(symbol, position_side=side)
+                    else:
+                        binance_pos = self.client.get_position(symbol)
+                    if not binance_pos:
+                        print(f"  {position_key}: {side} (Position not found on Binance)")
+                        continue
+
+                    # Use Binance's actual values
+                    entry_price = float(binance_pos.get("entry_price", 0))
+                    quantity = float(binance_pos.get("quantity", 0))
+                    pnl_dollar = float(binance_pos.get("unrealized_pnl", 0))
+                    liq_price = float(binance_pos.get("liquidation_price", 0))
+                    margin_used = float(binance_pos.get("isolated_wallet", 0)) or pos.margin_used
+
+                    # Skip if no entry price
+                    if entry_price <= 0:
+                        print(f"  {position_key}: {side} (SYNCING - waiting for entry price)")
+                        continue
+
+                    # Get current price
+                    price_data = self.client.get_current_price(symbol)
+                    mark_price = price_data["price"]
+
+                    # Add to total PNL
+                    total_pnl_from_binance += pnl_dollar
+
+                    # Calculate ROI from actual PNL and margin
+                    roi_pct = (pnl_dollar / margin_used * 100) if margin_used > 0 else 0
+
+                    # Position value
+                    position_value = mark_price * quantity
+
+                    # Get actual SL/TP from Binance orders
+                    tp_price = 0.0
+                    sl_price = 0.0
+                    try:
+                        orders = self.client.get_open_orders(symbol)
+                        for order in orders:
+                            order_type = order.get("type", "")
+                            stop_price = float(order.get("stopPrice", 0))
+                            order_side = order.get("side", "")
+                            if side == "LONG":
+                                if order_type == "TAKE_PROFIT_MARKET" and order_side == "SELL" and stop_price > entry_price:
+                                    tp_price = stop_price
+                                elif order_type == "STOP_MARKET" and order_side == "SELL" and stop_price < entry_price:
+                                    sl_price = stop_price
+                            else:
+                                if order_type == "TAKE_PROFIT_MARKET" and order_side == "BUY" and stop_price < entry_price:
+                                    tp_price = stop_price
+                                elif order_type == "STOP_MARKET" and order_side == "BUY" and stop_price > entry_price:
+                                    sl_price = stop_price
+                    except:
+                        pass
+
+                    # Calculate TP away percentage and ROI
+                    if tp_price > 0:
+                        if side == "LONG":
+                            tp_away = ((tp_price - mark_price) / mark_price) * 100
+                        else:
+                            tp_away = ((mark_price - tp_price) / mark_price) * 100
+                        tp_roi = abs(tp_price - entry_price) / entry_price * leverage * 100
+                    else:
+                        tp_away = 0
+                        tp_roi = DCA_CONFIG["take_profit_roi"] * 100
+
+                    # DCA level already set from pos.dca_count above
+
+                    # Next DCA info (ROI-based with PAIR-SPECIFIC VOLATILITY)
+                    if dca_level < len(DCA_CONFIG["levels"]):
+                        base_next_dca_roi = abs(DCA_CONFIG["levels"][dca_level]["trigger_roi"])
+
+                        # Apply volatility multiplier for this symbol
+                        symbol_settings = SYMBOL_SETTINGS.get(symbol, {})
+                        volatility_mult = symbol_settings.get("dca_volatility_mult", 1.0)
+                        next_dca_roi = base_next_dca_roi * volatility_mult  # Adjusted for volatility
+
+                        next_dca_price_pct = next_dca_roi / leverage
+                        if side == "LONG":
+                            next_dca_price = entry_price * (1 - next_dca_price_pct)
+                        else:
+                            next_dca_price = entry_price * (1 + next_dca_price_pct)
+                    else:
+                        next_dca_price = 0
+                        next_dca_roi = 0
+                        volatility_mult = 1.0
+
+                    roi_sign = "+" if roi_pct >= 0 else ""
+
+                    # Show volatility multiplier if not default
+                    vol_indicator = f" [x{volatility_mult:.1f}]" if volatility_mult != 1.0 else ""
+
+                    # Display position key (includes side in hedge mode)
+                    display_label = position_key if self.hedge_mode else symbol
+                    print(f"  {display_label}: {quantity:.6f} {side} @ ${entry_price:,.4f}{vol_indicator}")
+                    print(f"    Mark: ${mark_price:,.4f} | Value: ${position_value:,.2f} | P&L: ${pnl_dollar:+.2f} ({roi_sign}{roi_pct:.2f}%)")
+                    if tp_price > 0 and sl_price > 0:
+                        print(f"    TP: ${tp_price:,.4f} ({tp_roi:.1f}%) | SL: ${sl_price:,.4f} | Liq: ${liq_price:,.4f}")
+                    elif tp_price > 0:
+                        print(f"    TP: ${tp_price:,.4f} ({tp_roi:.1f}%) | SL: Not set | Liq: ${liq_price:,.4f}")
+                    else:
+                        print(f"    TP/SL: Orders not found | Liq: ${liq_price:,.4f}")
+                    # Show trailing TP status if active
+                    local_pos = self.positions.get(position_key)
+                    if local_pos and local_pos.trailing_active:
+                        trailing_config = DCA_CONFIG.get("trailing_tp", {})
+                        trail_distance = trailing_config.get("trail_distance_roi", 0.15) * 100
+                        trigger_roi = (local_pos.peak_roi - trailing_config.get("trail_distance_roi", 0.15)) * 100
+                        print(f"    DCA: {dca_level}/4 | Margin: ${margin_used:.2f} | TRAILING TP: Peak {local_pos.peak_roi*100:.1f}% (exit @ {trigger_roi:.1f}%)")
+                    elif local_pos and local_pos.peak_roi > 0:
+                        trailing_config = DCA_CONFIG.get("trailing_tp", {})
+                        activation = trailing_config.get("activation_roi", 0.20) * 100
+                        print(f"    DCA: {dca_level}/4 | Margin: ${margin_used:.2f} | Peak ROI: {local_pos.peak_roi*100:.1f}% (trail @ {activation:.0f}%)")
+                    else:
+                        print(f"    DCA: {dca_level}/4 | Margin: ${margin_used:.2f}")
+                    if next_dca_price > 0:
+                        # Check if DCA trigger is close and show reversal status
+                        current_roi_loss = abs(roi_pct) / 100  # Convert to decimal
+                        dca_trigger = next_dca_roi  # Already in decimal form (with volatility mult)
+                        roi_to_dca = (dca_trigger - current_roi_loss) * 100  # Percentage points to DCA
+
+                        if roi_to_dca <= 5:  # Within 5% ROI of DCA trigger
+                            # Check Smart DCA status
+                            dca_status = "PENDING"
+                            if symbol in self.data_buffer and self.data_buffer[symbol] is not None:
+                                df = self.data_buffer[symbol].get("1m") if isinstance(self.data_buffer[symbol], dict) else self.data_buffer[symbol]
+                                if df is not None:
+                                    can_dca, reason = self.signal_generator.can_dca(df, side, dca_level + 1)
+                                    if can_dca:
+                                        dca_status = f"READY ({reason})"
+                                    else:
+                                        dca_status = f"WAITING ({reason})"
+                            print(f"    Next DCA @ ${next_dca_price:,.4f} (-{next_dca_roi*100:.0f}% ROI) | {roi_to_dca:.1f}% away | {dca_status}")
+                        else:
+                            print(f"    Next DCA @ ${next_dca_price:,.4f} (-{next_dca_roi*100:.0f}% ROI) | {roi_to_dca:.1f}% away")
+
+                except Exception as e:
+                    print(f"  {position_key}: Error displaying - {e}")
+
+            print(f"\n  TOTAL Unrealized P&L: ${total_pnl_from_binance:+.2f}")
+        else:
+            print("\n--- No open positions ---")
+
+        # Session stats
+        if hasattr(self, 'session_start_time'):
+            runtime = datetime.now() - self.session_start_time
+        else:
+            self.session_start_time = datetime.now()
+            runtime = timedelta(seconds=0)
+
+        print(f"\n--- SESSION STATS (Runtime: {runtime}) ---")
+        print(f"  Trades Today: {self.daily_trades} (W:{self.daily_wins} / L:{self.daily_losses})")
+        win_rate = (self.daily_wins / self.daily_trades * 100) if self.daily_trades > 0 else 0
+        print(f"  Win Rate: {win_rate:.1f}%")
+        print(f"  Daily P&L: ${self.daily_pnl:+.2f}")
+
+        print(f"\nNext scan in 60 seconds... (Ctrl+C to stop)")
+
+    def print_status(self):
+        """Print current status with margin allocation info"""
+        print("\n" + "="*80)
+        mode = "TESTNET" if self.testnet else "LIVE"
+        print(f"BINANCE FUTURES {mode} TRADING - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("="*80)
+
+        try:
+            balance = self.client.get_balance()
+            available = self.client.get_available_balance()
+            print(f"\nBalance: ${balance:,.2f} (Available: ${available:,.2f})")
+            print(f"Daily Trades: {self.daily_trades}/{STRATEGY_CONFIG['max_trades_per_day']}")
+            print(f"Leverage: {self.leverage}x (ISOLATED)")
+
+            # Show margin allocation summary
+            total_margin_used = sum(self.symbol_margin_used.values())
+            total_budget = sum(self.symbol_budgets.values())
+            if total_budget > 0:
+                print(f"\nMargin Allocation: ${total_margin_used:,.2f} / ${total_budget:,.2f} used")
+
+            positions = self.client.get_positions()
+            if positions:
+                print(f"\nOpen Positions ({len(positions)}):")
+                for pos in positions:
+                    symbol = pos['symbol']
+                    pnl = pos.get("unrealized_pnl", 0)
+                    local_pos = self.positions.get(symbol)
+                    margin = local_pos.margin_used if local_pos else 0
+                    budget = self.symbol_budgets.get(symbol, 0)
+
+                    print(f"  {symbol} {pos['side']}: "
+                          f"Entry ${pos['entry_price']:,.2f} | "
+                          f"Qty: {pos['quantity']:.6f} | "
+                          f"Margin: ${margin:.2f}/{budget:.2f} | "
+                          f"P&L: ${pnl:+.2f}")
+            else:
+                print("\nNo open positions")
+
+        except Exception as e:
+            print(f"\nError getting status: {e}")
+
+        print("="*80 + "\n")
+
+    def run(self, duration_hours: float = 0):
+        """
+        Run live trading
+
+        Args:
+            duration_hours: How long to run (0 = run continuously)
+        """
+        self.running = True
+        start_time = datetime.now()
+        continuous = duration_hours == 0
+        end_time = None if continuous else start_time + timedelta(hours=duration_hours)
+
+        mode = "TESTNET" if self.testnet else "LIVE"
+        duration_str = "CONTINUOUSLY (24/7)" if continuous else f"for {duration_hours} hours"
+        self.log(f"Starting {mode} trading {duration_str}")
+        self.log(f"Symbols: {', '.join(self.symbols)}")
+
+        # Test connection
+        if not self.client.test_connection():
+            self.log("Connection failed!", level="ERROR")
+            return
+
+        # Get initial balance
+        self.starting_balance = self.client.get_balance()
+        self.daily_start_balance = self.starting_balance  # Also set daily baseline
+        self.log(f"Starting balance: ${self.starting_balance:,.2f}")
+
+        # Initialize dynamic fund allocation
+        self.initialize_dynamic_allocation()
+
+        # Setup symbols (leverage, margin type)
+        for symbol in self.symbols:
+            self.setup_symbol(symbol)
+
+        # Sync existing positions from previous sessions
+        self.sync_existing_positions()
+
+        check_interval = 60  # Scan every 60 seconds (like Forex system)
+        status_interval = 300
+        last_status = datetime.now()
+
+        # Track session start for runtime display
+        self.session_start_time = datetime.now()
+
+        self.log(f"Scan interval: {check_interval}s | Status update: {status_interval}s")
+
+        # ================================================================
+        # HEDGE MODE or HYBRID HOLD: AUTO-ENTER ON STARTUP
+        # ================================================================
+        hedge_config = DCA_CONFIG.get("hedge_mode", {})
+        hybrid_config = DCA_CONFIG.get("hybrid_hold", {})
+
+        if hedge_config.get("enabled", False):
+            # HEDGE MODE: Enter BOTH LONG and SHORT on each symbol
+            self.log("=" * 60, level="TRADE")
+            self.log("HEDGE MODE: Auto-entering LONG + SHORT positions...", level="TRADE")
+            self.log("=" * 60, level="TRADE")
+            for symbol in self.symbols:
+                self.auto_enter_hedge_positions(symbol)
+                time.sleep(1)  # Pause between symbols to avoid rate limiting
+
+        elif hybrid_config.get("enabled", False) and hybrid_config.get("auto_enter_on_start", True):
+            # HYBRID MODE: Enter based on trend direction
+            self.log("HYBRID MODE: Auto-entering positions based on trend detection...", level="TRADE")
+            for symbol in self.symbols:
+                if symbol not in self.positions:
+                    self.auto_enter_on_trend(symbol)
+                else:
+                    self.log(f"HYBRID: {symbol} already has position, skipping auto-enter", level="INFO")
+
+        try:
+            while self.running and (continuous or datetime.now() < end_time):
+                self.check_daily_reset()
+                self.check_entry_signals()
+                self.manage_positions()
+
+                if (datetime.now() - last_status).total_seconds() >= status_interval:
+                    self.print_status()
+                    last_status = datetime.now()
+
+                time.sleep(check_interval)
+
+        except KeyboardInterrupt:
+            print("\n\n[!] Stopping trading...")
+        finally:
+            self.running = False
+            self.print_session_summary()
+            self.log("Trading stopped")
+
+    def stop(self):
+        """Stop trading"""
+        self.running = False
+
+    def sync_existing_positions(self):
+        """
+        Sync existing positions from Binance on startup.
+        This allows the bot to manage positions from previous sessions.
+        """
+        self.log("Checking for existing positions...")
+
+        try:
+            binance_positions = self.client.get_positions()
+
+            if not binance_positions:
+                self.log("No existing positions found")
+                return
+
+            self.log(f"Found {len(binance_positions)} existing position(s)")
+
+            for pos in binance_positions:
+                symbol = pos["symbol"]
+                position_side = pos["side"]  # LONG or SHORT
+
+                # Skip if not in our trading symbols
+                if symbol not in self.symbols:
+                    self.log(f"  Skipping {symbol} (not in trading list)")
+                    continue
+
+                # In hedge mode, use SYMBOL_SIDE as key (e.g., DOTUSDT_LONG)
+                if self.hedge_mode:
+                    position_key = f"{symbol}_{position_side}"
+                else:
+                    position_key = symbol
+
+                # Skip if already tracking
+                if position_key in self.positions:
+                    continue
+
+                # Estimate margin used based on position value
+                position_value = pos["entry_price"] * pos["quantity"]
+                estimated_margin = position_value / self.leverage
+
+                # Get actual margin from Binance if available
+                actual_margin = float(pos.get("isolated_wallet", 0)) or estimated_margin
+
+                # Auto-detect DCA level from margin used
+                dca_level = self.detect_dca_level_from_margin(symbol, actual_margin)
+
+                # Create local position object
+                self.positions[position_key] = LivePosition(
+                    symbol=symbol,
+                    side=position_side,
+                    entry_price=pos["entry_price"],
+                    quantity=pos["quantity"],
+                    entry_time=datetime.now(),  # Unknown actual entry time
+                    avg_entry_price=pos["entry_price"],
+                    margin_used=actual_margin,
+                    dca_count=dca_level
+                )
+
+                self.symbol_margin_used[position_key] = actual_margin
+
+                # Calculate current P&L
+                current_price = pos["entry_price"]
+                try:
+                    price_data = self.client.get_current_price(symbol)
+                    current_price = price_data["price"]
+
+                    if pos["side"] == "LONG":
+                        pnl_pct = ((current_price - pos["entry_price"]) / pos["entry_price"]) * 100
+                    else:
+                        pnl_pct = ((pos["entry_price"] - current_price) / pos["entry_price"]) * 100
+
+                    self.log(f"  Synced {symbol} {pos['side']}: Entry ${pos['entry_price']:,.2f} | Qty: {pos['quantity']:.6f} | P&L: {pnl_pct:+.2f}% | DCA: {dca_level}/4")
+                except:
+                    self.log(f"  Synced {symbol} {pos['side']}: Entry ${pos['entry_price']:,.2f} | Qty: {pos['quantity']:.6f} | DCA: {dca_level}/4")
+
+                # Check if position has SL/TP orders - if DCA level > 0, update TP to reduced level
+                self._ensure_sl_tp_orders(symbol, pos, dca_level, position_key=position_key)
+
+            self.log(f"Position sync complete - Managing {len(self.positions)} position(s)")
+
+        except Exception as e:
+            self.log(f"Error syncing positions: {e}", level="ERROR")
+
+    def _ensure_sl_tp_orders(self, symbol: str, pos: dict, dca_level: int = 0, position_key: str = None):
+        """
+        Check if a position has SL/TP orders, and place/update them if needed.
+        This is called for synced positions from previous sessions.
+        If DCA level > 0, update TP to reduced level for faster exit.
+        position_key is used for hedge mode (e.g., DOTUSDT_LONG)
+        """
+        # Use position_key for self.positions lookup, default to symbol for non-hedge mode
+        if position_key is None:
+            position_key = symbol
+
+        try:
+            # Get open orders for this symbol
+            orders = self.client.get_open_orders(symbol)
+
+            has_sl = False
+            has_tp = False
+            tp_order_id = None
+            current_tp_price = 0.0
+
+            # Get the position side for filtering orders in hedge mode
+            position_side = pos["side"]  # LONG or SHORT
+
+            self.log(f"  {symbol} [{position_side}]: Found {len(orders)} open orders")
+            for order in orders:
+                order_type = order.get("type", "")
+                order_side = order.get("side", "")
+                order_position_side = order.get("positionSide", "BOTH")
+                trigger_price = float(order.get("stopPrice", order.get("triggerPrice", 0)))
+
+                # In hedge mode, only count orders that match our position side
+                if self.hedge_mode and order_position_side != position_side:
+                    continue
+
+                self.log(f"    Order: type={order_type}, side={order_side}, positionSide={order_position_side}, trigger=${trigger_price:,.4f}")
+                if order_type == "STOP_MARKET":
+                    has_sl = True
+                elif order_type == "TAKE_PROFIT_MARKET":
+                    has_tp = True
+                    tp_order_id = order.get("orderId")
+                    current_tp_price = float(order.get("stopPrice", 0))
+
+            # Need to place missing orders
+            entry_price = pos["entry_price"]
+            quantity = pos["quantity"]
+            # position_side already set above for order filtering
+
+            if entry_price <= 0:
+                self.log(f"  Cannot place SL/TP for {symbol}: entry_price is {entry_price}", level="WARN")
+                return
+
+            # Calculate SL/TP prices using ROI-BASED calculation for leveraged scalping
+            # Formula: price_move = roi / leverage
+            leverage = STRATEGY_CONFIG["leverage"]  # 20x
+
+            if DCA_CONFIG["enabled"]:
+                # Get TP based on DCA level (reduced TP for faster exit on DCA positions)
+                if dca_level > 0 and dca_level <= len(DCA_CONFIG["levels"]):
+                    # Use reduced TP from DCA level config
+                    dca_level_config = DCA_CONFIG["levels"][dca_level - 1]
+                    tp_roi = dca_level_config.get("tp_roi", DCA_CONFIG["take_profit_roi"])
+                    sl_roi = DCA_CONFIG["sl_after_dca_roi"]  # Tighter SL after DCA
+                    self.log(f"  {symbol} DCA level {dca_level}: Using reduced TP {tp_roi*100:.0f}% ROI")
+                else:
+                    # Initial entry - use default TP
+                    tp_roi = DCA_CONFIG["take_profit_roi"]    # 15% ROI
+                    sl_roi = DCA_CONFIG["stop_loss_roi"]      # 80% ROI
+
+                tp_price_pct = tp_roi / leverage
+                sl_price_pct = sl_roi / leverage
+            else:
+                # Price-based for non-DCA (legacy)
+                tp_price_pct = STRATEGY_CONFIG["take_profit_pct"]  # 2% price move
+                sl_price_pct = STRATEGY_CONFIG["stop_loss_pct"]    # 1% price move
+                tp_roi = tp_price_pct
+                sl_roi = sl_price_pct
+
+            if position_side == "LONG":
+                stop_loss_price = entry_price * (1 - sl_price_pct)
+                take_profit_price = entry_price * (1 + tp_price_pct)
+                sl_side = "SELL"
+                tp_side = "SELL"
+            else:
+                stop_loss_price = entry_price * (1 + sl_price_pct)
+                take_profit_price = entry_price * (1 - tp_price_pct)
+                sl_side = "BUY"
+                tp_side = "BUY"
+
+            # ================================================================
+            # LIQUIDATION PROTECTION: Ensure SL is ALWAYS before liquidation
+            # ================================================================
+            liq_price = float(pos.get("liquidation_price", 0))
+            if liq_price > 0:
+                buffer_pct = DCA_CONFIG.get("liquidation_buffer_pct", 0.01)  # 1% buffer
+                if position_side == "LONG":
+                    # For LONG: SL must be ABOVE liquidation price
+                    min_sl_price = liq_price * (1 + buffer_pct)
+                    if stop_loss_price < min_sl_price:
+                        self.log(f"  SL ${stop_loss_price:,.2f} too close to liquidation ${liq_price:,.2f}, adjusting to ${min_sl_price:,.2f}", level="WARN")
+                        stop_loss_price = min_sl_price
+                else:
+                    # For SHORT: SL must be BELOW liquidation price
+                    max_sl_price = liq_price * (1 - buffer_pct)
+                    if stop_loss_price > max_sl_price:
+                        self.log(f"  SL ${stop_loss_price:,.2f} too close to liquidation ${liq_price:,.2f}, adjusting to ${max_sl_price:,.2f}", level="WARN")
+                        stop_loss_price = max_sl_price
+
+            # Place missing SL order
+            if not has_sl:
+                if DCA_CONFIG["enabled"]:
+                    self.log(f"  Placing SL for {symbol} @ ${stop_loss_price:,.2f} ({sl_roi*100:.0f}% ROI loss)")
+                else:
+                    self.log(f"  Placing SL for {symbol} @ ${stop_loss_price:,.2f}")
+                hedge_position_side = position_side if self.hedge_mode else None
+                sl_order = self.client.place_stop_loss(symbol, sl_side, quantity, stop_loss_price, position_side=hedge_position_side)
+                if "orderId" in sl_order:
+                    if position_key in self.positions:
+                        self.positions[position_key].stop_loss_order_id = sl_order["orderId"]
+                    self.log(f"  SL order placed: ID={sl_order['orderId']}")
+                else:
+                    self.log(f"  SL order FAILED: {sl_order}", level="ERROR")
+
+            # Place or UPDATE TP order
+            # If DCA level > 0, check if existing TP needs to be reduced
+            need_new_tp = not has_tp
+            if has_tp and dca_level > 0 and tp_order_id:
+                # Check if current TP is higher than reduced TP target
+                if position_side == "LONG" and current_tp_price > take_profit_price * 1.001:
+                    # Current TP is too high, need to reduce it
+                    self.log(f"  {symbol}: Reducing TP from ${current_tp_price:,.4f} to ${take_profit_price:,.4f} (DCA level {dca_level})")
+                    try:
+                        self.client.cancel_order(symbol, tp_order_id)
+                        need_new_tp = True
+                    except Exception as e:
+                        self.log(f"  Failed to cancel old TP: {e}", level="WARN")
+                elif position_side == "SHORT" and current_tp_price < take_profit_price * 0.999:
+                    # Current TP is too low (for short), need to increase it
+                    self.log(f"  {symbol}: Adjusting TP from ${current_tp_price:,.4f} to ${take_profit_price:,.4f} (DCA level {dca_level})")
+                    try:
+                        self.client.cancel_order(symbol, tp_order_id)
+                        need_new_tp = True
+                    except Exception as e:
+                        self.log(f"  Failed to cancel old TP: {e}", level="WARN")
+
+            if need_new_tp:
+                if DCA_CONFIG["enabled"]:
+                    self.log(f"  Placing TP for {symbol} @ ${take_profit_price:,.2f} ({tp_roi*100:.1f}% ROI target)")
+                else:
+                    self.log(f"  Placing TP for {symbol} @ ${take_profit_price:,.2f}")
+                hedge_position_side = position_side if self.hedge_mode else None
+                tp_order = self.client.place_take_profit(symbol, tp_side, quantity, take_profit_price, position_side=hedge_position_side)
+                if "orderId" in tp_order:
+                    if position_key in self.positions:
+                        self.positions[position_key].take_profit_order_id = tp_order["orderId"]
+                    self.log(f"  TP order placed: ID={tp_order['orderId']}")
+                else:
+                    self.log(f"  TP order FAILED: {tp_order}", level="ERROR")
+            elif has_tp and has_sl:
+                self.log(f"  {symbol} already has SL/TP orders")
+
+        except Exception as e:
+            self.log(f"  Error ensuring SL/TP for {symbol}: {e}", level="ERROR")
+
+    def close_all_positions(self):
+        """Close all open positions with market orders"""
+        if not self.positions:
+            self.log("No positions to close")
+            return
+
+        self.log(f"Closing {len(self.positions)} position(s)...")
+
+        closed_count = 0
+        for position_key, pos in list(self.positions.items()):
+            try:
+                # Extract actual symbol from key (handles both 'DOTUSDT' and 'DOTUSDT_LONG')
+                symbol = self.get_symbol_from_key(position_key)
+
+                # Determine close side (opposite of position side)
+                close_side = "SELL" if pos.side == "LONG" else "BUY"
+
+                # Place market order to close (in hedge mode, include positionSide)
+                self.log(f"  Closing {position_key} {pos.side} ({pos.quantity:.6f})...")
+                position_side = pos.side if self.hedge_mode else None
+                order_result = self.client.place_market_order(symbol, close_side, pos.quantity, position_side=position_side)
+
+                if "orderId" in order_result:
+                    # Cancel any pending SL/TP orders
+                    try:
+                        self.client.cancel_all_orders(symbol)
+                    except:
+                        pass
+
+                    # Get fill price
+                    fill_price = float(order_result.get("avgPrice", 0))
+                    if fill_price == 0:
+                        time.sleep(0.3)
+                        price_data = self.client.get_current_price(symbol)
+                        fill_price = price_data["price"]
+
+                    # Calculate P&L
+                    if pos.side == "LONG":
+                        pnl = (fill_price - pos.avg_entry_price) * pos.quantity
+                    else:
+                        pnl = (pos.avg_entry_price - fill_price) * pos.quantity
+
+                    self.log(f"  CLOSED {position_key} @ ${fill_price:,.2f} | P&L: ${pnl:+.2f}")
+                    self.daily_pnl += pnl
+
+                    # Release margin
+                    self.symbol_margin_used[symbol] = 0.0
+                    del self.positions[position_key]
+                    closed_count += 1
+                else:
+                    self.log(f"  Failed to close {position_key}: {order_result}", level="ERROR")
+
+            except Exception as e:
+                self.log(f"  Error closing {position_key}: {e}", level="ERROR")
+
+        self.log(f"Closed {closed_count}/{len(self.positions) + closed_count} positions")
+
+    def prompt_close_positions(self):
+        """Ask user whether to close positions on stop"""
+        if not self.positions:
+            return
+
+        print("\n" + "!"*60)
+        print(f"! You have {len(self.positions)} OPEN POSITION(S) !")
+        print("!"*60)
+
+        # Show positions with P&L
+        total_pnl = 0.0
+        for position_key, pos in self.positions.items():
+            try:
+                # Extract actual symbol from key (handles both 'DOTUSDT' and 'DOTUSDT_LONG')
+                symbol = self.get_symbol_from_key(position_key)
+                price_data = self.client.get_current_price(symbol)
+                current_price = price_data["price"]
+
+                if pos.side == "LONG":
+                    pnl = (current_price - pos.avg_entry_price) * pos.quantity
+                    pnl_pct = ((current_price - pos.avg_entry_price) / pos.avg_entry_price) * 100
+                else:
+                    pnl = (pos.avg_entry_price - current_price) * pos.quantity
+                    pnl_pct = ((pos.avg_entry_price - current_price) / pos.avg_entry_price) * 100
+
+                total_pnl += pnl
+                print(f"  {position_key} {pos.side}: ${pnl:+.2f} ({pnl_pct:+.2f}%)")
+            except:
+                print(f"  {position_key} {pos.side}: Entry ${pos.avg_entry_price:,.2f}")
+
+        print(f"\n  TOTAL Unrealized P&L: ${total_pnl:+.2f}")
+        print("\nOptions:")
+        print("  [1] CLOSE ALL - Close all positions now (market orders)")
+        print("  [2] KEEP OPEN - Leave positions open (manage manually)")
+        print("")
+
+        try:
+            choice = input("Enter choice (1 or 2): ").strip()
+
+            if choice == "1":
+                print("\nClosing all positions...")
+                self.close_all_positions()
+            else:
+                print("\nKeeping positions open.")
+                print("You can manage them manually at: https://demo.binance.com/en/futures")
+        except:
+            print("\nNo input - keeping positions open.")
+
+    def print_session_summary(self):
+        """Print session summary like the Forex system"""
+        print("\n" + "="*70)
+        print("SESSION SUMMARY")
+        print("="*70)
+
+        # Get current balance
+        try:
+            current_balance = self.client.get_balance()
+        except:
+            current_balance = self.starting_balance
+
+        # Calculate session P&L
+        session_pnl = current_balance - self.starting_balance
+        session_pnl_pct = (session_pnl / self.starting_balance * 100) if self.starting_balance > 0 else 0
+
+        print(f"Starting Balance: ${self.starting_balance:,.2f}")
+        print(f"Final Balance: ${current_balance:,.2f}")
+        print(f"Session P&L: ${session_pnl:+,.2f} ({session_pnl_pct:+.2f}%)")
+        print(f"Total Trades: {self.daily_trades}")
+
+        # Show open positions
+        if self.positions:
+            print(f"\nOpen Positions ({len(self.positions)}):")
+            for position_key, pos in self.positions.items():
+                try:
+                    # Extract actual symbol from key (handles both 'DOTUSDT' and 'DOTUSDT_LONG')
+                    symbol = self.get_symbol_from_key(position_key)
+                    price_data = self.client.get_current_price(symbol)
+                    current_price = price_data["price"]
+
+                    if pos.avg_entry_price > 0:
+                        if pos.side == "LONG":
+                            pnl_pct = ((current_price - pos.avg_entry_price) / pos.avg_entry_price) * 100
+                        else:
+                            pnl_pct = ((pos.avg_entry_price - current_price) / pos.avg_entry_price) * 100
+                    else:
+                        pnl_pct = 0
+
+                    dca_str = f" (DCA{pos.dca_count})" if pos.dca_count > 0 else ""
+                    print(f"  {position_key} {pos.side}{dca_str}: Entry ${pos.avg_entry_price:,.2f} | P&L: {pnl_pct:+.2f}%")
+                except:
+                    print(f"  {position_key} {pos.side}: Entry ${pos.avg_entry_price:,.2f}")
+        else:
+            print("\nNo open positions")
+
+        print("="*70)
+
+        # Ask about closing positions
+        self.prompt_close_positions()
+
+
+# =============================================================================
+# Main
+# =============================================================================
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Binance Futures Live Trading")
+    parser.add_argument("--hours", type=float, default=24, help="Duration")
+    parser.add_argument("--live", action="store_true", help="Use mainnet (REAL MONEY!)")
+    parser.add_argument("--no-mtf", action="store_true", help="Disable MTF")
+    parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
+
+    args = parser.parse_args()
+
+    testnet = not args.live
+
+    if not args.yes:
+        print("\n" + "="*60)
+        mode = "MAINNET (REAL MONEY!)" if args.live else "TESTNET"
+        print(f"BINANCE FUTURES {mode} TRADING")
+        print("="*60)
+
+        if args.live:
+            print("\n!!! WARNING: REAL MONEY MODE !!!")
+            print("This will place REAL orders with REAL funds!")
+
+        print(f"\nDuration: {args.hours} hours")
+        symbols_to_use = FUTURES_SYMBOLS_LIVE if args.live else FUTURES_SYMBOLS_DEMO
+        print(f"Symbols: {', '.join(symbols_to_use)}")
+        print("="*60)
+
+        confirm = input("\nContinue? (y/n): ")
+        if confirm.lower() != "y":
+            print("Cancelled")
+            sys.exit(0)
+
+    engine = BinanceLiveTradingEngine(testnet=testnet, use_mtf=not args.no_mtf)
+    engine.run(duration_hours=args.hours)

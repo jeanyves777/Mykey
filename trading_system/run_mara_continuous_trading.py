@@ -32,6 +32,10 @@ from trading_system.config import PaperTradingConfig
 from trading_system.strategies.mara_continuous_momentum import MARAContinuousMomentumConfig
 from trading_system.engine.mara_continuous_trading_engine import MARAContinuousTradingEngine
 from trading_system.engine.alpaca_client import test_connection, ALPACA_AVAILABLE
+import json
+
+# MARA Continuous-specific config file (separate from COIN and MARA 0DTE)
+MARA_CONTINUOUS_CONFIG_FILE = Path.home() / ".thevolumeai" / "mara_continuous_trading_config.json"
 
 
 def print_banner():
@@ -100,14 +104,17 @@ def display_config(config: MARAContinuousMomentumConfig, api_key: str):
     print(f"  Max DTE:          {config.max_days_to_expiry} days")
     print(f"  Max Spread:       {config.max_bid_ask_spread_pct}%")
     print()
-    print("  --- Entry Validation ---")
+    print("  --- Entry Validation (V2 AGGRESSIVE) ---")
     print(f"  Volume Spike:     {config.volume_spike_multiplier}x average")
     print(f"  Min Volume:       {config.min_volume_threshold:,}")
-    print(f"  Dual Confirm:     {'Yes' if config.require_dual_confirmation else 'No'}")
+    print(f"  Min Score:        {config.min_signal_score}/6")
+    print(f"  Dual Confirm:     {'Yes (STRICT)' if config.require_dual_confirmation else 'No (AGGRESSIVE)'}")
+    if not config.require_dual_confirmation:
+        print("  >>> AGGRESSIVE MODE: Trades on technical signal alone!")
     print()
     print("  --- How It Works ---")
     print("  1. Monitor MARA price and volume continuously")
-    print("  2. Wait for volume spike + momentum confirmation")
+    print("  2. Wait for technical signal (no dual confirmation needed)")
     print("  3. Select ATM contract (weekly expiry)")
     print("  4. Enter with TP limit order on exchange")
     print("  5. Monitor for TP/SL/max hold")
@@ -148,17 +155,42 @@ Examples:
     if not check_dependencies():
         sys.exit(1)
 
-    # Load Alpaca credentials from existing config
-    alpaca_config = PaperTradingConfig.load()
-    if not alpaca_config.is_configured():
-        print("ERROR: Alpaca API not configured.")
-        print("Please run: python -m trading_system.run_paper_trading --setup")
+    # Load MARA Continuous-specific Alpaca credentials
+    if MARA_CONTINUOUS_CONFIG_FILE.exists():
+        try:
+            with open(MARA_CONTINUOUS_CONFIG_FILE, 'r') as f:
+                mara_creds = json.load(f)
+            api_key = mara_creds.get('api_key', '')
+            api_secret = mara_creds.get('api_secret', '')
+            position_value = mara_creds.get('fixed_position_value', 500.0)
+            if not api_key or not api_secret:
+                print("ERROR: MARA Continuous API credentials not configured")
+                sys.exit(1)
+        except (json.JSONDecodeError, TypeError) as e:
+            print(f"ERROR: Could not load MARA Continuous config: {e}")
+            sys.exit(1)
+    else:
+        print("ERROR: MARA Continuous config not found.")
+        print(f"Please create: {MARA_CONTINUOUS_CONFIG_FILE}")
         sys.exit(1)
 
-    # Create MARA continuous config
+    # Create a config-like object for compatibility
+    class AlpacaCreds:
+        def __init__(self, key, secret):
+            self.api_key = key
+            self.api_secret = secret
+
+    alpaca_config = AlpacaCreds(api_key, api_secret)
+
+    # Load additional config values from file (V2: aggressive mode settings)
+    require_dual = mara_creds.get('require_dual_confirmation', False)  # V2: Default OFF
+    min_score = mara_creds.get('min_signal_score', 2)  # V2: Lower threshold
+    vol_spike = mara_creds.get('volume_spike_multiplier', 1.2)  # V2: Lower volume req
+
+    # Create MARA continuous config with aggressive settings
     mara_config = MARAContinuousMomentumConfig(
         underlying_symbol="MARA",
-        fixed_position_value=200.0,
+        fixed_position_value=position_value,
         target_profit_pct=7.5,
         stop_loss_pct=25.0,
         entry_time_start="09:35:00",
@@ -167,14 +199,14 @@ Examples:
         max_hold_minutes=30,
         cooldown_minutes=5,
         max_trades_per_day=10,
-        volume_spike_multiplier=1.5,
-        min_volume_threshold=10000,
+        volume_spike_multiplier=vol_spike,
+        min_volume_threshold=5000,  # V2: Lower volume threshold
         use_weekly_expiry=True,
         min_days_to_expiry=1,
         max_days_to_expiry=7,
-        max_bid_ask_spread_pct=15.0,
-        min_signal_score=3,
-        require_dual_confirmation=True,
+        max_bid_ask_spread_pct=20.0,  # V2: Allow wider spreads
+        min_signal_score=min_score,
+        require_dual_confirmation=require_dual,
         poll_interval_seconds=10,
     )
 

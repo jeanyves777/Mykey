@@ -1,0 +1,137 @@
+================================================================================
+TRADOVATE TRADING SYSTEM - SETUP CHECKLIST
+================================================================================
+
+PHASE 1: SETUP & CONNECTION (10 minutes)
+================================================================================
+
+[ ] Step 1: Create Tradovate Demo Account
+    - Go to: https://trader.tradovate.com/#/signup
+    - Choose: "Open a FREE Simulated Account"
+    - Get $50,000 simulated funds
+
+[ ] Step 2: Get API Credentials
+    - Log in to Tradovate
+    - Click username (top right) → Settings → API
+    - Click "Generate New API Key"
+    - SAVE: Username, Password, API Key
+
+[ ] Step 3: Fill in Configuration
+    - Open: trading_system/Tradovate/config/tradovate_config.py
+    - Fill in:
+        TRADOVATE_DEMO_USERNAME = "your_username"
+        TRADOVATE_DEMO_PASSWORD = "your_password"
+        TRADOVATE_DEMO_API_KEY = "your_api_key"
+    - Save file
+
+[ ] Step 4: Test Connection
+    - Run: python run_tradovate_test_connection.py
+    - Expected: ✅ CONNECTION TEST PASSED!
+    - See account balance: $50,000.00
+
+================================================================================
+PHASE 2: BACKTESTING (Once connection works)
+================================================================================
+
+[ ] Step 5: Build Trading Engines
+    - Let me know connection test passed
+    - I'll build: backtest engine, paper engine, live engine
+    - Takes ~15 minutes
+
+[ ] Step 6: Run Backtest
+    - Run: python run_tradovate_backtest.py
+    - Verify: Win rate 45-55%
+    - Verify: Profit factor > 1.2
+    - Verify: FundedNext rules compliant
+
+================================================================================
+PHASE 3: PAPER TRADING (Validate strategy)
+================================================================================
+
+[ ] Step 7: Start Paper Trading
+    - Run: python run_tradovate_paper.py
+    - Let run for 1 week (Mon-Fri)
+
+[ ] Step 8: Monitor Performance
+    - Track daily P&L
+    - Verify win rate 45-55%
+    - Check FundedNext rule compliance
+    - Ensure profitable week (+$200-500)
+
+================================================================================
+PHASE 4: FUNDEDNEXT CHALLENGE (Go live!)
+================================================================================
+
+[ ] Step 9: Apply for FundedNext
+    - Go to: fundednext.com
+    - Choose: $25K Challenge ($79.99)
+    - Complete application
+
+[ ] Step 10: Connect to FundedNext
+    - Link Tradovate account
+    - Verify connection
+    - Initial balance: $25,000
+
+[ ] Step 11: Run Live Trading
+    - Edit config: USE_DEMO = False
+    - Fill in live credentials
+    - Run: python run_tradovate_live.py
+
+[ ] Step 12: Pass Challenge
+    - Target: +$1,250 profit
+    - Timeline: 2-3 weeks
+    - Rules: All automated (no manual intervention)
+
+[ ] Step 13: Get Funded!
+    - Receive funded $25K account
+    - Start earning 80% profit split
+    - Scale to $50K, $100K...
+
+================================================================================
+CURRENT STATUS
+================================================================================
+
+✅ COMPLETED:
+    [x] Tradovate client built
+    [x] Configuration files created
+    [x] Symbol mapping configured
+    [x] FundedNext rules implemented
+    [x] Test script created
+    [x] Documentation written
+    [x] Dependencies installed
+
+⏳ IN PROGRESS:
+    [ ] YOUR TURN: Create Tradovate account
+    [ ] YOUR TURN: Get API credentials
+    [ ] YOUR TURN: Test connection
+
+📅 TIMELINE:
+    Today:        Steps 1-4 (Setup & test)
+    Tomorrow:     Steps 5-6 (Build engines & backtest)
+    This week:    Steps 7-8 (Paper trading)
+    Week 2-3:     Steps 9-12 (FundedNext challenge)
+    Month 2+:     Step 13 (Funded & earning!)
+
+================================================================================
+QUICK REFERENCE
+================================================================================
+
+Important Files:
+    - TRADOVATE_QUICK_START.md ← START HERE
+    - trading_system/Tradovate/config/tradovate_config.py ← FILL THIS
+    - run_tradovate_test_connection.py ← RUN THIS FIRST
+
+Commands:
+    Test:     python run_tradovate_test_connection.py
+    Backtest: python run_tradovate_backtest.py (after engines built)
+    Paper:    python run_tradovate_paper.py (after engines built)
+    Live:     python run_tradovate_live.py (FundedNext challenge)
+
+Links:
+    Tradovate Signup: https://trader.tradovate.com/#/signup
+    FundedNext:       https://fundednext.com
+    Tradovate Help:   https://www.tradovate.com/support
+
+================================================================================
+NEXT STEP: Read TRADOVATE_QUICK_START.md and create your account!
+================================================================================

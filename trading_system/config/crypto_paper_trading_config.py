@@ -20,7 +20,8 @@ CONFIG_DIR = Path.home() / ".thevolumeai"
 CRYPTO_CONFIG_FILE = CONFIG_DIR / "crypto_paper_trading_config.json"
 
 
-# Default crypto symbols to trade (V6: 5 best performers)
+# Default crypto symbols to trade (V18: 5 symbols optimized with ML ensemble)
+# These are the symbols the ML models were trained on for highest accuracy
 DEFAULT_CRYPTO_SYMBOLS = [
     "BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD", "AVAX/USD"
 ]
@@ -40,15 +41,17 @@ class CryptoPaperTradingConfig:
     # Trading parameters - position size MUST be set by user
     fixed_position_value: float = 0.0  # Fixed $ amount per trade (user must set)
 
-    # Symbols to trade (all 9 by default)
+    # Symbols to trade (5 ML-optimized symbols)
     symbols: List[str] = field(default_factory=lambda: DEFAULT_CRYPTO_SYMBOLS.copy())
 
-    # Risk parameters - widened for crypto volatility
-    # With 0.25% taker fee each way (0.5% round trip), need wider levels
-    target_profit_pct: float = 1.5    # Take profit at 1.5% (net ~1.0% after fees)
-    stop_loss_pct: float = 1.0        # Stop loss at 1.0% - wider for crypto volatility
-    trailing_stop_pct: float = 0.5    # Trailing stop at 0.5%
-    use_trailing_stop: bool = True
+    # Risk parameters - V18 OPTIMAL: From ML ensemble backtest optimization
+    # V18 Results: 93.1% WR (27W/2L), 29 trades, +$1.61, PF=11.69, Sharpe=75.46
+    # Key: Tight SL/TP with 5/5 model agreement for highest confidence
+    target_profit_pct: float = 0.8    # V18 OPTIMAL: 0.8% TP (quick profits)
+    stop_loss_pct: float = 0.6        # V18 OPTIMAL: 0.6% SL (tight stops)
+    trailing_stop_pct: float = 0.0    # V18: Disabled - use fixed TP/SL only
+    trailing_stop_activation: float = 999.0  # V18: Never activate
+    use_trailing_stop: bool = False   # V18: Disabled
 
     # Trading hours (UTC) - crypto trades 24/7 but these are peak hours
     # Peak: 13:00-21:00 UTC (US trading hours), 00:00-08:00 UTC (Asian hours)
@@ -57,16 +60,16 @@ class CryptoPaperTradingConfig:
         default_factory=lambda: list(range(0, 9)) + list(range(13, 22))
     )
 
-    # Position management - max 5 (one per symbol)
+    # Position management - max 5 (one per symbol for all 5 ML-optimized cryptos)
     max_concurrent_positions: int = 5
-    max_trades_per_hour: int = 10
+    max_trades_per_hour: int = 20  # Increased for more data collection
 
-    # Hold time limits
-    max_hold_minutes: int = 60
-    min_hold_minutes: int = 5
+    # Hold time limits - V17: No max hold - wait for TP or SL
+    max_hold_minutes: int = 0  # V17: 0 = disabled, wait for TP or SL
+    min_hold_minutes: int = 1   # V17: Minimum 1 min before SL exit
 
-    # Entry requirements - V6: Higher threshold with mandatory trend filter
-    min_entry_score: int = 7  # V6: Increased from 6 to 7 (RSI + TREND + MACD + 4 more)
+    # Entry requirements - V17 DATA COLLECTION: Lower score for more trades
+    min_entry_score: int = 5  # Lowered to 5 for more frequent trades & data collection
 
     # Alpaca crypto fee (0.25% taker)
     taker_fee_pct: float = 0.25

@@ -225,25 +225,23 @@ def run_setup_wizard(config: CryptoLiveTradingConfig = None) -> CryptoLiveTradin
 
 def display_config(config: CryptoLiveTradingConfig):
     """Display current configuration."""
-    from trading_system.strategies.crypto_scalping import SYMBOL_RISK_PARAMS
-
-    print("\n--- Current LIVE Configuration ---")
+    print("\n--- Current LIVE Configuration (V17) ---")
     print(f"  API Key:          {mask_api_key(config.api_key) if config.api_key else 'NOT SET'}")
     print(f"  Trading Mode:     >>> LIVE (REAL MONEY) <<<")
     print(f"  Position Size:    ${config.fixed_position_value:,.2f}")
     print(f"  Max Positions:    {config.max_concurrent_positions}")
     print(f"  Daily Loss Limit: ${config.max_daily_loss}")
     print(f"  Time Filter:      {'ON' if config.use_time_filter else 'OFF'}")
-    print(f"  Exit Modes:       TP and SL only (V6)")
+    print(f"  Exit Modes:       TP and SL only (V17)")
     print(f"  Taker Fee:        {config.taker_fee_pct}%")
     print()
-    print("  Per-Symbol Settings (V6.1):")
+    print(f"  V17 Settings (ALL symbols use config values):")
+    print(f"    TP: {config.target_profit_pct}% | SL: {config.stop_loss_pct}% | MinScore: {config.min_entry_score}")
+    print(f"    Trailing Stop: {'ON' if config.use_trailing_stop else 'OFF'}")
+    print()
+    print(f"  Symbols ({len(config.symbols)}):")
     for symbol in config.symbols:
-        params = SYMBOL_RISK_PARAMS.get(symbol, {})
-        tp = params.get('target_profit_pct', config.target_profit_pct)
-        sl = params.get('stop_loss_pct', config.stop_loss_pct)
-        score = params.get('min_entry_score', config.min_entry_score)
-        print(f"    {symbol}: TP={tp}% SL={sl}% MinScore={score}")
+        print(f"    {symbol}")
     print()
 
 

@@ -28,6 +28,10 @@ from trading_system.config import PaperTradingConfig
 from trading_system.strategies.mara_0dte_momentum import MARADaily0DTEMomentumConfig
 from trading_system.engine.mara_paper_trading_engine import MARAPaperTradingEngine
 from trading_system.engine.alpaca_client import test_connection, ALPACA_AVAILABLE
+import json
+
+# MARA-specific config file (separate from COIN)
+MARA_CONFIG_FILE = Path.home() / ".thevolumeai" / "mara_paper_trading_config.json"
 
 
 def print_banner():
@@ -144,24 +148,44 @@ Examples:
     if not check_dependencies():
         sys.exit(1)
 
-    # Load Alpaca credentials from existing config
-    alpaca_config = PaperTradingConfig.load()
-    if not alpaca_config.is_configured():
-        print("ERROR: Alpaca API not configured.")
-        print("Please run: python -m trading_system.run_paper_trading --setup")
+    # Load MARA-specific Alpaca credentials
+    if MARA_CONFIG_FILE.exists():
+        try:
+            with open(MARA_CONFIG_FILE, 'r') as f:
+                mara_creds = json.load(f)
+            api_key = mara_creds.get('api_key', '')
+            api_secret = mara_creds.get('api_secret', '')
+            if not api_key or not api_secret:
+                print("ERROR: MARA API credentials not configured in mara_paper_trading_config.json")
+                sys.exit(1)
+        except (json.JSONDecodeError, TypeError) as e:
+            print(f"ERROR: Could not load MARA config: {e}")
+            sys.exit(1)
+    else:
+        print("ERROR: MARA config not found.")
+        print(f"Please create: {MARA_CONFIG_FILE}")
         sys.exit(1)
+
+    # Create a PaperTradingConfig-like object for compatibility
+    class AlpacaCreds:
+        def __init__(self, key, secret):
+            self.api_key = key
+            self.api_secret = secret
+
+    alpaca_config = AlpacaCreds(api_key, api_secret)
 
     # Create MARA-specific config
     mara_config = MARADaily0DTEMomentumConfig(
         underlying_symbol="MARA",
         fixed_position_value=200.0,
-        target_profit_pct=7.5,
+        target_profit_pct=25.0,  # High target to allow trailing stop to work
         stop_loss_pct=25.0,
         entry_time_start="09:30:00",
         entry_time_end="15:45:00",
         force_exit_time="15:50:00",
         max_hold_minutes=30,
-        max_trades_per_day=1,
+        max_trades_per_day=3,  # Allow up to 3 trades per day
+        daily_profit_target_pct=15.0,  # Stop trading at +15% daily profit
         poll_interval_seconds=10,
     )
 

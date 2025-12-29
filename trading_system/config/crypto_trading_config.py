@@ -46,11 +46,12 @@ class CryptoTradingConfig:
     # Selected symbols to trade
     symbols: List[str] = field(default_factory=lambda: ALPACA_CRYPTO_SYMBOLS.copy())
 
-    # Risk parameters - V6: Optimized for crypto volatility
-    target_profit_pct: float = 1.5        # V6: Take profit % (net ~1.0% after fees)
-    stop_loss_pct: float = 1.0            # V6: Stop loss % (wider for crypto volatility)
-    trailing_stop_pct: float = 0.5        # V6: Trailing stop %
-    use_trailing_stop: bool = True
+    # Risk parameters - V18 OPTIMAL: From ML ensemble backtest optimization
+    # V18 Results: 93.1% WR (27W/2L), 29 trades, +$1.61, PF=11.69, Sharpe=75.46
+    target_profit_pct: float = 0.8        # V18 OPTIMAL: 0.8% TP (quick profits)
+    stop_loss_pct: float = 0.6            # V18 OPTIMAL: 0.6% SL (tight stops)
+    trailing_stop_pct: float = 0.0        # V18: Disabled - use fixed TP/SL only
+    use_trailing_stop: bool = False       # V18: Disabled
 
     # Risk controls
     max_daily_loss: float = 500.0         # Daily loss limit
@@ -266,11 +267,12 @@ class CryptoLiveTradingConfig:
     # Selected symbols to trade
     symbols: List[str] = field(default_factory=lambda: ALPACA_CRYPTO_SYMBOLS.copy())
 
-    # Risk parameters - V6: Optimized for crypto volatility
-    target_profit_pct: float = 1.5        # V6: Take profit % (net ~1.0% after fees)
-    stop_loss_pct: float = 1.0            # V6: Stop loss % (wider for crypto volatility)
-    trailing_stop_pct: float = 0.5        # V6: Trailing stop %
-    use_trailing_stop: bool = True
+    # Risk parameters - V18 OPTIMAL: From ML ensemble backtest optimization
+    # V18 Results: 93.1% WR (27W/2L), 29 trades, +$1.61, PF=11.69, Sharpe=75.46
+    target_profit_pct: float = 0.8        # V18 OPTIMAL: 0.8% TP (quick profits)
+    stop_loss_pct: float = 0.6            # V18 OPTIMAL: 0.6% SL (tight stops)
+    trailing_stop_pct: float = 0.0        # V18: Disabled - use fixed TP/SL only
+    use_trailing_stop: bool = False       # V18: Disabled
 
     # Strict risk controls for live trading
     max_daily_loss: float = 100.0         # Daily loss limit (conservative)
