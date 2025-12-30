@@ -2990,7 +2990,9 @@ class BinanceLiveTradingEngine:
             has_sl = False
             has_tp = False
             tp_order_id = None
+            sl_order_id = None
             current_tp_price = 0.0
+            current_sl_price = 0.0
 
             # Get the position side for filtering orders in hedge mode
             position_side = pos["side"]  # LONG or SHORT
@@ -3009,6 +3011,8 @@ class BinanceLiveTradingEngine:
                 self.log(f"    Order: type={order_type}, side={order_side}, positionSide={order_position_side}, trigger=${trigger_price:,.4f}")
                 if order_type == "STOP_MARKET":
                     has_sl = True
+                    sl_order_id = order.get("orderId")
+                    current_sl_price = trigger_price
                 elif order_type == "TAKE_PROFIT_MARKET":
                     has_tp = True
                     tp_order_id = order.get("orderId")
@@ -3033,12 +3037,13 @@ class BinanceLiveTradingEngine:
                     # Use reduced TP from DCA level config
                     dca_level_config = DCA_CONFIG["levels"][dca_level - 1]
                     tp_roi = dca_level_config.get("tp_roi", DCA_CONFIG["take_profit_roi"])
-                    sl_roi = DCA_CONFIG["sl_after_dca_roi"]  # Tighter SL after DCA
                     self.log(f"  {symbol} DCA level {dca_level}: Using reduced TP {tp_roi*100:.0f}% ROI")
                 else:
                     # Initial entry - use default TP
-                    tp_roi = DCA_CONFIG["take_profit_roi"]    # 15% ROI
-                    sl_roi = DCA_CONFIG["stop_loss_roi"]      # 80% ROI
+                    tp_roi = DCA_CONFIG["take_profit_roi"]    # 8% ROI
+
+                # ALWAYS use 90% ROI SL regardless of DCA level
+                sl_roi = DCA_CONFIG["stop_loss_roi"]  # 90% ROI - ALWAYS SAME
 
                 tp_price_pct = tp_roi / leverage
                 sl_price_pct = sl_roi / leverage
@@ -3079,13 +3084,42 @@ class BinanceLiveTradingEngine:
                         self.log(f"  SL ${stop_loss_price:,.2f} too close to liquidation ${liq_price:,.2f}, adjusting to ${max_sl_price:,.2f}", level="WARN")
                         stop_loss_price = max_sl_price
 
-            # Place missing SL order
-            if not has_sl:
+            # Place or UPDATE SL order - ALWAYS ensure SL is at correct 90% ROI level
+            need_new_sl = not has_sl
+            hedge_position_side = position_side if self.hedge_mode else None
+
+            # Check if existing SL is at wrong price (needs update)
+            if has_sl and current_sl_price > 0:
+                # Calculate how far off the current SL is from correct price
+                sl_tolerance = 0.001  # 0.1% tolerance
+                if position_side == "LONG":
+                    # For LONG, SL should be below entry. Check if current SL is wrong
+                    if abs(current_sl_price - stop_loss_price) / stop_loss_price > sl_tolerance:
+                        self.log(f"  {symbol}: SL at ${current_sl_price:,.4f} is wrong, should be ${stop_loss_price:,.4f} (90% ROI)")
+                        # Cancel old SL and place new one
+                        try:
+                            self.client.cancel_order(symbol, sl_order_id, is_algo_order=True)
+                            self.log(f"  Cancelled old SL order {sl_order_id}")
+                        except Exception as e:
+                            self.log(f"  Could not cancel old SL: {e}", level="WARN")
+                        need_new_sl = True
+                else:
+                    # For SHORT, SL should be above entry. Check if current SL is wrong
+                    if abs(current_sl_price - stop_loss_price) / stop_loss_price > sl_tolerance:
+                        self.log(f"  {symbol}: SL at ${current_sl_price:,.4f} is wrong, should be ${stop_loss_price:,.4f} (90% ROI)")
+                        # Cancel old SL and place new one
+                        try:
+                            self.client.cancel_order(symbol, sl_order_id, is_algo_order=True)
+                            self.log(f"  Cancelled old SL order {sl_order_id}")
+                        except Exception as e:
+                            self.log(f"  Could not cancel old SL: {e}", level="WARN")
+                        need_new_sl = True
+
+            if need_new_sl:
                 if DCA_CONFIG["enabled"]:
                     self.log(f"  Placing SL for {symbol} @ ${stop_loss_price:,.2f} ({sl_roi*100:.0f}% ROI loss)")
                 else:
                     self.log(f"  Placing SL for {symbol} @ ${stop_loss_price:,.2f}")
-                hedge_position_side = position_side if self.hedge_mode else None
                 sl_order = self.client.place_stop_loss(symbol, sl_side, quantity, stop_loss_price, position_side=hedge_position_side)
                 if "orderId" in sl_order:
                     if position_key in self.positions:
