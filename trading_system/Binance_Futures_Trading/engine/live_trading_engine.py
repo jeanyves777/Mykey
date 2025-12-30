@@ -1442,6 +1442,19 @@ class BinanceLiveTradingEngine:
             side = "BUY" if signal.signal == "BUY" else "SELL"
             position_side = "LONG" if side == "BUY" else "SHORT"
 
+            # ================================================================
+            # CANCEL EXISTING ORDERS for this side BEFORE entering new position
+            # This prevents duplicate TP/SL orders
+            # ================================================================
+            if self.hedge_mode:
+                # In hedge mode, only cancel orders for this specific side
+                cancel_result = self.client.cancel_orders_for_side(symbol, position_side)
+                if cancel_result.get("cancelled"):
+                    self.log(f"Cancelled {len(cancel_result['cancelled'])} existing {position_side} orders before entry")
+            else:
+                # In normal mode, cancel all orders for this symbol
+                self.client.cancel_all_orders(symbol)
+
             # Get margin for initial entry
             margin = self.get_entry_margin(symbol)
             remaining = self.get_remaining_budget(symbol)

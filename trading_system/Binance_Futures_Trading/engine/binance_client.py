@@ -642,6 +642,36 @@ class BinanceClient:
 
         return results
 
+    def cancel_orders_for_side(self, symbol: str, position_side: str) -> Dict:
+        """
+        Cancel all open orders for a specific position side (LONG or SHORT).
+        Used in hedge mode to only cancel orders for one side.
+        """
+        results = {"cancelled": [], "failed": []}
+
+        # Get all open orders for this symbol
+        all_orders = self.get_open_orders(symbol)
+
+        for order in all_orders:
+            order_position_side = order.get("positionSide", "BOTH")
+
+            # Only cancel orders matching the specified side
+            if order_position_side == position_side:
+                order_id = order.get("orderId") or order.get("algoId")
+                if order_id:
+                    try:
+                        # Check if it's an algo order
+                        is_algo = "algoId" in order
+                        if is_algo:
+                            cancel_result = self.cancel_algo_order(symbol, order_id)
+                        else:
+                            cancel_result = self.cancel_order(symbol, order_id)
+                        results["cancelled"].append({"orderId": order_id, "type": order.get("type", "unknown")})
+                    except Exception as e:
+                        results["failed"].append({"orderId": order_id, "error": str(e)})
+
+        return results
+
     def get_open_orders(self, symbol: str = None) -> List[Dict]:
         """Get all open orders (including algo orders on mainnet)"""
         params = {}
