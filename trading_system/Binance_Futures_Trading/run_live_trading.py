@@ -56,10 +56,16 @@ Examples:
         help="Skip confirmation prompt (NOT RECOMMENDED for live trading)"
     )
 
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip ALL confirmations (for VPS/automated deployment)"
+    )
+
     args = parser.parse_args()
 
-    # Safety check for live mode
-    if args.live and args.yes:
+    # Safety check for live mode (skip if --force is used)
+    if args.live and args.yes and not args.force:
         print("\n" + "!"*60)
         print("! DANGER: You are about to start LIVE trading with -y flag !")
         print("! This will place REAL orders without confirmation!         !")
