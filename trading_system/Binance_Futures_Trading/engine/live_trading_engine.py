@@ -1641,27 +1641,27 @@ class BinanceLiveTradingEngine:
                     del self.positions[position_key]
 
                     # ============================================
-                    # HEDGE MODE or HYBRID HOLD: RE-ENTER AFTER TP
-                    # If TP hit (profitable close), re-enter same direction
+                    # HEDGE MODE or HYBRID HOLD: ALWAYS RE-ENTER
+                    # Re-enter same direction after ANY exit (TP, SL, BE, manual)
+                    # Stay in market at all times with both LONG and SHORT
                     # ============================================
                     hedge_config = DCA_CONFIG.get("hedge_mode", {})
                     hybrid_config = DCA_CONFIG.get("hybrid_hold", {})
 
-                    # Re-enter if TP hit OR if exit was profitable (in case exit_type detection failed)
-                    is_profitable_exit = exit_type == "TP" or exit_type == "BE" or realized_pnl >= 0
-
-                    if self.hedge_mode and hedge_config.get("reenter_on_tp", True) and is_profitable_exit:
-                        # HEDGE MODE: Re-enter the SAME SIDE that just closed
-                        self.log(f"HEDGE: TP hit for {actual_symbol} [{closed_side}], IMMEDIATE RE-ENTRY", level="TRADE")
+                    # ALWAYS re-enter in hedge mode - never stop trading
+                    if self.hedge_mode and hedge_config.get("reenter_on_tp", True):
+                        # HEDGE MODE: ALWAYS re-enter the SAME SIDE that just closed
+                        exit_label = "WIN" if realized_pnl >= 0 else "LOSS"
+                        self.log(f"HEDGE: {actual_symbol} [{closed_side}] closed ({exit_type}, {exit_label}), IMMEDIATE RE-ENTRY", level="TRADE")
                         self.pending_reentry[position_key] = closed_side
                         # Try immediate re-entry
                         self.reenter_after_tp(actual_symbol, closed_side)
 
                     elif (hybrid_config.get("enabled", False) and
-                          hybrid_config.get("reenter_on_tp", True) and
-                          is_profitable_exit):
-                        # HYBRID MODE: Re-enter same direction
-                        self.log(f"HYBRID: TP hit for {actual_symbol}, IMMEDIATE RE-ENTRY {closed_side}", level="TRADE")
+                          hybrid_config.get("reenter_on_tp", True)):
+                        # HYBRID MODE: ALWAYS re-enter same direction
+                        exit_label = "WIN" if realized_pnl >= 0 else "LOSS"
+                        self.log(f"HYBRID: {actual_symbol} closed ({exit_type}, {exit_label}), IMMEDIATE RE-ENTRY {closed_side}", level="TRADE")
                         self.pending_reentry[actual_symbol] = closed_side
                         self.reenter_after_tp(actual_symbol, closed_side)
 
