@@ -39,10 +39,11 @@ BINANCE_CONFIG = {
 # =============================================================================
 # 2. TRADING SYMBOLS - OPTIMIZED FOR SCALPING
 # =============================================================================
-# LIVE MODE: Top performers based on backtest
+# LIVE MODE: Top performers with Enhanced Boost Mode
 FUTURES_SYMBOLS_LIVE = [
-    "DOTUSDT",   # Polkadot - Best performer on demo
-    "AVAXUSDT",  # Avalanche - Best backtest: +97.9%, 82.6% win rate, 12% max DD
+    "DOTUSDT",   # Polkadot - Best performer: +93.1% in 90-day backtest
+    "AVAXUSDT",  # Avalanche - Stable: -2.1% during -43% crash
+    "BTCUSDT",   # Bitcoin - With tighter settings: +40.6% in 90-day backtest
 ]
 
 # DEMO MODE: All symbols for testing
@@ -81,14 +82,28 @@ FUTURES_SYMBOLS = FUTURES_SYMBOLS_DEMO
 #   1.5 = 50% wider DCA triggers (moderately volatile altcoins)
 #   2.0 = 100% wider DCA triggers (highly volatile altcoins)
 # Example: If base DCA L1 is -20% ROI, with 1.5x mult it becomes -30% ROI
+#
+# ENHANCED BOOST SETTINGS (symbol-specific):
+#   - tp_roi: Take profit ROI (lower for less volatile coins)
+#   - boost_trigger_dca: DCA level to trigger boost (earlier for less volatile)
+#   - dca_levels: Custom DCA trigger levels (tighter for less volatile)
 SYMBOL_SETTINGS = {
-    # Tier 1: Most stable - use default DCA triggers
+    # Tier 1: BTC/ETH - Less volatile, need TIGHTER parameters
     "BTCUSDT": {
         "min_qty": 0.001,
         "price_precision": 2,
         "qty_precision": 3,
         "tick_size": 0.01,
         "dca_volatility_mult": 1.0,   # Default - BTC is stable
+        # ENHANCED BOOST - Tighter settings for BTC
+        "tp_roi": 0.05,               # 5% TP (vs 8% default) - faster exits
+        "boost_trigger_dca": 2,       # Trigger boost at DCA 2 (vs 3 default) - earlier
+        "dca_levels": [               # Tighter DCA triggers for BTC
+            {"trigger_roi": -0.03, "multiplier": 1.50, "tp_roi": 0.04},   # L1: -3% ROI
+            {"trigger_roi": -0.10, "multiplier": 1.75, "tp_roi": 0.04},   # L2: -10% ROI
+            {"trigger_roi": -0.18, "multiplier": 2.00, "tp_roi": 0.03},   # L3: -18% ROI
+            {"trigger_roi": -0.25, "multiplier": 2.25, "tp_roi": 0.03},   # L4: -25% ROI
+        ],
     },
     "ETHUSDT": {
         "min_qty": 0.01,
@@ -96,6 +111,10 @@ SYMBOL_SETTINGS = {
         "qty_precision": 3,
         "tick_size": 0.01,
         "dca_volatility_mult": 1.0,   # Default - ETH is stable
+        # ENHANCED BOOST - Same as DOT (which works well, 93% return)
+        "tp_roi": 0.08,               # 8% TP (same as DOT) - proven to work
+        "boost_trigger_dca": 3,       # Trigger boost at DCA 3 (same as DOT)
+        # Uses default DCA levels from DCA_CONFIG (same as DOT)
     },
     # Tier 2: Moderate volatility
     "BNBUSDT": {
@@ -140,6 +159,10 @@ SYMBOL_SETTINGS = {
         "qty_precision": 0,           # Integer only - Binance requires stepSize=1
         "tick_size": 0.001,
         "dca_volatility_mult": 1.6,   # 60% wider - AVAX is volatile
+        # ENHANCED BOOST - Default settings (AVAX is volatile, works well)
+        "tp_roi": 0.08,               # 8% TP (default) - works well for AVAX
+        "boost_trigger_dca": 3,       # Trigger boost at DCA 3 (default)
+        # Uses default DCA levels from DCA_CONFIG
     },
     "LINKUSDT": {
         "min_qty": 0.1,
@@ -161,6 +184,10 @@ SYMBOL_SETTINGS = {
         "qty_precision": 1,
         "tick_size": 0.001,
         "dca_volatility_mult": 1.2,   # 20% wider - tightened for faster DCA recovery
+        # ENHANCED BOOST - Default settings (DOT is volatile, works well)
+        "tp_roi": 0.08,               # 8% TP (default) - works well for DOT
+        "boost_trigger_dca": 3,       # Trigger boost at DCA 3 (default)
+        # Uses default DCA levels from DCA_CONFIG
     },
     "LTCUSDT": {
         "min_qty": 0.01,

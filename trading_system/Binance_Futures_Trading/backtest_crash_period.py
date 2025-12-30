@@ -51,10 +51,12 @@ class CrashBacktester:
         self.peak_balance = start_balance
 
     def get_historical_data(self, days: int = 30, interval: str = "1h"):
-        """Fetch historical klines from Binance"""
+        """Fetch historical klines from Binance MAINNET (real data)"""
         print(f"Fetching {days} days of {interval} data for {self.symbol}...")
+        print("Using Binance MAINNET for real historical data...")
 
-        client = BinanceClient(testnet=True, use_demo=True)
+        # Use MAINNET for real data (no API key needed for public klines)
+        client = BinanceClient(testnet=False, use_demo=False)
 
         end_time = datetime.now()
         start_time = end_time - timedelta(days=days)
@@ -187,13 +189,28 @@ class CrashBacktester:
 
     def close_position(self, position: dict, exit_price: float, exit_type: str, timestamp):
         """Close position and record trade"""
+        # Calculate ROI-based PNL (correct for leveraged trading)
+        # PNL = margin * ROI, where ROI = price_change% * leverage
+        price_change_pct = (exit_price - position["entry_price"]) / position["entry_price"]
+
         if position["side"] == "LONG":
-            pnl = (exit_price - position["entry_price"]) * position["quantity"]
+            roi = price_change_pct * self.leverage
         else:
-            pnl = (position["entry_price"] - exit_price) * position["quantity"]
+            roi = -price_change_pct * self.leverage
+
+        # PNL is based on margin used, not notional value
+        pnl = position["margin"] * roi
+
+        # Cap loss at margin (can't lose more than margin in isolated mode)
+        if pnl < -position["margin"]:
+            pnl = -position["margin"]
 
         self.balance += pnl
         self.total_pnl += pnl
+
+        # Check if liquidated
+        if self.balance <= 0:
+            self.balance = 0
 
         if pnl > 0:
             self.total_wins += 1
@@ -242,6 +259,11 @@ class CrashBacktester:
 
         # Iterate through candles
         for i, (timestamp, row) in enumerate(df.iterrows()):
+            # Stop if liquidated
+            if self.balance <= 0:
+                print(f"[{timestamp}] LIQUIDATED - Balance depleted!")
+                break
+
             high = row['high']
             low = row['low']
             close = row['close']
@@ -286,15 +308,17 @@ class CrashBacktester:
                     self.short_position = self.execute_dca(self.short_position, close)
                     print(f"[{timestamp}] SHORT DCA {self.short_position['dca_level']} @ ${close:.4f} | Avg: ${old_entry:.4f} -> ${self.short_position['entry_price']:.4f}")
 
-        # Calculate final unrealized PNL
+        # Calculate final unrealized PNL (using margin-based calculation)
         final_price = df['close'].iloc[-1]
         unrealized_long = 0
         unrealized_short = 0
 
         if self.long_position:
-            unrealized_long = (final_price - self.long_position["entry_price"]) * self.long_position["quantity"]
+            price_change = (final_price - self.long_position["entry_price"]) / self.long_position["entry_price"]
+            unrealized_long = self.long_position["margin"] * price_change * self.leverage
         if self.short_position:
-            unrealized_short = (self.short_position["entry_price"] - final_price) * self.short_position["quantity"]
+            price_change = (self.short_position["entry_price"] - final_price) / self.short_position["entry_price"]
+            unrealized_short = self.short_position["margin"] * price_change * self.leverage
 
         total_unrealized = unrealized_long + unrealized_short
 
@@ -345,21 +369,21 @@ class CrashBacktester:
 
 def main():
     print("="*70)
-    print("HEDGE + DCA STRATEGY BACKTEST - CRASH PERIOD TEST")
+    print("HEDGE + DCA STRATEGY BACKTEST - CRASH PERIOD TEST (ORIGINAL)")
     print("="*70)
 
-    # Test on DOTUSDT (volatile crypto)
     symbol = "DOTUSDT"
 
     backtester = CrashBacktester(symbol, start_balance=100.0)
 
-    # Get 30 days of hourly data
+    # Get REAL data from Binance MAINNET - NO synthetic data
     df = backtester.get_historical_data(days=30, interval="1h")
 
     if df is not None and len(df) > 0:
         backtester.run_backtest(df)
     else:
-        print("Failed to get historical data")
+        print("ERROR: Failed to get real data from Binance!")
+        print("Make sure VPN is active and try again.")
 
 
 if __name__ == "__main__":

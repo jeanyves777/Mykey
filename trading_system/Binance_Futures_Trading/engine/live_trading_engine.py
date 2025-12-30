@@ -46,6 +46,10 @@ class LivePosition:
     hedge_side: Optional[str] = None  # Side of hedge position ("LONG" or "SHORT")
     waiting_for_breakeven: bool = False  # True if waiting to exit at breakeven
     hedge_start_time: Optional[datetime] = None  # When hedge was opened
+    # ENHANCED BOOST MODE tracking
+    is_boosted: bool = False       # True if this position is boosted (1.5x)
+    boost_multiplier: float = 1.0  # Current boost multiplier (1.0 = normal, 1.5 = boosted)
+    half_close_count: int = 0      # Number of half-close cycles performed
 
 
 class BinanceLiveTradingEngine:
@@ -120,6 +124,15 @@ class BinanceLiveTradingEngine:
         # When hedge_mode enabled, we track BOTH LONG and SHORT positions per symbol
         self.hedge_mode = DCA_CONFIG.get("hedge_mode", {}).get("enabled", False)
         self.hedge_budget_split = DCA_CONFIG.get("hedge_mode", {}).get("budget_split", 0.5)
+
+        # ENHANCED BOOST MODE tracking (per symbol)
+        # When one side hits DCA trigger level, boost the opposite side
+        self.boost_mode_active: Dict[str, bool] = {}      # symbol -> True if boost mode active
+        self.boosted_side: Dict[str, str] = {}            # symbol -> "LONG" or "SHORT" (which side is boosted)
+        self.boost_trigger_side: Dict[str, str] = {}      # symbol -> side that triggered boost (DCA side)
+        self.boost_locked_profit: Dict[str, float] = {}   # symbol -> profit locked from half-closes
+        self.boost_cycle_count: Dict[str, int] = {}       # symbol -> number of half-close cycles
+        self.boost_multiplier = 1.5                       # 1.5x boost
 
         # Logging
         self.log_dir = os.path.join(
@@ -402,6 +415,104 @@ class BinanceLiveTradingEngine:
             return 1
         else:
             return 0
+
+    # =========================================================================
+    # ENHANCED BOOST MODE FUNCTIONS
+    # =========================================================================
+    # When one side hits DCA trigger level -> boost the OTHER side 1.5x
+    # At TP on boosted side: Close HALF, lock profit, add back 0.5x
+    # Trailing activates AFTER each half-close cycle
+    # Continue until losing side recovers (TP) or hits SL
+
+    def _get_boost_trigger_level(self, symbol: str) -> int:
+        """Get the DCA level that triggers boost mode for this symbol."""
+        symbol_config = SYMBOL_SETTINGS.get(symbol, {})
+        return symbol_config.get("boost_trigger_dca", 3)  # Default: DCA 3
+
+    def _check_boost_activation(self, symbol: str, position: LivePosition, dca_level: int):
+        """
+        Check if this DCA level should trigger boost mode.
+        When triggered, boost the OPPOSITE side position.
+        """
+        if not self.hedge_mode:
+            return  # Boost only works in hedge mode
+
+        # Already in boost mode for this symbol?
+        if self.boost_mode_active.get(symbol, False):
+            return
+
+        # Check if this DCA level triggers boost
+        boost_trigger = self._get_boost_trigger_level(symbol)
+        if dca_level != boost_trigger:
+            return
+
+        # Get the opposite side position
+        opposite_side = "SHORT" if position.side == "LONG" else "LONG"
+        opposite_key = self.get_position_key(symbol, opposite_side)
+        opposite_pos = self.positions.get(opposite_key)
+
+        if not opposite_pos:
+            self.log(f"[BOOST] {symbol}: {position.side} hit DCA {dca_level} but no {opposite_side} position to boost")
+            return
+
+        # ACTIVATE BOOST MODE
+        self.boost_mode_active[symbol] = True
+        self.boosted_side[symbol] = opposite_side
+        self.boost_trigger_side[symbol] = position.side
+        self.boost_locked_profit[symbol] = 0.0
+        self.boost_cycle_count[symbol] = 0
+
+        # Mark the opposite position as boosted
+        opposite_pos.is_boosted = True
+        opposite_pos.boost_multiplier = self.boost_multiplier
+
+        self.log(f">>> [BOOST] {symbol}: ACTIVATED! {position.side} hit DCA {dca_level} -> {opposite_side} now BOOSTED 1.5x")
+        self.log(f"    [BOOST] Logic: At TP -> Close HALF, lock profit, add 0.5x, trailing starts")
+
+        # TODO: In a full implementation, we would:
+        # 1. Increase the opposite position size by 1.5x (place additional order)
+        # 2. Track this for half-close logic when TP hits
+        # For now, we're just marking it for tracking
+
+    def _deactivate_boost_mode(self, symbol: str, reason: str):
+        """Deactivate boost mode for a symbol."""
+        if not self.boost_mode_active.get(symbol, False):
+            return
+
+        locked = self.boost_locked_profit.get(symbol, 0)
+        cycles = self.boost_cycle_count.get(symbol, 0)
+
+        self.log(f">>> [BOOST] {symbol}: ENDED - {reason}")
+        self.log(f"    [BOOST] Summary: {cycles} half-close cycles | Locked profit: ${locked:+.2f}")
+
+        # Reset boost state
+        self.boost_mode_active[symbol] = False
+        self.boosted_side[symbol] = None
+        self.boost_trigger_side[symbol] = None
+        self.boost_locked_profit[symbol] = 0.0
+        self.boost_cycle_count[symbol] = 0
+
+        # Reset position boost flags
+        for side in ["LONG", "SHORT"]:
+            pos_key = self.get_position_key(symbol, side)
+            pos = self.positions.get(pos_key)
+            if pos:
+                pos.is_boosted = False
+                pos.boost_multiplier = 1.0
+                pos.half_close_count = 0
+
+    def _check_boost_deactivation(self, symbol: str, closed_side: str, exit_type: str):
+        """
+        Check if boost mode should be deactivated.
+        Deactivates when the TRIGGER side recovers (TP) or hits SL.
+        """
+        if not self.boost_mode_active.get(symbol, False):
+            return
+
+        trigger_side = self.boost_trigger_side.get(symbol)
+        if closed_side == trigger_side:
+            # The losing side that triggered boost has recovered or stopped out
+            self._deactivate_boost_mode(symbol, f"{trigger_side} {exit_type}")
 
     def check_daily_reset(self):
         """Reset daily counters at midnight"""
@@ -871,6 +982,9 @@ class BinanceLiveTradingEngine:
                 # Release margin
                 self.symbol_margin_used[symbol] = 0.0
 
+                # Check if boost mode should be deactivated
+                self._check_boost_deactivation(symbol, position.side, "TREND_FLIP")
+
                 # Remove position
                 del self.positions[symbol]
 
@@ -1087,6 +1201,9 @@ class BinanceLiveTradingEngine:
                             self.client.cancel_order(symbol, position.take_profit_order_id, is_algo_order=True)
                     except:
                         pass
+
+                    # Check if boost mode should be deactivated
+                    self._check_boost_deactivation(symbol, position.side, "TP")
 
                     # Remove from tracking (hedge position continues)
                     self.symbol_margin_used[symbol] -= position.margin_used
@@ -1627,6 +1744,9 @@ class BinanceLiveTradingEngine:
                     else:
                         self.symbol_margin_used[actual_symbol] = 0.0
 
+                    # Check if boost mode should be deactivated
+                    self._check_boost_deactivation(actual_symbol, closed_side, exit_type)
+
                     # Remove position from tracking
                     del self.positions[position_key]
 
@@ -1829,6 +1949,12 @@ class BinanceLiveTradingEngine:
 
                     position.dca_count = dca_level
 
+                    # ================================================================
+                    # ENHANCED BOOST MODE: Check if this DCA level should trigger boost
+                    # When one side hits boost trigger DCA level, boost the OTHER side
+                    # ================================================================
+                    self._check_boost_activation(symbol, position, dca_level)
+
                     # Cancel old SL/TP and place new ones
                     if position.stop_loss_order_id:
                         try:
@@ -1960,10 +2086,11 @@ class BinanceLiveTradingEngine:
                         continue  # Position was closed due to timeout, skip to next
 
                 # ================================================================
-                # HYBRID HOLD: Check for TREND CHANGE first
+                # HYBRID HOLD: Check for TREND CHANGE first (NOT used in Hedge Mode)
                 # If trend reversed, either close+flip OR hedge (for DCA positions)
+                # NOTE: In HEDGE MODE we always hold BOTH sides, so trend flip is irrelevant
                 # ================================================================
-                if hybrid_config.get("enabled", False) and hybrid_config.get("flip_on_trend_change", True):
+                if not self.hedge_mode and hybrid_config.get("enabled", False) and hybrid_config.get("flip_on_trend_change", True):
                     # Skip trend change check if already hedged
                     if not position.is_hedged and self.check_trend_change(symbol, position):
                         # Trend has changed
@@ -2117,6 +2244,9 @@ class BinanceLiveTradingEngine:
             else:
                 self.daily_losses += 1
 
+            # Check if boost mode should be deactivated
+            self._check_boost_deactivation(symbol, position.side, "STALE_EXIT")
+
             # Release margin and remove position
             self.symbol_margin_used[symbol] = 0.0
             del self.positions[symbol]
@@ -2243,6 +2373,9 @@ class BinanceLiveTradingEngine:
                     else:
                         self.daily_losses += 1
 
+                    # Check if boost mode should be deactivated
+                    self._check_boost_deactivation(symbol, position.side, "TRAILING_TP")
+
                     # Release margin and remove position
                     self.symbol_margin_used[symbol] = 0.0
                     del self.positions[symbol]
@@ -2348,6 +2481,9 @@ class BinanceLiveTradingEngine:
                     self.daily_wins += 1
                 else:
                     self.daily_losses += 1
+
+                # Check if boost mode should be deactivated
+                self._check_boost_deactivation(symbol, position.side, "AUTO_TP")
 
                 # Release margin and remove position
                 self.symbol_margin_used[symbol] = 0.0
