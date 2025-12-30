@@ -1399,20 +1399,31 @@ class BinanceLiveTradingEngine:
         settings = SYMBOL_SETTINGS.get(symbol, {})
         min_qty = settings.get("min_qty", 0.001)
         qty_precision = settings.get("qty_precision", 3)
+        min_notional = settings.get("min_notional", 100.0)  # Binance requires $100 min notional for BTC
 
         # Round to precision
         quantity = round(quantity, qty_precision)
 
         # Enforce minimum quantity - if below min, use min_qty
         if quantity < min_qty:
-            # Check if we can afford min_qty
-            min_margin_needed = (min_qty * price) / self.leverage
-            if min_margin_needed <= remaining:
-                quantity = min_qty
-                self.log(f"{symbol}: Adjusted qty to min {min_qty} (margin: ${min_margin_needed:.2f})")
-            else:
-                self.log(f"{symbol}: Cannot afford min qty {min_qty} (need ${min_margin_needed:.2f}, have ${remaining:.2f})", level="WARN")
-                return 0.0
+            quantity = min_qty
+
+        # Enforce minimum notional value (Binance requires $100 for BTC)
+        notional = quantity * price
+        if notional < min_notional:
+            # Calculate minimum quantity needed for min_notional
+            min_qty_for_notional = min_notional / price
+            # Round up to precision
+            import math
+            min_qty_for_notional = math.ceil(min_qty_for_notional * (10 ** qty_precision)) / (10 ** qty_precision)
+            quantity = max(quantity, min_qty_for_notional)
+            self.log(f"{symbol}: Adjusted qty to {quantity} for min notional ${min_notional}")
+
+        # Final check if we can afford this quantity
+        final_margin_needed = (quantity * price) / self.leverage
+        if final_margin_needed > remaining:
+            self.log(f"{symbol}: Cannot afford qty {quantity} (need ${final_margin_needed:.2f}, have ${remaining:.2f})", level="WARN")
+            return 0.0
 
         return quantity
 

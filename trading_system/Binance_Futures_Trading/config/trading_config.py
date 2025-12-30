@@ -91,6 +91,7 @@ SYMBOL_SETTINGS = {
     # Tier 1: BTC/ETH - Less volatile, need TIGHTER parameters
     "BTCUSDT": {
         "min_qty": 0.001,
+        "min_notional": 5.0,          # Binance min notional $5 for BTC
         "price_precision": 2,
         "qty_precision": 3,
         "tick_size": 0.01,
