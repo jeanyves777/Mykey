@@ -238,24 +238,46 @@ class BinanceLiveTradingEngine:
         buffer = RISK_CONFIG.get("allocation_buffer_pct", 0.05)
         available_balance = balance * (1 - buffer)
 
-        # Calculate budget per symbol
-        budget_per_symbol = available_balance / self.num_symbols
-
         self.log(f"Dynamic Allocation: ${balance:.2f} balance")
         self.log(f"  Buffer: {buffer*100:.1f}% reserved for fees")
         self.log(f"  Available: ${available_balance:.2f}")
         self.log(f"  Symbols: {self.num_symbols}")
-        self.log(f"  Budget per symbol: ${budget_per_symbol:.2f}")
-        if self.hedge_mode:
-            self.log(f"  HEDGE MODE: ${budget_per_symbol * self.hedge_budget_split:.2f} per side (LONG + SHORT)")
         self.log(f"  Leverage: {self.leverage}x (ISOLATED)")
+
+        # Calculate minimum margin required per symbol (for min_notional requirement)
+        # First pass: calculate total minimum margin needed
+        min_margins = {}
+        total_min_margin = 0.0
+        for symbol in self.symbols:
+            settings = SYMBOL_SETTINGS.get(symbol, {})
+            min_notional = settings.get("min_notional", 5.0)  # Default $5 notional
+            # Min margin = min_notional / leverage, times 2 for LONG + SHORT in hedge mode
+            min_margin_per_side = min_notional / self.leverage
+            if self.hedge_mode:
+                min_margins[symbol] = min_margin_per_side * 2  # Both sides
+            else:
+                min_margins[symbol] = min_margin_per_side
+            total_min_margin += min_margins[symbol]
+
+        # Calculate remaining budget after minimum allocations
+        remaining_budget = available_balance - total_min_margin
+
+        # Distribute remaining budget equally among symbols
+        extra_per_symbol = remaining_budget / self.num_symbols if remaining_budget > 0 else 0
 
         # Initialize budgets for each symbol
         for symbol in self.symbols:
-            self.symbol_budgets[symbol] = budget_per_symbol
+            symbol_budget = min_margins[symbol] + extra_per_symbol
+            self.symbol_budgets[symbol] = symbol_budget
             self.symbol_margin_used[symbol] = 0.0
+            min_margin = min_margins[symbol]
+            self.log(f"  {symbol}: ${symbol_budget:.2f} (min: ${min_margin:.2f} + extra: ${extra_per_symbol:.2f})")
 
-        return budget_per_symbol
+        if self.hedge_mode:
+            avg_budget = sum(self.symbol_budgets.values()) / self.num_symbols
+            self.log(f"  HEDGE MODE: ~${avg_budget * self.hedge_budget_split:.2f} per side (LONG + SHORT)")
+
+        return available_balance / self.num_symbols  # Return average for compatibility
 
     # =========================================================================
     # HEDGE MODE HELPER FUNCTIONS
