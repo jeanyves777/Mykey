@@ -29,6 +29,15 @@ class CrashBacktester:
         self.dca_levels = DCA_CONFIG["levels"]
         self.budget_split = DCA_CONFIG["hedge_mode"]["budget_split"]  # 50%
 
+        # DCA budget allocation percentages
+        self.dca_pcts = [
+            DCA_CONFIG.get("initial_entry_pct", 0.10),  # 10%
+            DCA_CONFIG.get("dca1_pct", 0.15),           # 15%
+            DCA_CONFIG.get("dca2_pct", 0.20),           # 20%
+            DCA_CONFIG.get("dca3_pct", 0.25),           # 25%
+            DCA_CONFIG.get("dca4_pct", 0.30),           # 30%
+        ]
+
         # Positions
         self.long_position = None
         self.short_position = None
@@ -132,7 +141,9 @@ class CrashBacktester:
     def execute_dca(self, position: dict, current_price: float) -> dict:
         """Execute DCA - add to position"""
         dca_level = self.get_dca_level(position)
-        add_pct = self.dca_levels[dca_level]["add_pct"]
+
+        # Get add percentage from dca_pcts array (dca_level+1 because index 0 is initial entry)
+        add_pct = self.dca_pcts[dca_level + 1] if dca_level + 1 < len(self.dca_pcts) else 0.15
 
         # Calculate new position
         old_qty = position["quantity"]
@@ -160,7 +171,7 @@ class CrashBacktester:
     def open_position(self, side: str, price: float) -> dict:
         """Open new position"""
         budget = self.start_balance * self.budget_split
-        initial_margin = budget * 0.20  # 20% initial entry
+        initial_margin = budget * self.dca_pcts[0]  # 10% initial entry from config
         quantity = (initial_margin * self.leverage) / price
 
         position = {
