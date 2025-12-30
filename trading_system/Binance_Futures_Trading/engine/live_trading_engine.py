@@ -1373,6 +1373,7 @@ class BinanceLiveTradingEngine:
         """
         Calculate position size based on dynamic allocation.
         Uses margin-based allocation with leverage.
+        Ensures minimum quantity requirements are met.
         """
         # Get margin for this entry type
         if is_dca and dca_level > 0:
@@ -1393,6 +1394,25 @@ class BinanceLiveTradingEngine:
 
         # Convert to quantity
         quantity = position_value / price
+
+        # Get symbol settings for min_qty and precision
+        settings = SYMBOL_SETTINGS.get(symbol, {})
+        min_qty = settings.get("min_qty", 0.001)
+        qty_precision = settings.get("qty_precision", 3)
+
+        # Round to precision
+        quantity = round(quantity, qty_precision)
+
+        # Enforce minimum quantity - if below min, use min_qty
+        if quantity < min_qty:
+            # Check if we can afford min_qty
+            min_margin_needed = (min_qty * price) / self.leverage
+            if min_margin_needed <= remaining:
+                quantity = min_qty
+                self.log(f"{symbol}: Adjusted qty to min {min_qty} (margin: ${min_margin_needed:.2f})")
+            else:
+                self.log(f"{symbol}: Cannot afford min qty {min_qty} (need ${min_margin_needed:.2f}, have ${remaining:.2f})", level="WARN")
+                return 0.0
 
         return quantity
 
