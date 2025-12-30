@@ -694,6 +694,7 @@ class BinanceClient:
                 "algoId": order.get("algoId"),
                 "symbol": order.get("symbol"),
                 "side": order.get("side"),
+                "positionSide": order.get("positionSide", "BOTH"),  # Include positionSide for hedge mode
                 "type": order_type,
                 "status": order.get("algoStatus", order.get("status")),
                 "triggerPrice": float(order.get("triggerPrice", 0)),
