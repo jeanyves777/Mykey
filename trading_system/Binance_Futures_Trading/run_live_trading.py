@@ -96,8 +96,8 @@ Examples:
     print(f"Symbols: {', '.join(symbols)}")
     print("="*60)
 
-    # Confirm
-    if not args.yes:
+    # Confirm (skip if --force is used for VPS/automated deployment)
+    if not args.yes and not args.force:
         if args.live:
             confirm = input("\n!!! Are you SURE you want to trade with REAL MONEY? (type 'YES' in caps): ")
             if confirm != "YES":
@@ -108,6 +108,12 @@ Examples:
             if confirm.lower() not in ("y", "yes"):
                 print("Cancelled")
                 return
+
+    if args.force:
+        print("\n[FORCE MODE] Skipping all confirmations - auto-starting...")
+        print("[FORCE MODE] Trading will begin in 3 seconds...")
+        import time
+        time.sleep(3)
 
     # Run live trading
     engine = BinanceLiveTradingEngine(
