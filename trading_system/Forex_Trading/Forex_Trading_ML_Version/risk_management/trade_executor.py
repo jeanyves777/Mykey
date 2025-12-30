@@ -25,6 +25,16 @@ class TradeExecutor:
         self.config = config
         self.last_error: str = ""
 
+    def _format_price(self, symbol: str, price: float) -> str:
+        """Format price correctly for OANDA API.
+
+        JPY pairs use 3 decimal places, all others use 5.
+        """
+        if 'JPY' in symbol:
+            return f"{price:.3f}"
+        else:
+            return f"{price:.5f}"
+
     def place_market_order(self, symbol: str, units: float, direction: str,
                            stop_loss: float = None, take_profit: float = None) -> Tuple[bool, Dict]:
         """
@@ -54,16 +64,16 @@ class TradeExecutor:
                 }
             }
 
-            # Add stop loss
+            # Add stop loss (format correctly for JPY pairs)
             if stop_loss:
                 order_data["order"]["stopLossOnFill"] = {
-                    "price": f"{stop_loss:.5f}"
+                    "price": self._format_price(symbol, stop_loss)
                 }
 
-            # Add take profit
+            # Add take profit (format correctly for JPY pairs)
             if take_profit:
                 order_data["order"]["takeProfitOnFill"] = {
-                    "price": f"{take_profit:.5f}"
+                    "price": self._format_price(symbol, take_profit)
                 }
 
             # Place order
@@ -150,7 +160,7 @@ class TradeExecutor:
             return False, {'error': str(e)}
 
     def modify_trade(self, trade_id: str, stop_loss: float = None,
-                     take_profit: float = None) -> Tuple[bool, Dict]:
+                     take_profit: float = None, symbol: str = None) -> Tuple[bool, Dict]:
         """
         Modify stop loss or take profit for a trade.
 
@@ -158,6 +168,7 @@ class TradeExecutor:
             trade_id: Trade ID to modify
             stop_loss: New stop loss price
             take_profit: New take profit price
+            symbol: Trading pair (for price formatting, optional)
 
         Returns:
             Tuple of (success, result_dict)
@@ -165,9 +176,15 @@ class TradeExecutor:
         try:
             modify_data = {}
             if stop_loss:
-                modify_data['stopLoss'] = {'price': f"{stop_loss:.5f}"}
+                if symbol:
+                    modify_data['stopLoss'] = {'price': self._format_price(symbol, stop_loss)}
+                else:
+                    modify_data['stopLoss'] = {'price': f"{stop_loss:.5f}"}
             if take_profit:
-                modify_data['takeProfit'] = {'price': f"{take_profit:.5f}"}
+                if symbol:
+                    modify_data['takeProfit'] = {'price': self._format_price(symbol, take_profit)}
+                else:
+                    modify_data['takeProfit'] = {'price': f"{take_profit:.5f}"}
 
             response = self.api.modify_trade(trade_id, modify_data)
 
@@ -271,27 +288,27 @@ class TradeExecutor:
             # Adjust units for direction
             order_units = units if direction == 'BUY' else -units
 
-            # Build limit order data
+            # Build limit order data (format prices correctly for JPY pairs)
             order_data = {
                 "order": {
                     "instrument": symbol,
                     "units": str(int(order_units)),
                     "type": "LIMIT",
-                    "price": f"{price:.5f}",
+                    "price": self._format_price(symbol, price),
                     "timeInForce": "GTC"  # Good Till Cancelled
                 }
             }
 
-            # Add stop loss
+            # Add stop loss (format correctly for JPY pairs)
             if stop_loss:
                 order_data["order"]["stopLossOnFill"] = {
-                    "price": f"{stop_loss:.5f}"
+                    "price": self._format_price(symbol, stop_loss)
                 }
 
-            # Add take profit
+            # Add take profit (format correctly for JPY pairs)
             if take_profit:
                 order_data["order"]["takeProfitOnFill"] = {
-                    "price": f"{take_profit:.5f}"
+                    "price": self._format_price(symbol, take_profit)
                 }
 
             # Place order
@@ -449,10 +466,15 @@ class TradeExecutor:
                 else:
                     distance = min_pips * 0.0001
 
-            # Build trailing stop order data
+            # Build trailing stop order data (format distance correctly for JPY pairs)
+            if 'JPY' in symbol:
+                distance_str = f"{distance:.3f}"
+            else:
+                distance_str = f"{distance:.5f}"
+
             modify_data = {
                 'trailingStopLoss': {
-                    'distance': f"{distance:.5f}"
+                    'distance': distance_str
                 }
             }
 

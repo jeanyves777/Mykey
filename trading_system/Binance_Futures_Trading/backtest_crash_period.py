@@ -59,7 +59,7 @@ class CrashBacktester:
             limit=1000
         )
 
-        if not klines:
+        if klines is None or (hasattr(klines, 'empty') and klines.empty) or len(klines) == 0:
             print("No data returned!")
             return None
 

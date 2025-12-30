@@ -432,6 +432,88 @@ class TrendFilter:
                 f"EMA Cross={analysis.ema_crossover}, "
                 f"Reversal={analysis.reversal_type}")
 
+    def check_higher_timeframe_trend(self, df_h1: pd.DataFrame) -> Tuple[str, str]:
+        """
+        Check overall trend direction on H1 timeframe using EMA50 vs EMA200.
+
+        NEW STRATEGY: Only trade WITH the overall trend.
+        - EMA50 > EMA200 = UPTREND → Only allow BUY signals
+        - EMA50 < EMA200 = DOWNTREND → Only allow SELL signals
+        - No clear trend = FLAT → No new trades
+
+        Args:
+            df_h1: H1 timeframe DataFrame with OHLCV data
+
+        Returns:
+            Tuple of (allowed_direction, reason)
+            allowed_direction: 'BUY', 'SELL', or 'NONE'
+            reason: Explanation
+        """
+        if df_h1 is None or len(df_h1) < 200:
+            return 'BOTH', "Insufficient H1 data - allowing both directions"
+
+        # Ensure close column exists
+        close_col = 'close' if 'close' in df_h1.columns else 'Close'
+        if close_col not in df_h1.columns:
+            return 'BOTH', "No close price column"
+
+        close = df_h1[close_col].values
+
+        # Calculate EMA50 and EMA200
+        ema50 = self._calculate_ema(pd.Series(close), 50)
+        ema200 = self._calculate_ema(pd.Series(close), 200)
+
+        # Current price relative to EMAs
+        current_price = close[-1]
+
+        # Calculate trend strength (gap between EMAs as %)
+        ema_gap = ((ema50 - ema200) / ema200) * 100
+
+        # Determine trend
+        if ema50 > ema200 and current_price > ema50:
+            # Strong uptrend - price above both EMAs
+            return 'BUY', f"H1 UPTREND: EMA50 > EMA200 (gap: {ema_gap:+.2f}%), Price above EMA50"
+        elif ema50 > ema200:
+            # Uptrend with pullback
+            return 'BUY', f"H1 UPTREND: EMA50 > EMA200 (gap: {ema_gap:+.2f}%), Pullback"
+        elif ema50 < ema200 and current_price < ema50:
+            # Strong downtrend - price below both EMAs
+            return 'SELL', f"H1 DOWNTREND: EMA50 < EMA200 (gap: {ema_gap:+.2f}%), Price below EMA50"
+        elif ema50 < ema200:
+            # Downtrend with bounce
+            return 'SELL', f"H1 DOWNTREND: EMA50 < EMA200 (gap: {ema_gap:+.2f}%), Bounce"
+        else:
+            # Flat/consolidation
+            return 'NONE', f"H1 FLAT: EMA50 ≈ EMA200 (gap: {ema_gap:+.2f}%) - No clear trend"
+
+    def validate_signal_with_htf(self, signal_direction: str, df_h1: pd.DataFrame) -> Tuple[bool, str]:
+        """
+        Validate that a signal aligns with higher timeframe trend.
+
+        Args:
+            signal_direction: 'BUY' or 'SELL' from the signal generator
+            df_h1: H1 timeframe data
+
+        Returns:
+            Tuple of (allowed, reason)
+        """
+        allowed_direction, htf_reason = self.check_higher_timeframe_trend(df_h1)
+
+        if allowed_direction == 'BOTH':
+            # No HTF data - allow signal
+            return True, f"Signal {signal_direction} allowed - {htf_reason}"
+
+        if allowed_direction == 'NONE':
+            # Flat market - no trades
+            return False, f"Signal {signal_direction} BLOCKED: {htf_reason}"
+
+        if signal_direction == allowed_direction:
+            # Signal matches HTF trend
+            return True, f"Signal {signal_direction} APPROVED: {htf_reason}"
+        else:
+            # Signal against HTF trend
+            return False, f"Signal {signal_direction} BLOCKED (HTF says {allowed_direction}): {htf_reason}"
+
 
 # Export
 __all__ = ['TrendFilter', 'TrendAnalysis']

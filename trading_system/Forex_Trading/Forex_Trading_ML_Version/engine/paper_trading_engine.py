@@ -866,187 +866,125 @@ class PaperTradingEngine:
         print(f"{'='*60}")
 
         # PRIORITY: ML SCANNING - Process each symbol for trading opportunities
+        trades_opened = False
         for symbol in self.symbols:
             try:
-                self._process_symbol(symbol)
+                opened = self._process_symbol(symbol)
+                if opened:
+                    trades_opened = True
             except Exception as e:
                 print(f"  {symbol}: ERROR - {e}")
 
-        # Update positions with cached OANDA data
+        # If any trades were opened, REFRESH the OANDA trades cache before sync
+        # This prevents newly opened trades from being detected as "closed"
+        if trades_opened:
+            import time
+            time.sleep(0.5)  # Small delay to let OANDA process the orders
+            success, self._live_oanda_trades = self.trade_executor.get_open_trades()
+            if not success:
+                self._live_oanda_trades = []
+
+        # Update positions with fresh OANDA data
         self._update_positions()
 
-    def _process_symbol(self, symbol: str) -> None:
-        """Process trading logic for a symbol - ALWAYS FETCH FRESH DATA."""
-        # ALWAYS fetch fresh market data from OANDA - NO CACHING
+    def _process_symbol(self, symbol: str) -> bool:
+        """
+        Process trading logic for a symbol.
+
+        NEW STRATEGY - TREND FOLLOWING (NO SIGNAL WAITING):
+        1. Check H1 trend direction (EMA50 vs EMA200)
+        2. If no position: Open IMMEDIATELY in trend direction
+        3. If position closed: Reopen IMMEDIATELY in trend direction
+        4. Let DCA handle any pullbacks
+
+        Returns:
+            bool: True if a new trade was opened, False otherwise
+        """
+        # Fetch M5 data for buffer
         df = self.data_loader.get_latest_bars(symbol, count=500, granularity=self.timeframe)
-        if df is None or len(df) < 200:
-            print(f"  {symbol}: Insufficient data ({len(df) if df is not None else 0} bars)")
-            return
+        if df is None or len(df) < 50:
+            print(f"  {symbol}: Insufficient M5 data ({len(df) if df is not None else 0} bars)")
+            return False
 
-        # Always use fresh data for ML decisions - no bar time check
         self.data_buffer[symbol] = df
-
-        # Get current price for display
         current_price = df['close'].iloc[-1] if len(df) > 0 else 0
 
-        # Check if position exists on OANDA (use cached data)
+        # Check if position exists on OANDA
         oanda_trades = getattr(self, '_live_oanda_trades', [])
         has_position = any(t.get('instrument') == symbol for t in oanda_trades)
 
-        # Also check local tracking
         if not has_position:
             has_position = self.position_manager.has_position(symbol)
 
         if has_position:
-            # Check for close signal
+            # Position exists - just manage it (DCA, trailing, etc. handled elsewhere)
             position = self.position_manager.get_position(symbol)
-
-            # If position exists on OANDA but not locally, sync it first
             if position is None:
-                # Find OANDA trade for this symbol and sync
                 for trade in oanda_trades:
                     if trade.get('instrument') == symbol:
                         units = float(trade.get('currentUnits', 0))
                         direction = 'BUY' if units > 0 else 'SELL'
-                        print(f"  {symbol}: POSITION OPEN ({direction}) on OANDA - syncing locally...")
-                        # Skip ML exit check - position not tracked locally
-                        return
-                return
-
-            print(f"  {symbol}: POSITION OPEN ({position.direction}) - Checking for exit signal...")
-            should_close, reason = self.strategy.should_close_position(
-                symbol, position.direction, df
-            )
-            if should_close:
-                print(f"  {symbol}: EXIT SIGNAL - {reason}")
-                self._close_position(symbol, reason)
-            else:
-                print(f"  {symbol}: Hold position (no exit signal)")
+                        print(f"  {symbol}: POSITION OPEN ({direction}) @ {current_price:.5f} - managing...")
+                        return False
+                return False
+            print(f"  {symbol}: POSITION OPEN ({position.direction}) @ {current_price:.5f}")
+            return False
         else:
-            # MASTER MOMENTUM: Check for fast entry when trend + momentum align
-            momentum_enabled = hasattr(self.config, 'momentum') and getattr(self.config.momentum, 'enabled', True)
-            signal = None
-            confidence = 0.0
-            agreement = 0
-            reason = ""
+            # ============================================================
+            # NO POSITION - GET H1 TREND AND OPEN IMMEDIATELY
+            # ============================================================
+            df_h1 = self.data_loader.get_latest_bars(symbol, count=250, granularity='H1')
+            trend_direction, trend_reason = self.trend_filter.check_higher_timeframe_trend(df_h1)
 
-            if momentum_enabled:
-                mom_signal, mom_conf, mom_reason = self.momentum_signal.generate_signal(symbol, df)
+            print(f"  {symbol}: {trend_reason}")
 
-                # Get momentum value from the signal generator
-                mom_summary = self.momentum_signal.get_trend_summary(df)
-                raw_momentum = mom_summary.get('momentum', 0.0)
-                mom_direction = mom_summary.get('momentum_direction', 'NONE')
-                momentum_threshold = getattr(self.config.momentum, 'momentum_threshold', 0.08)
+            if trend_direction == 'NONE':
+                print(f"  {symbol}: NO TRADE - Market flat/consolidating")
+                return False
 
-                if mom_signal:
-                    # MOMENTUM SIGNAL - Fast entry (all 4 conditions met)!
-                    signal = mom_signal
-                    confidence = mom_conf
-                    agreement = 5  # Treat momentum as full agreement
-                    reason = mom_reason
-                    print(f"  {symbol}: >>> MOMENTUM {signal} <<< Conf={confidence:.0%} @ {current_price:.5f}")
-                    print(f"       {mom_reason}")
-                else:
-                    # ALWAYS show momentum check result
-                    print(f"  {symbol}: MOM-CHECK: {mom_reason}")
+            if trend_direction == 'BOTH':
+                # Insufficient H1 data - use M5 EMA as fallback
+                ema_fast = df['close'].ewm(span=8, adjust=False).mean().iloc[-1]
+                ema_slow = df['close'].ewm(span=21, adjust=False).mean().iloc[-1]
+                trend_direction = 'BUY' if ema_fast > ema_slow else 'SELL'
+                print(f"  {symbol}: M5 fallback trend: {trend_direction}")
 
-                    # Check if momentum is strong (>= threshold) even if other conditions failed
-                    strong_momentum = abs(raw_momentum) >= momentum_threshold
+            # Check risk limits
+            can_trade, risk_reason = self.risk_manager.can_trade(
+                self.position_manager.get_position_count()
+            )
 
-                    # Fallback to ML if configured
-                    use_ml_fallback = getattr(self.config.momentum, 'use_ml_fallback', True)
-                    if use_ml_fallback:
-                        ml_signal, ml_conf, ml_agree, ml_reason = self.strategy.generate_signal(symbol, df)
+            if not can_trade:
+                print(f"  {symbol}: Trade BLOCKED - {risk_reason}")
+                return False
 
-                        # Check if ML ALIGNS with momentum direction
-                        ml_aligns_with_momentum = (
-                            (mom_direction == 'UP' and ml_signal == 'BUY') or
-                            (mom_direction == 'DOWN' and ml_signal == 'SELL')
-                        )
-
-                        if strong_momentum and ml_signal and ml_aligns_with_momentum:
-                            # SUPER STRONG: Momentum >= 0.08% AND ML agrees!
-                            signal = ml_signal
-                            confidence = min(0.95, ml_conf + 0.10)  # Boost confidence
-                            agreement = ml_agree
-                            reason = f"MOMENTUM+ML ALIGN: Mom={raw_momentum:+.2f}% + ML {ml_signal}"
-                            print(f"       >>> MOMENTUM+ML ALIGN <<< Mom={raw_momentum:+.2f}% + ML={ml_signal}")
-                        elif ml_signal:
-                            # ML signal only (momentum weak or doesn't align)
-                            signal = ml_signal
-                            confidence = ml_conf
-                            agreement = ml_agree
-                            reason = ml_reason
-                            print(f"       ML-FALLBACK: {ml_signal} Conf={confidence:.0%}")
-            else:
-                # Momentum disabled - use ML only
-                signal, confidence, agreement, reason = self.strategy.generate_signal(symbol, df)
-
-            # ALWAYS show ML decision for each pair (if ML was used)
-            if signal:
-                if 'MOMENTUM' not in reason:
-                    total_display = getattr(self.config.ml, 'total_models_for_display', 3) if hasattr(self.config, 'ml') else 3
-                    print(f"  {symbol}: ML={signal} Conf={confidence:.0%} Agree={agreement}/{total_display} @ {current_price:.5f}")
-
-                # Check risk limits
-                can_trade, risk_reason = self.risk_manager.can_trade(
-                    self.position_manager.get_position_count()
-                )
-
-                if can_trade:
-                    print(f"  {symbol}: >>> EXECUTING {signal} TRADE <<<")
-                    self._open_position(symbol, signal, df, confidence, reason)
-                else:
-                    print(f"  {symbol}: Trade BLOCKED - {risk_reason}")
-            else:
-                # Show why no signal (below threshold or HOLD)
-                total_display = getattr(self.config.ml, 'total_models_for_display', 3) if hasattr(self.config, 'ml') else 3
-                print(f"  {symbol}: HOLD Conf={confidence:.0%} @ {current_price:.5f} ({reason})")
+            # OPEN IMMEDIATELY IN TREND DIRECTION
+            print(f"  {symbol}: >>> OPENING {trend_direction} (H1 trend) <<<")
+            success = self._open_position(symbol, trend_direction, df, 0.80, f"H1 TREND: {trend_reason}")
+            return success
 
     def _open_position(self, symbol: str, direction: str, df: pd.DataFrame,
-                       confidence: float, reason: str) -> None:
+                       confidence: float, reason: str) -> bool:
         """
-        Open a new position with trend validation.
+        Open a new position in the given direction.
 
-        Before entering a new trade, we validate the ML signal against current market trend.
-        This prevents entering trades that go strongly against the current trend,
-        which would likely result in immediate losses and DCA traps.
+        NEW STRATEGY: Trend already checked in _process_symbol
+        - Open immediately in the direction provided
+        - DCA will handle any pullbacks
+
+        Returns:
+            bool: True if trade was opened successfully, False otherwise
         """
         # Get current price
         prices = self.client.get_pricing([symbol])
         if not prices or symbol not in prices:
             print(f"  {symbol}: Failed to get price")
-            return
+            return False
 
         if direction == 'BUY':
             entry_price = prices[symbol]['ask']
         else:
             entry_price = prices[symbol]['bid']
-
-        # TREND VALIDATION: Check if ML signal aligns with market conditions
-        # BUT: Skip trend filter for ML FALLBACK entries (when momentum < threshold)
-        # DCA still uses trend filter as designed
-        is_momentum_signal = 'MOMENTUM' in reason.upper()
-        use_trend_filter = getattr(self.config.dca, 'use_trend_filter', True)
-
-        if use_trend_filter and df is not None and is_momentum_signal:
-            # Only apply trend filter to MOMENTUM signals
-            # ML fallback signals bypass trend filter (DCA will help if counter-trend)
-            can_enter, trend_reason = self.trend_filter.validate_entry(df, direction)
-
-            if not can_enter:
-                # Momentum signal goes against strong trend - skip this trade
-                print(f"  {symbol}: ENTRY BLOCKED - {trend_reason}")
-                print(f"       >>> MOMENTUM {direction} blocked by strong counter-trend")
-                return
-
-            # Show trend alignment when entry is allowed
-            trend_summary = self.trend_filter.get_trend_summary(df)
-            print(f"  {symbol}: Entry OK - {trend_reason}")
-        elif not is_momentum_signal:
-            # ML FALLBACK - skip trend filter, trust ML with DCA support
-            print(f"  {symbol}: ML ENTRY (trend filter bypassed - DCA will help)")
 
         # Check if DCA is enabled
         dca_enabled = self.config.dca.enabled if hasattr(self.config, 'dca') else False
@@ -1140,8 +1078,11 @@ class PaperTradingEngine:
             # When use_pending_orders=False (SMART DCA), we check trend conditions at each DCA level instead
             if dca_enabled and getattr(self.config.dca, 'use_pending_orders', False):
                 self._place_pending_dca_orders(symbol, direction, entry_price, units)
+
+            return True
         else:
             print(f"\n[ERR] {symbol}: Order failed - {result.get('error', 'Unknown')}")
+            return False
 
     def _place_pending_dca_orders(self, symbol: str, direction: str, entry_price: float, base_units: float) -> None:
         """
@@ -1550,14 +1491,14 @@ class PaperTradingEngine:
 
     def _execute_dca_entry(self, symbol: str, position, dca_level: int) -> None:
         """
-        Execute a DCA entry to add to position (SMART DCA with trend filter).
+        Execute a DCA entry to add to position.
 
-        Before adding to a losing position, we check:
-        1. Is the trend strongly against us? (ADX > 30 in wrong direction)
-        2. Are there reversal signals? (EMA crossover, reversal candles)
-        3. Higher DCA levels (3-4) require stronger confirmation
+        NEW STRATEGY:
+        - L1-L4: Execute IMMEDIATELY when price level is reached (no confirmation needed)
+        - L5-L6: Require reversal confirmation before executing
 
-        If trend is too strong against us, we WAIT for reversal instead of blindly adding.
+        This ensures fast DCA execution for normal recovery while being cautious
+        at extreme levels where the trade might be wrong.
         """
         # Get current price
         prices = self.client.get_pricing([symbol])
@@ -1572,22 +1513,31 @@ class PaperTradingEngine:
         # Get pip value for this symbol
         pip_value = self.config.get_pip_value(symbol)
 
-        # SMART DCA: Check trend conditions before executing
-        use_trend_filter = getattr(self.config.dca, 'use_trend_filter', True)
-        if use_trend_filter and symbol in self.data_buffer:
-            df = self.data_buffer[symbol]
-            can_dca, reason = self.trend_filter.can_dca(df, position.direction, dca_level)
+        # Determine if this level requires reversal confirmation
+        # L1-L4: IMMEDIATE execution, L5-L6: Require reversal
+        dca_immediate_levels = getattr(self.config.dca, 'dca_immediate_levels', 4)
+        requires_reversal = dca_level > dca_immediate_levels
 
-            if not can_dca:
-                # Trend too strong against us - wait for reversal
-                print(f"\n[DCA{dca_level}] {symbol}: BLOCKED - {reason}")
-                print(f"       >>> Waiting for market reversal before adding to position")
-                return
+        if requires_reversal:
+            # L5-L6: Check trend conditions before executing
+            use_trend_filter = getattr(self.config.dca, 'use_trend_filter', True)
+            if use_trend_filter and symbol in self.data_buffer:
+                df = self.data_buffer[symbol]
+                can_dca, reason = self.trend_filter.can_dca(df, position.direction, dca_level)
 
-            # Show trend analysis when DCA is allowed
-            trend_summary = self.trend_filter.get_trend_summary(df)
-            print(f"\n[DCA{dca_level}] {symbol}: Trend OK - {reason}")
-            print(f"       {trend_summary}")
+                if not can_dca:
+                    # Trend too strong against us - wait for reversal
+                    print(f"\n[DCA{dca_level}] {symbol}: REVERSAL REQUIRED - {reason}")
+                    print(f"       >>> L{dca_level} requires reversal confirmation - waiting...")
+                    return
+
+                # Show trend analysis when DCA is allowed
+                trend_summary = self.trend_filter.get_trend_summary(df)
+                print(f"\n[DCA{dca_level}] {symbol}: REVERSAL CONFIRMED - {reason}")
+                print(f"       {trend_summary}")
+        else:
+            # L1-L4: Execute immediately without trend check
+            print(f"\n[DCA{dca_level}] {symbol}: IMMEDIATE EXECUTION (L{dca_level} <= L{dca_immediate_levels})")
 
         # Calculate DCA units
         base_units = position.units  # Original position size
@@ -1753,12 +1703,13 @@ class PaperTradingEngine:
                     return
 
         # ========================================
-        # 3. TIME-BASED RECOVERY EXIT - Close old DCA positions
+        # 3. TIME-BASED EXIT - FORCE EXIT AFTER 4 HOURS MAX HOLD
         # ========================================
-        # If position held > 4 hours with DCA, exit at small loss to preserve capital
-        if dca_level >= 1 and getattr(dca, 'use_time_based_recovery', True):
+        # NEW STRATEGY: If position held > 4 hours, EXIT REGARDLESS OF LOSS
+        # Take the loss and start over - don't let positions sit forever
+        if getattr(dca, 'use_time_based_recovery', True):
             max_hold_hours = getattr(dca, 'max_hold_hours', 4.0)
-            time_recovery_loss_pips = getattr(dca, 'time_recovery_loss_pips', -2.0)
+            time_recovery_loss_pips = getattr(dca, 'time_recovery_loss_pips', -5.0)  # Accept up to -5p loss
 
             # Check position age
             position_age_hours = 0
@@ -1769,17 +1720,31 @@ class PaperTradingEngine:
                 if isinstance(entry_time, datetime):
                     position_age_hours = (now - entry_time).total_seconds() / 3600.0
 
-            # If held too long and recovered to acceptable loss, exit
-            if position_age_hours >= max_hold_hours and profit_pips >= time_recovery_loss_pips:
-                print(f"\n{'='*60}")
-                print(f"[TIME-BASED RECOVERY EXIT] {symbol}")
-                print(f"{'='*60}")
-                print(f"       DCA Level: {dca_level} | Position Age: {position_age_hours:.1f} hours")
-                print(f"       Current P&L: {profit_pips:+.1f} pips | Threshold: {time_recovery_loss_pips:+.1f} pips")
-                print(f"       >>> HELD TOO LONG - Exiting to preserve capital!")
-                print(f"       >>> After {max_hold_hours:.0f}h with DCA, best to cut position")
-                self._close_all_trades_for_symbol(symbol, f'Time Recovery Exit DCA{dca_level} after {position_age_hours:.1f}h at {profit_pips:+.1f}p')
-                return
+            # FORCE EXIT after max_hold_hours - regardless of P&L (but prefer small loss)
+            if position_age_hours >= max_hold_hours:
+                # If recovered to acceptable loss OR in profit, exit immediately
+                if profit_pips >= time_recovery_loss_pips:
+                    print(f"\n{'='*60}")
+                    print(f"[4-HOUR MAX HOLD EXIT] {symbol}")
+                    print(f"{'='*60}")
+                    print(f"       DCA Level: {dca_level} | Position Age: {position_age_hours:.1f} hours")
+                    print(f"       Current P&L: {profit_pips:+.1f} pips")
+                    print(f"       >>> MAX HOLD TIME REACHED - EXITING NOW!")
+                    print(f"       >>> Take the loss and start fresh with new trend")
+                    self._close_all_trades_for_symbol(symbol, f'4H Max Hold Exit DCA{dca_level} at {profit_pips:+.1f}p')
+                    return
+                else:
+                    # Loss is worse than threshold, but still close if held > 5 hours
+                    if position_age_hours >= max_hold_hours + 1.0:  # Give 1 extra hour buffer
+                        print(f"\n{'='*60}")
+                        print(f"[FORCED EXIT - EXCEEDED MAX HOLD] {symbol}")
+                        print(f"{'='*60}")
+                        print(f"       DCA Level: {dca_level} | Position Age: {position_age_hours:.1f} hours")
+                        print(f"       Current P&L: {profit_pips:+.1f} pips (worse than {time_recovery_loss_pips:+.1f}p threshold)")
+                        print(f"       >>> FORCED EXIT - Position held too long!")
+                        print(f"       >>> Accept the loss and move on")
+                        self._close_all_trades_for_symbol(symbol, f'FORCED Exit DCA{dca_level} after {position_age_hours:.1f}h at {profit_pips:+.1f}p')
+                        return
 
         # ========================================
         # 4. BREAKEVEN PROTECTION for DCA 3-4 (fallback if recovery exit not triggered)
@@ -2183,41 +2148,50 @@ class PaperTradingEngine:
                             # Use OANDA trade count - 1 as DCA level (1 trade = level 0, 2 trades = level 1)
                             current_dca_level = num_trades - 1
 
-                        # Calculate which DCA level WOULD trigger at current price drop
+                        # Calculate which DCA level WOULD trigger at current price drop (check all 6 levels)
                         loss_pips = abs(pnl_pips)
                         next_dca_level = 0
 
-                        if loss_pips >= dca.get_dca_trigger_pips(1) and current_dca_level < 1:
-                            next_dca_level = 1
-                        elif loss_pips >= dca.get_dca_trigger_pips(2) and current_dca_level < 2:
-                            next_dca_level = 2
-                        elif loss_pips >= dca.get_dca_trigger_pips(3) and current_dca_level < 3:
-                            next_dca_level = 3
-                        elif loss_pips >= dca.get_dca_trigger_pips(4) and current_dca_level < 4:
-                            next_dca_level = 4
+                        for level in range(1, 7):  # Check levels 1-6
+                            if loss_pips >= dca.get_dca_trigger_pips(level) and current_dca_level < level:
+                                next_dca_level = level
+                                break  # Take the lowest untriggered level
 
-                        # If DCA should have triggered but hasn't, show trend filter status
-                        if next_dca_level > 0 and use_trend_filter and symbol in self.data_buffer:
-                            df = self.data_buffer[symbol]
-                            can_dca, reason = self.trend_filter.can_dca(df, direction, next_dca_level)
-                            trend_summary = self.trend_filter.get_trend_summary(df)
+                        # Get immediate execution threshold (L1-L4 immediate, L5-L6 need reversal)
+                        dca_immediate_levels = getattr(dca, 'dca_immediate_levels', 4)
 
-                            if not can_dca:
-                                print(f"    >>> [SMART DCA] DCA{next_dca_level} BLOCKED @ {loss_pips:.1f}p loss")
-                                print(f"        REASON: {reason}")
-                                print(f"        TREND: {trend_summary}")
-                                print(f"        >>> WAITING FOR REVERSAL SIGNAL <<<")
+                        # If DCA should have triggered but hasn't, show status
+                        if next_dca_level > 0:
+                            # Check if this level requires reversal confirmation
+                            requires_reversal = next_dca_level > dca_immediate_levels
+
+                            if requires_reversal:
+                                # L5-L6: Check trend filter
+                                if use_trend_filter and symbol in self.data_buffer:
+                                    df = self.data_buffer[symbol]
+                                    can_dca, reason = self.trend_filter.can_dca(df, direction, next_dca_level)
+                                    trend_summary = self.trend_filter.get_trend_summary(df)
+
+                                    if not can_dca:
+                                        print(f"    >>> [DCA{next_dca_level}] REVERSAL REQUIRED @ {loss_pips:.1f}p loss")
+                                        print(f"        REASON: {reason}")
+                                        print(f"        TREND: {trend_summary}")
+                                        print(f"        >>> L{next_dca_level} needs reversal confirmation <<<")
+                                    else:
+                                        print(f"    >>> [DCA{next_dca_level}] REVERSAL CONFIRMED - {reason}")
+                                else:
+                                    print(f"    >>> [DCA{next_dca_level}] L{next_dca_level} @ {loss_pips:.1f}p - waiting for trend data")
                             else:
-                                print(f"    >>> [SMART DCA] DCA{next_dca_level} READY - {reason}")
-                        elif next_dca_level > 0:
-                            # DCA ready but no trend filter data
-                            print(f"    >>> [SMART DCA] DCA{next_dca_level} level reached ({loss_pips:.1f}p) - No data for trend check")
+                                # L1-L4: IMMEDIATE EXECUTION
+                                print(f"    >>> [DCA{next_dca_level}] IMMEDIATE @ {loss_pips:.1f}p (L1-L4 no reversal needed)")
                         elif loss_pips > 0:
                             # Position underwater but not at DCA trigger yet
-                            next_trigger = dca.get_dca_trigger_pips(current_dca_level + 1)
+                            next_level = min(current_dca_level + 1, 6)
+                            next_trigger = dca.get_dca_trigger_pips(next_level)
                             pips_to_next = next_trigger - loss_pips
                             if pips_to_next > 0:
-                                print(f"    >>> [DCA INFO] Next DCA{current_dca_level + 1} at {next_trigger:.0f}p ({pips_to_next:.1f}p away)")
+                                mode = "IMMEDIATE" if next_level <= dca_immediate_levels else "REVERSAL"
+                                print(f"    >>> [DCA INFO] Next DCA{next_level} at {next_trigger:.0f}p ({pips_to_next:.1f}p away) - {mode}")
 
                     # Show DCA and trailing stop info
                     # Note: has_oanda_trailing and trailing_distance already set in aggregation loop above
