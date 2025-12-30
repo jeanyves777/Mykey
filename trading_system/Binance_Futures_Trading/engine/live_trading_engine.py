@@ -244,34 +244,14 @@ class BinanceLiveTradingEngine:
         self.log(f"  Symbols: {self.num_symbols}")
         self.log(f"  Leverage: {self.leverage}x (ISOLATED)")
 
-        # Calculate minimum margin required per symbol (for min_notional requirement)
-        # First pass: calculate total minimum margin needed
-        min_margins = {}
-        total_min_margin = 0.0
-        for symbol in self.symbols:
-            settings = SYMBOL_SETTINGS.get(symbol, {})
-            min_notional = settings.get("min_notional", 5.0)  # Default $5 notional
-            # Min margin = min_notional / leverage, times 2 for LONG + SHORT in hedge mode
-            min_margin_per_side = min_notional / self.leverage
-            if self.hedge_mode:
-                min_margins[symbol] = min_margin_per_side * 2  # Both sides
-            else:
-                min_margins[symbol] = min_margin_per_side
-            total_min_margin += min_margins[symbol]
-
-        # Calculate remaining budget after minimum allocations
-        remaining_budget = available_balance - total_min_margin
-
-        # Distribute remaining budget equally among symbols
-        extra_per_symbol = remaining_budget / self.num_symbols if remaining_budget > 0 else 0
+        # Simple equal distribution among symbols
+        per_symbol = available_balance / self.num_symbols
 
         # Initialize budgets for each symbol
         for symbol in self.symbols:
-            symbol_budget = min_margins[symbol] + extra_per_symbol
-            self.symbol_budgets[symbol] = symbol_budget
+            self.symbol_budgets[symbol] = per_symbol
             self.symbol_margin_used[symbol] = 0.0
-            min_margin = min_margins[symbol]
-            self.log(f"  {symbol}: ${symbol_budget:.2f} (min: ${min_margin:.2f} + extra: ${extra_per_symbol:.2f})")
+            self.log(f"  {symbol}: ${per_symbol:.2f}")
 
         if self.hedge_mode:
             avg_budget = sum(self.symbol_budgets.values()) / self.num_symbols

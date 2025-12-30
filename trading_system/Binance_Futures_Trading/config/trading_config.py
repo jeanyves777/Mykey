@@ -40,10 +40,11 @@ BINANCE_CONFIG = {
 # 2. TRADING SYMBOLS - OPTIMIZED FOR SCALPING
 # =============================================================================
 # LIVE MODE: Top performers with Enhanced Boost Mode
+# NOTE: BTC removed - requires $100 min notional ($10 margin with 20x leverage), will add back when capital allows
 FUTURES_SYMBOLS_LIVE = [
     "DOTUSDT",   # Polkadot - Best performer: +93.1% in 90-day backtest
     "AVAXUSDT",  # Avalanche - Stable: -2.1% during -43% crash
-    "BTCUSDT",   # Bitcoin - With tighter settings: +40.6% in 90-day backtest
+    # "BTCUSDT",   # Bitcoin - Disabled: needs ~$10 margin for min $100 notional
 ]
 
 # DEMO MODE: All symbols for testing
