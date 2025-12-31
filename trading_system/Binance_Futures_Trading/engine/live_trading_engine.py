@@ -153,9 +153,9 @@ class BinanceLiveTradingEngine:
 
         # POSITION STATE PERSISTENCE - Save DCA levels and boost state
         # This allows the bot to properly restore position states after restart
+        # Put it in Binance_Futures_Trading/ directory (parent of engine/)
         self.position_state_file = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "Binance_Futures_Trading",
             "position_state.json"
         )
 
