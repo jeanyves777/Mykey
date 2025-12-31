@@ -3141,37 +3141,44 @@ class BinanceLiveTradingEngine:
                         print(f"    TP/SL: Orders not found | Liq: ${liq_price:,.4f}")
                     # Show trailing TP status if active
                     local_pos = self.positions.get(position_key)
+                    is_boosted = local_pos.is_boosted if local_pos else False
+                    boost_tag = " [BOOSTED]" if is_boosted else ""
+
                     if local_pos and local_pos.trailing_active:
                         trailing_config = DCA_CONFIG.get("trailing_tp", {})
                         trail_distance = trailing_config.get("trail_distance_roi", 0.15) * 100
                         trigger_roi = (local_pos.peak_roi - trailing_config.get("trail_distance_roi", 0.15)) * 100
-                        print(f"    DCA: {dca_level}/4 | Margin: ${margin_used:.2f} | TRAILING TP: Peak {local_pos.peak_roi*100:.1f}% (exit @ {trigger_roi:.1f}%)")
+                        print(f"    DCA: {dca_level}/4{boost_tag} | Margin: ${margin_used:.2f} | TRAILING TP: Peak {local_pos.peak_roi*100:.1f}% (exit @ {trigger_roi:.1f}%)")
                     elif local_pos and local_pos.peak_roi > 0:
                         trailing_config = DCA_CONFIG.get("trailing_tp", {})
                         activation = trailing_config.get("activation_roi", 0.20) * 100
-                        print(f"    DCA: {dca_level}/4 | Margin: ${margin_used:.2f} | Peak ROI: {local_pos.peak_roi*100:.1f}% (trail @ {activation:.0f}%)")
+                        print(f"    DCA: {dca_level}/4{boost_tag} | Margin: ${margin_used:.2f} | Peak ROI: {local_pos.peak_roi*100:.1f}% (trail @ {activation:.0f}%)")
                     else:
-                        print(f"    DCA: {dca_level}/4 | Margin: ${margin_used:.2f}")
+                        print(f"    DCA: {dca_level}/4{boost_tag} | Margin: ${margin_used:.2f}")
                     if next_dca_price > 0:
-                        # Check if DCA trigger is close and show reversal status
-                        current_roi_loss = abs(roi_pct) / 100  # Convert to decimal
-                        dca_trigger = next_dca_roi  # Already in decimal form (with volatility mult)
-                        roi_to_dca = (dca_trigger - current_roi_loss) * 100  # Percentage points to DCA
-
-                        if roi_to_dca <= 5:  # Within 5% ROI of DCA trigger
-                            # Check Smart DCA status
-                            dca_status = "PENDING"
-                            if symbol in self.data_buffer and self.data_buffer[symbol] is not None:
-                                df = self.data_buffer[symbol].get("1m") if isinstance(self.data_buffer[symbol], dict) else self.data_buffer[symbol]
-                                if df is not None:
-                                    can_dca, reason = self.signal_generator.can_dca(df, side, dca_level + 1)
-                                    if can_dca:
-                                        dca_status = f"READY ({reason})"
-                                    else:
-                                        dca_status = f"WAITING ({reason})"
-                            print(f"    Next DCA @ ${next_dca_price:,.4f} (-{next_dca_roi*100:.0f}% ROI) | {roi_to_dca:.1f}% away | {dca_status}")
+                        # BOOSTED positions don't DCA - skip showing next DCA
+                        if is_boosted:
+                            print(f"    Next DCA: BLOCKED (position is BOOSTED - no further DCA)")
                         else:
-                            print(f"    Next DCA @ ${next_dca_price:,.4f} (-{next_dca_roi*100:.0f}% ROI) | {roi_to_dca:.1f}% away")
+                            # Check if DCA trigger is close and show reversal status
+                            current_roi_loss = abs(roi_pct) / 100  # Convert to decimal
+                            dca_trigger = next_dca_roi  # Already in decimal form (with volatility mult)
+                            roi_to_dca = (dca_trigger - current_roi_loss) * 100  # Percentage points to DCA
+
+                            if roi_to_dca <= 5:  # Within 5% ROI of DCA trigger
+                                # Check Smart DCA status
+                                dca_status = "PENDING"
+                                if symbol in self.data_buffer and self.data_buffer[symbol] is not None:
+                                    df = self.data_buffer[symbol].get("1m") if isinstance(self.data_buffer[symbol], dict) else self.data_buffer[symbol]
+                                    if df is not None:
+                                        can_dca, reason = self.signal_generator.can_dca(df, side, dca_level + 1)
+                                        if can_dca:
+                                            dca_status = f"READY ({reason})"
+                                        else:
+                                            dca_status = f"WAITING ({reason})"
+                                print(f"    Next DCA @ ${next_dca_price:,.4f} (-{next_dca_roi*100:.0f}% ROI) | {roi_to_dca:.1f}% away | {dca_status}")
+                            else:
+                                print(f"    Next DCA @ ${next_dca_price:,.4f} (-{next_dca_roi*100:.0f}% ROI) | {roi_to_dca:.1f}% away")
 
                 except Exception as e:
                     print(f"  {position_key}: Error displaying - {e}")
