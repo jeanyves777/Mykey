@@ -760,15 +760,23 @@ class BinanceLiveTradingEngine:
     def _check_boost_deactivation(self, symbol: str, closed_side: str, exit_type: str):
         """
         Check if boost mode should be deactivated.
-        Deactivates when the TRIGGER side recovers (TP) or hits SL.
+        Deactivates when:
+        1. TRIGGER side recovers (TP) or hits SL
+        2. BOOSTED side hits SL (means trigger side recovered - price moved in trigger's favor)
         """
         if not self.boost_mode_active.get(symbol, False):
             return
 
         trigger_side = self.boost_trigger_side.get(symbol)
+        boosted_side = self.boosted_side.get(symbol)
+
         if closed_side == trigger_side:
             # The losing side that triggered boost has recovered or stopped out
             self._deactivate_boost_mode(symbol, f"{trigger_side} {exit_type}")
+        elif closed_side == boosted_side and exit_type == "SL":
+            # BOOSTED side hit SL - this means price moved in trigger side's favor
+            # (e.g., SHORT boosted hit SL because price went UP, so LONG should be recovering)
+            self._deactivate_boost_mode(symbol, f"{boosted_side} SL (trigger side recovering)")
 
     def _handle_boosted_tp(self, symbol: str, position: LivePosition, current_price: float) -> bool:
         """
