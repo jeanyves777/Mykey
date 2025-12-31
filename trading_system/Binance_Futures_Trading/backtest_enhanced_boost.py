@@ -671,7 +671,8 @@ def run_90_day_test():
     print("          Continue until losing side recovers or SL")
     print("="*80)
 
-    symbols = ["DOTUSDT", "AVAXUSDT", "ETHUSDT", "BTCUSDT"]
+    # Only test DOT and AVAX (no BTC/ETH - insufficient capital)
+    symbols = ["DOTUSDT", "AVAXUSDT"]
 
     all_results = []
     total_starting = 0

@@ -161,8 +161,8 @@ SYMBOL_SETTINGS = {
         "qty_precision": 0,           # Integer only - Binance requires stepSize=1
         "tick_size": 0.001,
         "dca_volatility_mult": 1.6,   # 60% wider - AVAX is volatile
-        # ENHANCED BOOST - Default settings (AVAX is volatile, works well)
-        "tp_roi": 0.08,               # 8% TP (default) - works well for AVAX
+        # ENHANCED BOOST - 8% TP optimal (tested 2.5%, 8%, 10% - 8% best)
+        "tp_roi": 0.08,               # 8% TP - optimal for AVAX volatility
         "boost_trigger_dca": 3,       # Trigger boost at DCA 3 (default)
         # Uses default DCA levels from DCA_CONFIG
     },
@@ -433,6 +433,30 @@ RISK_CONFIG = {
     "max_daily_loss_pct": 0.10,       # Stop trading at -10% daily loss
     "max_total_positions": 12,        # Max concurrent positions (all symbols)
     "max_drawdown_pct": 0.10,         # Max 10% drawdown from peak
+}
+
+# =============================================================================
+# SMART COMPOUNDING - RESERVE FUND SYSTEM
+# =============================================================================
+# Instead of compounding 100% of profits back into trading:
+# - 50% of profits compound into trading capital (grows position sizes)
+# - 50% of profits go to reserve fund (protected, withdrawable anytime)
+#
+# IMPORTANT: Reserve fund is NEVER used for trading, reducing risk while
+# still allowing capital growth through partial compounding.
+#
+# Example with $125 starting balance:
+#   After $10 profit: Trading = $130 ($125 + $5), Reserve = $5
+#   After $20 more:   Trading = $140 ($130 + $10), Reserve = $15
+#   After $50 more:   Trading = $165 ($140 + $25), Reserve = $40
+#
+# The reserve fund can be withdrawn at any time without affecting trading.
+SMART_COMPOUNDING_CONFIG = {
+    "enabled": True,                  # Enable smart compounding with reserve fund
+    "compound_pct": 0.50,             # 50% of profits go to trading capital
+    "reserve_pct": 0.50,              # 50% of profits go to reserve fund
+    "initial_capital": 125.0,         # Starting capital (baseline for calculations)
+    "reserve_file": "reserve_fund.json",  # File to persist reserve fund state
 }
 
 # =============================================================================

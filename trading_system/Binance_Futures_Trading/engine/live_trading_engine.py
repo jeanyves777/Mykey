@@ -18,7 +18,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.trading_config import (
     FUTURES_SYMBOLS, FUTURES_SYMBOLS_LIVE, FUTURES_SYMBOLS_DEMO,
     STRATEGY_CONFIG, RISK_CONFIG, DCA_CONFIG,
-    LOGGING_CONFIG, MOMENTUM_CONFIG, BINANCE_CONFIG, SYMBOL_SETTINGS
+    LOGGING_CONFIG, MOMENTUM_CONFIG, BINANCE_CONFIG, SYMBOL_SETTINGS,
+    SMART_COMPOUNDING_CONFIG
 )
 from engine.binance_client import BinanceClient
 from engine.momentum_signal import MasterMomentumSignal, MultiTimeframeMomentumSignal, TradingSignal, SignalType
@@ -134,6 +135,22 @@ class BinanceLiveTradingEngine:
         self.boost_cycle_count: Dict[str, int] = {}       # symbol -> number of half-close cycles
         self.boost_multiplier = 1.5                       # 1.5x boost
 
+        # SMART COMPOUNDING - Reserve Fund System
+        # Instead of 100% compounding, split profits: 50% compound, 50% reserve
+        self.smart_compounding_enabled = SMART_COMPOUNDING_CONFIG.get("enabled", True)
+        self.compound_pct = SMART_COMPOUNDING_CONFIG.get("compound_pct", 0.50)
+        self.reserve_pct = SMART_COMPOUNDING_CONFIG.get("reserve_pct", 0.50)
+        self.initial_capital = SMART_COMPOUNDING_CONFIG.get("initial_capital", 125.0)
+        self.reserve_fund = 0.0           # Protected profits (never traded)
+        self.total_realized_profit = 0.0  # Total lifetime realized profit
+        self.trading_capital = self.initial_capital  # Capital available for trading
+        self.reserve_file = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "Binance_Futures_Trading",
+            SMART_COMPOUNDING_CONFIG.get("reserve_file", "reserve_fund.json")
+        )
+        self._load_reserve_fund()  # Load saved state
+
         # Logging
         self.log_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -196,8 +213,97 @@ class BinanceLiveTradingEngine:
 
             self.log(f"Trade logged: {symbol} {side} | P&L: ${pnl:+.2f} | Exit: {exit_type}")
 
+            # SMART COMPOUNDING: Process the realized profit/loss
+            # This splits profits 50/50 between compound and reserve
+            self.process_realized_profit(pnl)
+
         except Exception as e:
             self.log(f"Error logging trade: {e}", level="WARN")
+
+    # =========================================================================
+    # SMART COMPOUNDING - RESERVE FUND SYSTEM
+    # =========================================================================
+
+    def _load_reserve_fund(self):
+        """Load reserve fund state from file"""
+        try:
+            if os.path.exists(self.reserve_file):
+                with open(self.reserve_file, 'r') as f:
+                    data = json.load(f)
+                    self.reserve_fund = data.get("reserve_fund", 0.0)
+                    self.total_realized_profit = data.get("total_realized_profit", 0.0)
+                    self.trading_capital = data.get("trading_capital", self.initial_capital)
+                    self.log(f"[SMART COMPOUND] Loaded: Trading=${self.trading_capital:.2f} | Reserve=${self.reserve_fund:.2f}")
+        except Exception as e:
+            self.log(f"[SMART COMPOUND] Error loading reserve fund: {e}", level="WARN")
+
+    def _save_reserve_fund(self):
+        """Save reserve fund state to file"""
+        try:
+            data = {
+                "reserve_fund": self.reserve_fund,
+                "total_realized_profit": self.total_realized_profit,
+                "trading_capital": self.trading_capital,
+                "initial_capital": self.initial_capital,
+                "last_updated": datetime.now().isoformat()
+            }
+            with open(self.reserve_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            self.log(f"[SMART COMPOUND] Error saving reserve fund: {e}", level="WARN")
+
+    def process_realized_profit(self, pnl: float):
+        """
+        Process realized profit/loss with smart compounding.
+        - 50% of profit compounds into trading capital
+        - 50% of profit goes to reserve fund (protected)
+        - Losses reduce trading capital only (reserve is protected)
+        """
+        if not self.smart_compounding_enabled:
+            return
+
+        self.total_realized_profit += pnl
+
+        if pnl > 0:
+            # PROFIT: Split 50/50
+            compound_amount = pnl * self.compound_pct
+            reserve_amount = pnl * self.reserve_pct
+
+            self.trading_capital += compound_amount
+            self.reserve_fund += reserve_amount
+
+            self.log(f"[SMART COMPOUND] Profit ${pnl:.2f} -> Compound +${compound_amount:.2f} | Reserve +${reserve_amount:.2f}")
+            self.log(f"[SMART COMPOUND] Trading Capital: ${self.trading_capital:.2f} | Reserve Fund: ${self.reserve_fund:.2f}")
+        else:
+            # LOSS: Only affects trading capital (reserve protected)
+            self.log(f"[SMART COMPOUND] Loss ${pnl:.2f} -> Reserve protected (${self.reserve_fund:.2f})")
+
+        # Save state after each profit/loss
+        self._save_reserve_fund()
+
+    def get_trading_capital(self) -> float:
+        """
+        Get the capital available for trading.
+        This is initial_capital + compounded profits (NOT total balance).
+        Reserve fund is NEVER included in trading capital.
+        """
+        if self.smart_compounding_enabled:
+            return self.trading_capital
+        else:
+            # Fall back to actual balance if smart compounding disabled
+            return self.client.get_balance()
+
+    def get_reserve_fund_status(self) -> dict:
+        """Get reserve fund status for display"""
+        return {
+            "enabled": self.smart_compounding_enabled,
+            "initial_capital": self.initial_capital,
+            "trading_capital": self.trading_capital,
+            "reserve_fund": self.reserve_fund,
+            "total_realized_profit": self.total_realized_profit,
+            "compound_pct": self.compound_pct * 100,
+            "reserve_pct": self.reserve_pct * 100
+        }
 
     def setup_symbol(self, symbol: str):
         """Set up a symbol for trading (leverage, margin type)"""
@@ -220,8 +326,9 @@ class BinanceLiveTradingEngine:
 
     def initialize_dynamic_allocation(self):
         """
-        Initialize dynamic fund allocation based on current balance.
-        Divides balance equally among all symbols.
+        Initialize dynamic fund allocation based on TRADING CAPITAL (not total balance).
+        With smart compounding: uses initial_capital + compounded profits
+        Reserve fund is NEVER included in trading allocation.
         """
         # If hedge mode is enabled, ensure Binance account is set to Hedge Mode
         if self.hedge_mode:
@@ -232,7 +339,20 @@ class BinanceLiveTradingEngine:
                 self.log("HEDGE MODE: WARNING - Could not enable Hedge Mode on Binance!", level="WARN")
                 self.log("  You may need to close all positions first, then enable manually", level="WARN")
 
-        balance = self.client.get_balance()
+        # Get actual balance from Binance
+        actual_balance = self.client.get_balance()
+
+        # SMART COMPOUNDING: Use trading_capital instead of total balance
+        # This excludes the reserve fund from trading allocations
+        if self.smart_compounding_enabled:
+            # Use our calculated trading capital (initial + 50% of profits)
+            trading_capital = self.get_trading_capital()
+            self.log(f"[SMART COMPOUND] Actual Balance: ${actual_balance:.2f}")
+            self.log(f"[SMART COMPOUND] Trading Capital: ${trading_capital:.2f} (excludes reserve)")
+            self.log(f"[SMART COMPOUND] Reserve Fund: ${self.reserve_fund:.2f} (protected)")
+            balance = trading_capital
+        else:
+            balance = actual_balance
 
         # Apply buffer for fees/safety
         buffer = RISK_CONFIG.get("allocation_buffer_pct", 0.05)
@@ -2937,6 +3057,15 @@ class BinanceLiveTradingEngine:
             balance = self.client.get_balance()
             available = self.client.get_available_balance()
             print(f"\nBalance: ${balance:,.2f} (Available: ${available:,.2f})")
+
+            # SMART COMPOUNDING - Show reserve fund status
+            if self.smart_compounding_enabled:
+                status = self.get_reserve_fund_status()
+                print(f"\n[SMART COMPOUNDING] 50/50 Split Active")
+                print(f"  Trading Capital: ${status['trading_capital']:.2f} (used for sizing)")
+                print(f"  Reserve Fund: ${status['reserve_fund']:.2f} (protected)")
+                print(f"  Total Profit: ${status['total_realized_profit']:.2f}")
+
             print(f"Daily Trades: {self.daily_trades}/{STRATEGY_CONFIG['max_trades_per_day']}")
             print(f"Leverage: {self.leverage}x (ISOLATED)")
 
