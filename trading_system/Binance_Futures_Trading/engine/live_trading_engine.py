@@ -3552,7 +3552,7 @@ class BinanceLiveTradingEngine:
                 self.log(f"  [CLEANUP] Found {len(tp_orders)} duplicate TP orders, cancelling extras...")
                 for tp in tp_orders[:-1]:  # Cancel all but the last one
                     try:
-                        self.client.cancel_order(symbol, tp["id"])
+                        self.client.cancel_order(symbol, tp["id"], is_algo_order=True)
                         self.log(f"    Cancelled duplicate TP order {tp['id']} @ ${tp['price']:,.4f}")
                     except Exception as e:
                         self.log(f"    Failed to cancel TP {tp['id']}: {e}", level="WARN")
