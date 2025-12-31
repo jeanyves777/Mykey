@@ -3229,16 +3229,30 @@ class BinanceLiveTradingEngine:
                 print(f"\nOpen Positions ({len(positions)}):")
                 for pos in positions:
                     symbol = pos['symbol']
+                    side = pos['side']
                     pnl = pos.get("unrealized_pnl", 0)
-                    local_pos = self.positions.get(symbol)
+
+                    # In hedge mode, use symbol_side as key
+                    if self.hedge_mode:
+                        pos_key = f"{symbol}_{side}"
+                    else:
+                        pos_key = symbol
+
+                    local_pos = self.positions.get(pos_key)
                     margin = local_pos.margin_used if local_pos else 0
+                    dca_count = local_pos.dca_count if local_pos else 0
+                    is_boosted = local_pos.is_boosted if local_pos else False
                     budget = self.symbol_budgets.get(symbol, 0)
 
-                    print(f"  {symbol} {pos['side']}: "
+                    # Build status string
+                    boost_str = " [BOOSTED]" if is_boosted else ""
+                    dca_str = f" DCA:{dca_count}/4" if dca_count > 0 else ""
+
+                    print(f"  {symbol} {side}: "
                           f"Entry ${pos['entry_price']:,.2f} | "
                           f"Qty: {pos['quantity']:.6f} | "
                           f"Margin: ${margin:.2f}/{budget:.2f} | "
-                          f"P&L: ${pnl:+.2f}")
+                          f"P&L: ${pnl:+.2f}{dca_str}{boost_str}")
             else:
                 print("\nNo open positions")
 
@@ -3501,12 +3515,17 @@ class BinanceLiveTradingEngine:
             # Get the position side for filtering orders in hedge mode
             position_side = pos["side"]  # LONG or SHORT
 
+            # Collect ALL SL and TP orders for this position side
+            sl_orders = []
+            tp_orders = []
+
             self.log(f"  {symbol} [{position_side}]: Found {len(orders)} open orders")
             for order in orders:
                 order_type = order.get("type", "")
                 order_side = order.get("side", "")
                 order_position_side = order.get("positionSide", "BOTH")
                 trigger_price = float(order.get("stopPrice", order.get("triggerPrice", 0)))
+                order_id = order.get("orderId")
 
                 # In hedge mode, only count orders that match our position side
                 if self.hedge_mode and order_position_side != position_side:
@@ -3514,13 +3533,38 @@ class BinanceLiveTradingEngine:
 
                 self.log(f"    Order: type={order_type}, side={order_side}, positionSide={order_position_side}, trigger=${trigger_price:,.4f}")
                 if order_type == "STOP_MARKET":
-                    has_sl = True
-                    sl_order_id = order.get("orderId")
-                    current_sl_price = trigger_price
+                    sl_orders.append({"id": order_id, "price": trigger_price})
                 elif order_type == "TAKE_PROFIT_MARKET":
-                    has_tp = True
-                    tp_order_id = order.get("orderId")
-                    current_tp_price = float(order.get("stopPrice", 0))
+                    tp_orders.append({"id": order_id, "price": trigger_price})
+
+            # CLEANUP: Cancel duplicate orders, keep only the newest (last) one
+            if len(sl_orders) > 1:
+                self.log(f"  [CLEANUP] Found {len(sl_orders)} duplicate SL orders, cancelling extras...")
+                for sl in sl_orders[:-1]:  # Cancel all but the last one
+                    try:
+                        self.client.cancel_order(symbol, sl["id"], is_algo_order=True)
+                        self.log(f"    Cancelled duplicate SL order {sl['id']} @ ${sl['price']:,.4f}")
+                    except Exception as e:
+                        self.log(f"    Failed to cancel SL {sl['id']}: {e}", level="WARN")
+                sl_orders = [sl_orders[-1]]  # Keep only the last one
+
+            if len(tp_orders) > 1:
+                self.log(f"  [CLEANUP] Found {len(tp_orders)} duplicate TP orders, cancelling extras...")
+                for tp in tp_orders[:-1]:  # Cancel all but the last one
+                    try:
+                        self.client.cancel_order(symbol, tp["id"])
+                        self.log(f"    Cancelled duplicate TP order {tp['id']} @ ${tp['price']:,.4f}")
+                    except Exception as e:
+                        self.log(f"    Failed to cancel TP {tp['id']}: {e}", level="WARN")
+                tp_orders = [tp_orders[-1]]  # Keep only the last one
+
+            # Set final values
+            has_sl = len(sl_orders) > 0
+            has_tp = len(tp_orders) > 0
+            sl_order_id = sl_orders[0]["id"] if has_sl else None
+            tp_order_id = tp_orders[0]["id"] if has_tp else None
+            current_sl_price = sl_orders[0]["price"] if has_sl else 0.0
+            current_tp_price = tp_orders[0]["price"] if has_tp else 0.0
 
             # Need to place missing orders
             entry_price = pos["entry_price"]
