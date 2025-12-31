@@ -151,6 +151,14 @@ class BinanceLiveTradingEngine:
         )
         self._load_reserve_fund()  # Load saved state
 
+        # POSITION STATE PERSISTENCE - Save DCA levels and boost state
+        # This allows the bot to properly restore position states after restart
+        self.position_state_file = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "Binance_Futures_Trading",
+            "position_state.json"
+        )
+
         # Logging
         self.log_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -304,6 +312,102 @@ class BinanceLiveTradingEngine:
             "compound_pct": self.compound_pct * 100,
             "reserve_pct": self.reserve_pct * 100
         }
+
+    # =========================================================================
+    # POSITION STATE PERSISTENCE - Save/Load DCA levels and boost state
+    # =========================================================================
+    # This allows the bot to properly restore position states after restart
+    # instead of guessing DCA levels from margin used
+
+    def _save_position_state(self):
+        """
+        Save position state to file for restart recovery.
+        Saves: DCA levels, boost mode state, position details
+        """
+        try:
+            state = {
+                "last_updated": datetime.now().isoformat(),
+                "positions": {},
+                "boost_state": {
+                    "boost_mode_active": dict(self.boost_mode_active),
+                    "boosted_side": dict(self.boosted_side),
+                    "boost_trigger_side": dict(self.boost_trigger_side),
+                    "boost_locked_profit": dict(self.boost_locked_profit),
+                    "boost_cycle_count": dict(self.boost_cycle_count),
+                }
+            }
+
+            # Save each position's state
+            for pos_key, pos in self.positions.items():
+                state["positions"][pos_key] = {
+                    "symbol": pos.symbol,
+                    "side": pos.side,
+                    "entry_price": pos.entry_price,
+                    "avg_entry_price": pos.avg_entry_price,
+                    "quantity": pos.quantity,
+                    "dca_count": pos.dca_count,
+                    "margin_used": pos.margin_used,
+                    "is_boosted": pos.is_boosted,
+                    "boost_multiplier": pos.boost_multiplier,
+                    "half_close_count": pos.half_close_count,
+                    "peak_roi": pos.peak_roi,
+                    "trailing_active": pos.trailing_active,
+                }
+
+            with open(self.position_state_file, 'w') as f:
+                json.dump(state, f, indent=2)
+
+            self.log(f"[STATE] Saved position state: {len(self.positions)} positions")
+
+        except Exception as e:
+            self.log(f"[STATE] Error saving position state: {e}", level="WARN")
+
+    def _load_position_state(self) -> dict:
+        """
+        Load saved position state from file.
+        Returns dict with positions and boost_state, or empty dict if not found.
+        """
+        try:
+            if os.path.exists(self.position_state_file):
+                with open(self.position_state_file, 'r') as f:
+                    state = json.load(f)
+                    self.log(f"[STATE] Loaded saved state from {state.get('last_updated', 'unknown')}")
+                    return state
+        except Exception as e:
+            self.log(f"[STATE] Error loading position state: {e}", level="WARN")
+        return {}
+
+    def _clear_position_state(self, position_key: str = None):
+        """
+        Clear position state from file.
+        If position_key is given, only clear that position.
+        If None, clear all state.
+        """
+        try:
+            if position_key:
+                # Load, remove specific position, save
+                state = self._load_position_state()
+                if state and "positions" in state:
+                    if position_key in state["positions"]:
+                        del state["positions"][position_key]
+                        self.log(f"[STATE] Cleared state for {position_key}")
+                    # Check if boost state needs clearing for this symbol
+                    symbol = position_key.split("_")[0] if "_" in position_key else position_key
+                    if "boost_state" in state:
+                        for key in ["boost_mode_active", "boosted_side", "boost_trigger_side",
+                                    "boost_locked_profit", "boost_cycle_count"]:
+                            if symbol in state["boost_state"].get(key, {}):
+                                del state["boost_state"][key][symbol]
+                    # Save updated state
+                    with open(self.position_state_file, 'w') as f:
+                        json.dump(state, f, indent=2)
+            else:
+                # Clear all state
+                if os.path.exists(self.position_state_file):
+                    os.remove(self.position_state_file)
+                    self.log("[STATE] Cleared all position state")
+        except Exception as e:
+            self.log(f"[STATE] Error clearing position state: {e}", level="WARN")
 
     def setup_symbol(self, symbol: str):
         """Set up a symbol for trading (leverage, margin type)"""
@@ -616,6 +720,8 @@ class BinanceLiveTradingEngine:
                     # Update position quantity
                     opposite_pos.quantity += boost_add_qty
                     self.log(f"    [BOOST] SUCCESS: {opposite_side} now has {opposite_pos.quantity} qty (1.5x)")
+                    # SAVE STATE after boost activation
+                    self._save_position_state()
                 else:
                     self.log(f"    [BOOST] WARNING: Failed to add boost qty: {boost_order}", level="WARN")
         except Exception as e:
@@ -647,6 +753,9 @@ class BinanceLiveTradingEngine:
                 pos.is_boosted = False
                 pos.boost_multiplier = 1.0
                 pos.half_close_count = 0
+
+        # SAVE STATE after boost deactivation
+        self._save_position_state()
 
     def _check_boost_deactivation(self, symbol: str, closed_side: str, exit_type: str):
         """
@@ -1760,6 +1869,9 @@ class BinanceLiveTradingEngine:
                 margin_used=margin
             )
 
+            # SAVE STATE after new position entry
+            self._save_position_state()
+
             # NOTE: daily_trades is counted on position CLOSE, not entry
             # This ensures trades/wins/losses are all counted consistently
 
@@ -1940,6 +2052,9 @@ class BinanceLiveTradingEngine:
 
                     # Remove position from tracking
                     del self.positions[position_key]
+
+                    # CLEAR STATE for closed position
+                    self._save_position_state()
 
                     # ============================================
                     # HEDGE MODE or HYBRID HOLD: ALWAYS RE-ENTER
@@ -2151,6 +2266,9 @@ class BinanceLiveTradingEngine:
                     # When one side hits boost trigger DCA level, boost the OTHER side
                     # ================================================================
                     self._check_boost_activation(symbol, position, dca_level)
+
+                    # SAVE POSITION STATE after DCA (for restart recovery)
+                    self._save_position_state()
 
                     # Cancel old SL/TP and place new ones
                     if position.stop_loss_order_id:
@@ -3226,17 +3344,43 @@ class BinanceLiveTradingEngine:
         """
         Sync existing positions from Binance on startup.
         This allows the bot to manage positions from previous sessions.
+
+        IMPROVED: Now uses saved position_state.json to restore DCA levels
+        and boost state instead of guessing from margin used.
         """
         self.log("Checking for existing positions...")
+
+        # Load saved position state first
+        saved_state = self._load_position_state()
+        saved_positions = saved_state.get("positions", {})
+        saved_boost = saved_state.get("boost_state", {})
 
         try:
             binance_positions = self.client.get_positions()
 
             if not binance_positions:
                 self.log("No existing positions found")
+                # Clear saved state if no positions on Binance
+                if saved_positions:
+                    self._clear_position_state()
                 return
 
             self.log(f"Found {len(binance_positions)} existing position(s)")
+
+            # Restore boost state from saved state
+            if saved_boost:
+                self.boost_mode_active = saved_boost.get("boost_mode_active", {})
+                self.boosted_side = saved_boost.get("boosted_side", {})
+                self.boost_trigger_side = saved_boost.get("boost_trigger_side", {})
+                self.boost_locked_profit = saved_boost.get("boost_locked_profit", {})
+                self.boost_cycle_count = saved_boost.get("boost_cycle_count", {})
+
+                # Log restored boost state
+                for symbol, active in self.boost_mode_active.items():
+                    if active:
+                        boosted = self.boosted_side.get(symbol, "?")
+                        trigger = self.boost_trigger_side.get(symbol, "?")
+                        self.log(f"  [BOOST] Restored: {symbol} {boosted} is BOOSTED (triggered by {trigger})")
 
             for pos in binance_positions:
                 symbol = pos["symbol"]
@@ -3264,8 +3408,29 @@ class BinanceLiveTradingEngine:
                 # Get actual margin from Binance if available
                 actual_margin = float(pos.get("isolated_wallet", 0)) or estimated_margin
 
-                # Auto-detect DCA level from margin used
-                dca_level = self.detect_dca_level_from_margin(symbol, actual_margin)
+                # ================================================================
+                # IMPROVED: Use saved state if available, otherwise estimate
+                # ================================================================
+                saved_pos = saved_positions.get(position_key, {})
+
+                if saved_pos:
+                    # Use saved DCA level and boost state
+                    dca_level = saved_pos.get("dca_count", 0)
+                    is_boosted = saved_pos.get("is_boosted", False)
+                    boost_multiplier = saved_pos.get("boost_multiplier", 1.0)
+                    half_close_count = saved_pos.get("half_close_count", 0)
+                    peak_roi = saved_pos.get("peak_roi", 0.0)
+                    trailing_active = saved_pos.get("trailing_active", False)
+                    self.log(f"  [STATE] {position_key}: Restored DCA={dca_level}/4, Boosted={is_boosted}")
+                else:
+                    # Fallback: estimate DCA level from margin used
+                    dca_level = self.detect_dca_level_from_margin(symbol, actual_margin)
+                    is_boosted = False
+                    boost_multiplier = 1.0
+                    half_close_count = 0
+                    peak_roi = 0.0
+                    trailing_active = False
+                    self.log(f"  [STATE] {position_key}: No saved state, estimated DCA={dca_level}/4")
 
                 # Create local position object
                 self.positions[position_key] = LivePosition(
@@ -3276,7 +3441,12 @@ class BinanceLiveTradingEngine:
                     entry_time=datetime.now(),  # Unknown actual entry time
                     avg_entry_price=pos["entry_price"],
                     margin_used=actual_margin,
-                    dca_count=dca_level
+                    dca_count=dca_level,
+                    is_boosted=is_boosted,
+                    boost_multiplier=boost_multiplier,
+                    half_close_count=half_close_count,
+                    peak_roi=peak_roi,
+                    trailing_active=trailing_active
                 )
 
                 self.symbol_margin_used[position_key] = actual_margin
@@ -3292,9 +3462,11 @@ class BinanceLiveTradingEngine:
                     else:
                         pnl_pct = ((pos["entry_price"] - current_price) / pos["entry_price"]) * 100
 
-                    self.log(f"  Synced {symbol} {pos['side']}: Entry ${pos['entry_price']:,.2f} | Qty: {pos['quantity']:.6f} | P&L: {pnl_pct:+.2f}% | DCA: {dca_level}/4")
+                    boost_str = " [BOOSTED]" if is_boosted else ""
+                    self.log(f"  Synced {symbol} {pos['side']}: Entry ${pos['entry_price']:,.2f} | Qty: {pos['quantity']:.6f} | P&L: {pnl_pct:+.2f}% | DCA: {dca_level}/4{boost_str}")
                 except:
-                    self.log(f"  Synced {symbol} {pos['side']}: Entry ${pos['entry_price']:,.2f} | Qty: {pos['quantity']:.6f} | DCA: {dca_level}/4")
+                    boost_str = " [BOOSTED]" if is_boosted else ""
+                    self.log(f"  Synced {symbol} {pos['side']}: Entry ${pos['entry_price']:,.2f} | Qty: {pos['quantity']:.6f} | DCA: {dca_level}/4{boost_str}")
 
                 # Check if position has SL/TP orders - if DCA level > 0, update TP to reduced level
                 self._ensure_sl_tp_orders(symbol, pos, dca_level, position_key=position_key)
