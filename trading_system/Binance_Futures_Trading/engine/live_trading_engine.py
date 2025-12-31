@@ -770,6 +770,156 @@ class BinanceLiveTradingEngine:
             # The losing side that triggered boost has recovered or stopped out
             self._deactivate_boost_mode(symbol, f"{trigger_side} {exit_type}")
 
+    def _handle_boosted_tp(self, symbol: str, position: LivePosition, current_price: float) -> bool:
+        """
+        Handle TP for BOOSTED positions with half-close cycle:
+        1. Close 50% of position -> lock profit
+        2. Keep 50% running with trailing SL
+        3. Re-enter NEW position at 1.5x size
+
+        Returns True if half-close was executed, False otherwise.
+        """
+        if not position.is_boosted:
+            return False
+
+        pos_key = self.get_position_key(symbol, position.side)
+
+        # Calculate 50% quantity to close
+        half_qty = position.quantity / 2
+
+        # Round to symbol precision
+        symbol_config = SYMBOL_SETTINGS.get(symbol, {})
+        qty_precision = symbol_config.get("qty_precision", 1)
+        half_qty = round(half_qty, qty_precision)
+        remaining_qty = round(position.quantity - half_qty, qty_precision)
+
+        if half_qty <= 0:
+            self.log(f"[BOOST HALF-CLOSE] {symbol}: Quantity too small to split", level="WARN")
+            return False
+
+        self.log(f">>> [BOOST HALF-CLOSE] {symbol} {position.side}: TP HIT!", level="TRADE")
+        self.log(f"    [BOOST] Closing 50%: {half_qty} qty (keeping {remaining_qty})", level="TRADE")
+
+        try:
+            # 1. CLOSE 50% - Lock profit
+            close_side = "SELL" if position.side == "LONG" else "BUY"
+            hedge_position_side = position.side if self.hedge_mode else None
+
+            close_order = self.client.place_market_order(
+                symbol, close_side, half_qty, position_side=hedge_position_side
+            )
+
+            if "orderId" not in close_order:
+                self.log(f"    [BOOST] FAILED to close 50%: {close_order}", level="ERROR")
+                return False
+
+            fill_price = float(close_order.get("avgPrice", current_price))
+
+            # Calculate P&L for the closed portion
+            if position.side == "LONG":
+                half_pnl = (fill_price - position.avg_entry_price) * half_qty
+            else:
+                half_pnl = (position.avg_entry_price - fill_price) * half_qty
+
+            self.log(f"    [BOOST] Closed 50% @ ${fill_price:,.4f} | P&L: ${half_pnl:+.2f}", level="TRADE")
+
+            # Lock profit
+            self.boost_locked_profit[symbol] = self.boost_locked_profit.get(symbol, 0) + half_pnl
+            position.half_close_count += 1
+            self.boost_cycle_count[symbol] = self.boost_cycle_count.get(symbol, 0) + 1
+
+            # Update position quantity
+            position.quantity = remaining_qty
+
+            # Log trade
+            self.log_trade(
+                symbol=symbol,
+                side=position.side,
+                entry_price=position.avg_entry_price,
+                exit_price=fill_price,
+                quantity=half_qty,
+                pnl=half_pnl,
+                exit_type="BOOST_HALF_CLOSE",
+                dca_level=position.dca_count
+            )
+
+            # Update daily stats
+            self.daily_pnl += half_pnl
+            self.daily_trades += 1
+            if half_pnl > 0:
+                self.daily_wins += 1
+            else:
+                self.daily_losses += 1
+
+            # 2. ACTIVATE TRAILING SL on remaining 50%
+            position.trailing_active = True
+            position.peak_roi = 0.0  # Reset peak for trailing
+            self.log(f"    [BOOST] Remaining 50% now has TRAILING SL active", level="TRADE")
+
+            # 3. RE-ENTER at 1.5x size
+            # Calculate new position size (1.5x of original base)
+            base_qty = remaining_qty  # The remaining 50% is the base
+            new_entry_qty = round(base_qty * 1.5, qty_precision)  # 1.5x
+
+            if new_entry_qty > 0:
+                entry_side = "BUY" if position.side == "LONG" else "SELL"
+                self.log(f"    [BOOST] Re-entering at 1.5x: {new_entry_qty} qty", level="TRADE")
+
+                reentry_order = self.client.place_market_order(
+                    symbol, entry_side, new_entry_qty, position_side=position.side
+                )
+
+                if "orderId" in reentry_order:
+                    reentry_price = float(reentry_order.get("avgPrice", current_price))
+
+                    # Update position with new average entry
+                    total_qty = remaining_qty + new_entry_qty
+                    # Weighted average entry price
+                    new_avg_entry = (
+                        (position.avg_entry_price * remaining_qty) +
+                        (reentry_price * new_entry_qty)
+                    ) / total_qty
+
+                    position.quantity = total_qty
+                    position.avg_entry_price = new_avg_entry
+
+                    self.log(f"    [BOOST] SUCCESS: New total qty {total_qty} @ avg ${new_avg_entry:,.4f}", level="TRADE")
+                    self.log(f"    [BOOST] Cycle #{position.half_close_count} complete | Total locked: ${self.boost_locked_profit.get(symbol, 0):+.2f}", level="TRADE")
+                else:
+                    self.log(f"    [BOOST] WARNING: Re-entry failed: {reentry_order}", level="WARN")
+
+            # Update SL/TP orders for the new position
+            pos_dict = {
+                "symbol": symbol,
+                "side": position.side,
+                "entry_price": position.avg_entry_price,
+                "quantity": position.quantity
+            }
+
+            # Cancel old orders and place new ones
+            try:
+                # Cancel only orders for this position side
+                orders = self.client.get_open_orders(symbol)
+                for order in orders:
+                    if order.get("positionSide") == position.side:
+                        try:
+                            self.client.cancel_order(symbol, order["orderId"], is_algo_order=True)
+                        except:
+                            pass
+            except:
+                pass
+
+            self._ensure_sl_tp_orders(symbol, pos_dict, position.dca_count, position_key=pos_key)
+
+            # Save state
+            self._save_position_state()
+
+            return True
+
+        except Exception as e:
+            self.log(f"    [BOOST] ERROR in half-close cycle: {e}", level="ERROR")
+            return False
+
     def check_daily_reset(self):
         """Reset daily counters at midnight"""
         today = datetime.now().date()
@@ -2705,7 +2855,8 @@ class BinanceLiveTradingEngine:
     def _check_auto_close_tp(self, symbol: str, position: LivePosition, current_price: float) -> bool:
         """
         Check if position should be auto-closed because price is past TP target.
-        Returns True if position was closed, False otherwise.
+        For BOOSTED positions: executes half-close cycle instead of full close.
+        Returns True if position was closed/handled, False otherwise.
         """
         leverage = STRATEGY_CONFIG["leverage"]
 
@@ -2739,6 +2890,11 @@ class BinanceLiveTradingEngine:
             for order in orders:
                 order_type = order.get("type", "")
                 order_qty = float(order.get("origQty", 0))
+                order_position_side = order.get("positionSide", "BOTH")
+
+                # In hedge mode, match position side
+                if self.hedge_mode and order_position_side != position.side:
+                    continue
 
                 if order_type == "TAKE_PROFIT_MARKET":
                     # Check if quantity matches (within 1% tolerance)
@@ -2749,6 +2905,11 @@ class BinanceLiveTradingEngine:
             if has_valid_tp:
                 # TP order exists with correct qty - Binance should execute it
                 return False
+
+            # *** BOOSTED POSITION: Execute half-close cycle ***
+            if position.is_boosted:
+                self.log(f"[BOOST TP] {symbol} {position.side}: Price ${current_price:,.4f} hit TP ${expected_tp:,.4f}", level="TRADE")
+                return self._handle_boosted_tp(symbol, position, current_price)
 
             # NO valid TP order and price is past target - AUTO CLOSE!
             self.log(f"AUTO-CLOSE {symbol}: Price ${current_price:,.4f} past TP ${expected_tp:,.4f} (no valid TP order)", level="TRADE")
@@ -3142,7 +3303,16 @@ class BinanceLiveTradingEngine:
                     # Show trailing TP status if active
                     local_pos = self.positions.get(position_key)
                     is_boosted = local_pos.is_boosted if local_pos else False
-                    boost_tag = " [BOOSTED]" if is_boosted else ""
+                    half_closes = local_pos.half_close_count if local_pos else 0
+                    locked_profit = self.boost_locked_profit.get(symbol, 0)
+
+                    # Build boost tag with cycle info
+                    if is_boosted and half_closes > 0:
+                        boost_tag = f" [BOOSTED x{half_closes} | Locked: ${locked_profit:+.2f}]"
+                    elif is_boosted:
+                        boost_tag = " [BOOSTED]"
+                    else:
+                        boost_tag = ""
 
                     if local_pos and local_pos.trailing_active:
                         trailing_config = DCA_CONFIG.get("trailing_tp", {})
