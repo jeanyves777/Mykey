@@ -591,10 +591,35 @@ class BinanceLiveTradingEngine:
         self.log(f">>> [BOOST] {symbol}: ACTIVATED! {position.side} hit DCA {dca_level} -> {opposite_side} now BOOSTED 1.5x")
         self.log(f"    [BOOST] Logic: At TP -> Close HALF, lock profit, add 0.5x, trailing starts")
 
-        # TODO: In a full implementation, we would:
-        # 1. Increase the opposite position size by 1.5x (place additional order)
-        # 2. Track this for half-close logic when TP hits
-        # For now, we're just marking it for tracking
+        # ACTUALLY BOOST THE OPPOSITE SIDE: Add 0.5x more to make it 1.5x total
+        try:
+            boost_add_qty = opposite_pos.quantity * 0.5  # Add 50% to make 1.5x
+
+            # Round quantity to symbol precision
+            symbol_config = SYMBOL_SETTINGS.get(symbol, {})
+            qty_precision = symbol_config.get("qty_precision", 1)
+            boost_add_qty = round(boost_add_qty, qty_precision)
+
+            if boost_add_qty > 0:
+                # Place market order to add to the boosted position
+                boost_side = "SELL" if opposite_side == "SHORT" else "BUY"
+                self.log(f"    [BOOST] Adding {boost_add_qty} to {opposite_side} position (0.5x boost)")
+
+                boost_order = self.client.place_market_order(
+                    symbol,
+                    boost_side,
+                    boost_add_qty,
+                    position_side=opposite_side
+                )
+
+                if "orderId" in boost_order:
+                    # Update position quantity
+                    opposite_pos.quantity += boost_add_qty
+                    self.log(f"    [BOOST] SUCCESS: {opposite_side} now has {opposite_pos.quantity} qty (1.5x)")
+                else:
+                    self.log(f"    [BOOST] WARNING: Failed to add boost qty: {boost_order}", level="WARN")
+        except Exception as e:
+            self.log(f"    [BOOST] ERROR adding boost position: {e}", level="ERROR")
 
     def _deactivate_boost_mode(self, symbol: str, reason: str):
         """Deactivate boost mode for a symbol."""
@@ -2005,6 +2030,12 @@ class BinanceLiveTradingEngine:
 
         if position.dca_count >= len(DCA_CONFIG["levels"]):
             return
+
+        # ENHANCED BOOST MODE: Skip DCA on boosted positions
+        # When a position is boosted (1.5x), it should NOT DCA
+        # It maintains its boosted size until TP (half-close) or losing side recovers
+        if position.is_boosted:
+            return  # Boosted positions don't DCA
 
         dca_level = position.dca_count + 1  # Next DCA level (1-4)
 
