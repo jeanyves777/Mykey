@@ -47,6 +47,8 @@ class LivePosition:
     hedge_side: Optional[str] = None  # Side of hedge position ("LONG" or "SHORT")
     waiting_for_breakeven: bool = False  # True if waiting to exit at breakeven
     hedge_start_time: Optional[datetime] = None  # When hedge was opened
+    # Stop for day trailing close
+    trailing_for_close: bool = False  # True when marked for trailing close after other side SL
     # ENHANCED BOOST MODE tracking
     is_boosted: bool = False       # True if this position is boosted (1.5x)
     boost_multiplier: float = 1.0  # Current boost multiplier (1.0 = normal, 1.5 = boosted)
@@ -782,82 +784,133 @@ class BinanceLiveTradingEngine:
             # (e.g., SHORT boosted hit SL because price went UP, so LONG should be recovering)
             self._deactivate_boost_mode(symbol, f"{boosted_side} SL (trigger side recovering)")
 
-    def _stop_for_day(self, symbol: str):
+    def _stop_for_day(self, symbol: str, sl_side: str = None):
         """
-        STOP TRADING THIS SYMBOL FOR THE DAY after SL hit.
-        Close remaining position and don't re-enter until next day.
+        After SL hit on one side:
+        - Keep the WINNING side open with trailing stop
+        - Only fully stop when winning side closes via trailing
+        - Then restart both sides next day
+
+        Args:
+            symbol: The trading pair
+            sl_side: The side that hit SL ("LONG" or "SHORT")
         """
-        self.stopped_for_day[symbol] = True
-        self.sl_hit_date[symbol] = datetime.now()
+        self.log(f">>> [STOP FOR DAY] {symbol}: {sl_side} hit SL", level="TRADE")
 
-        self.log(f">>> [STOP FOR DAY] {symbol}: SL hit - STOPPING trading until tomorrow", level="TRADE")
+        # Determine winning side (opposite of SL side)
+        winning_side = "SHORT" if sl_side == "LONG" else "LONG"
+        winning_pos_key = f"{symbol}_{winning_side}"
+        winning_pos = self.positions.get(winning_pos_key)
 
-        # Close the OTHER side position if exists
-        opposite_positions_to_close = []
-        for pos_key, position in list(self.positions.items()):
-            if position.symbol == symbol:
-                opposite_positions_to_close.append((pos_key, position))
+        # Get current price
+        try:
+            price_data = self.client.get_current_price(symbol)
+            current_price = price_data["price"]
+        except Exception as e:
+            self.log(f"    [STOP DAY] Error getting price: {e}", level="ERROR")
+            current_price = None
 
-        for pos_key, position in opposite_positions_to_close:
-            try:
-                # Get current price
-                price_data = self.client.get_current_price(symbol)
-                current_price = price_data["price"]
+        # Check if winning side is profitable
+        if winning_pos and current_price:
+            if winning_side == "LONG":
+                unrealized_pnl = (current_price - winning_pos.avg_entry_price) * winning_pos.quantity
+                roi = (current_price - winning_pos.avg_entry_price) / winning_pos.avg_entry_price * self.leverage
+            else:
+                unrealized_pnl = (winning_pos.avg_entry_price - current_price) * winning_pos.quantity
+                roi = (winning_pos.avg_entry_price - current_price) / winning_pos.avg_entry_price * self.leverage
 
-                # Close position
-                close_side = "SELL" if position.side == "LONG" else "BUY"
-                hedge_position_side = position.side if self.hedge_mode else None
+            if unrealized_pnl > 0:
+                # Winning side is profitable - mark for trailing close, don't stop for day yet
+                winning_pos.trailing_for_close = True
+                self.trailing_active[symbol] = True
+                self.boosted_peak_roi[symbol] = roi
 
-                close_order = self.client.place_market_order(
-                    symbol, close_side, position.quantity, position_side=hedge_position_side
+                self.log(f"    [STOP DAY] {winning_side} is PROFITABLE (${unrealized_pnl:+.2f}, {roi*100:.1f}% ROI)", level="TRADE")
+                self.log(f"    [STOP DAY] Activating TRAILING STOP on {winning_side} - will close via trailing", level="TRADE")
+                self.log(f"    [STOP DAY] After trailing close, will restart both sides", level="TRADE")
+
+                # DON'T set stopped_for_day yet - let trailing run
+                # The trailing close handler will set it when done
+                return
+
+            else:
+                # Winning side not profitable - close it too
+                self.log(f"    [STOP DAY] {winning_side} not profitable (${unrealized_pnl:+.2f}) - closing", level="TRADE")
+                self._close_position_for_stop_day(winning_pos_key, winning_pos, current_price)
+
+        # If we get here, close all remaining positions and stop for day
+        self._finalize_stop_for_day(symbol)
+
+    def _close_position_for_stop_day(self, pos_key: str, position, current_price: float):
+        """Helper to close a position during stop for day"""
+        symbol = position.symbol
+        try:
+            close_side = "SELL" if position.side == "LONG" else "BUY"
+            hedge_position_side = position.side if self.hedge_mode else None
+
+            close_order = self.client.place_market_order(
+                symbol, close_side, position.quantity, position_side=hedge_position_side
+            )
+
+            if "orderId" in close_order:
+                fill_price = float(close_order.get("avgPrice", current_price))
+                if position.side == "LONG":
+                    pnl = (fill_price - position.avg_entry_price) * position.quantity
+                else:
+                    pnl = (position.avg_entry_price - fill_price) * position.quantity
+
+                self.log(f"    [STOP DAY] Closed {position.side} @ ${fill_price:,.4f} | P&L: ${pnl:+.2f}", level="TRADE")
+
+                # Update daily stats
+                self.daily_pnl += pnl
+                self.daily_trades += 1
+                if pnl >= 0:
+                    self.daily_wins += 1
+                else:
+                    self.daily_losses += 1
+
+                # Log trade
+                self.log_trade(
+                    symbol=symbol,
+                    side=position.side,
+                    entry_price=position.avg_entry_price,
+                    exit_price=fill_price,
+                    quantity=position.quantity,
+                    pnl=pnl,
+                    exit_type="STOP_DAY",
+                    dca_level=position.dca_count
                 )
 
-                if "orderId" in close_order:
-                    fill_price = float(close_order.get("avgPrice", current_price))
-                    if position.side == "LONG":
-                        pnl = (fill_price - position.avg_entry_price) * position.quantity
-                    else:
-                        pnl = (position.avg_entry_price - fill_price) * position.quantity
+            # Release margin
+            margin_released = position.margin_used
+            current_margin = self.symbol_margin_used.get(symbol, 0)
+            self.symbol_margin_used[symbol] = max(0, current_margin - margin_released)
 
-                    self.log(f"    [STOP DAY] Closed {position.side} @ ${fill_price:,.4f} | P&L: ${pnl:+.2f}", level="TRADE")
-
-                    # Update daily stats
-                    self.daily_pnl += pnl
-                    self.daily_trades += 1
-                    if pnl >= 0:
-                        self.daily_wins += 1
-                    else:
-                        self.daily_losses += 1
-
-                    # Log trade
-                    self.log_trade(
-                        symbol=symbol,
-                        side=position.side,
-                        entry_price=position.avg_entry_price,
-                        exit_price=fill_price,
-                        quantity=position.quantity,
-                        pnl=pnl,
-                        exit_type="STOP_DAY",
-                        dca_level=position.dca_count
-                    )
-
-                # Cancel all orders for this symbol
-                try:
-                    self.client.cancel_all_orders(symbol)
-                    self.log(f"    [STOP DAY] Cancelled all orders for {symbol}")
-                except Exception as e:
-                    self.log(f"    [STOP DAY] Warning: Could not cancel orders: {e}", level="WARN")
-
-                # Release margin
-                margin_released = position.margin_used
-                current_margin = self.symbol_margin_used.get(symbol, 0)
-                self.symbol_margin_used[symbol] = max(0, current_margin - margin_released)
-
-                # Remove from tracking
+            # Remove from tracking
+            if pos_key in self.positions:
                 del self.positions[pos_key]
 
+        except Exception as e:
+            self.log(f"    [STOP DAY] Error closing {position.side}: {e}", level="ERROR")
+
+    def _finalize_stop_for_day(self, symbol: str):
+        """Finalize stop for day - close remaining positions and set flags"""
+        # Close any remaining positions for this symbol
+        positions_to_close = [(k, v) for k, v in list(self.positions.items()) if v.symbol == symbol]
+        for pos_key, position in positions_to_close:
+            try:
+                price_data = self.client.get_current_price(symbol)
+                current_price = price_data["price"]
+                self._close_position_for_stop_day(pos_key, position, current_price)
             except Exception as e:
-                self.log(f"    [STOP DAY] Error closing {position.side}: {e}", level="ERROR")
+                self.log(f"    [STOP DAY] Error in finalize: {e}", level="ERROR")
+
+        # Cancel all orders for this symbol
+        try:
+            self.client.cancel_all_orders(symbol)
+            self.log(f"    [STOP DAY] Cancelled all orders for {symbol}")
+        except Exception as e:
+            self.log(f"    [STOP DAY] Warning: Could not cancel orders: {e}", level="WARN")
 
         # Deactivate boost mode if active
         if self.boost_mode_active.get(symbol, False):
@@ -870,6 +923,10 @@ class BinanceLiveTradingEngine:
             del self.pending_reentry[f"{symbol}_LONG"]
         if f"{symbol}_SHORT" in self.pending_reentry:
             del self.pending_reentry[f"{symbol}_SHORT"]
+
+        # NOW set stopped for day
+        self.stopped_for_day[symbol] = True
+        self.sl_hit_date[symbol] = datetime.now()
 
         self.log(f">>> [STOP FOR DAY] {symbol}: All positions closed. Will restart tomorrow.", level="TRADE")
 
@@ -2357,7 +2414,8 @@ class BinanceLiveTradingEngine:
                     # CHECK IF SL HIT - STOP FOR THE DAY
                     if exit_type == "SL":
                         # SL hit - STOP trading this symbol for the day
-                        self._stop_for_day(actual_symbol)
+                        # Pass the side that hit SL so we can keep winning side with trailing
+                        self._stop_for_day(actual_symbol, sl_side=closed_side)
                         # Don't re-enter - skip to next position check
                         continue
 
@@ -2734,6 +2792,15 @@ class BinanceLiveTradingEngine:
                         continue  # Position was closed, skip to next
 
                 # ================================================================
+                # TRAILING FOR CLOSE: Position marked for trailing close after SL on other side
+                # This takes priority - close via trailing then stop for day
+                # ================================================================
+                if position.trailing_for_close and self.trailing_active.get(symbol, False):
+                    should_close = self._check_trailing_for_close(symbol, position, current_price)
+                    if should_close:
+                        continue  # Position was closed, skip to next
+
+                # ================================================================
                 # TRAILING TP: Check if we should trail and close on pullback
                 # This runs BEFORE auto-close check to capture profits at peak
                 # ================================================================
@@ -2995,6 +3062,114 @@ class BinanceLiveTradingEngine:
                     return True
                 else:
                     self.log(f"TRAILING TP CLOSE FAILED {symbol}: {order_result}", level="ERROR")
+                    return False
+
+        return False
+
+    def _check_trailing_for_close(self, symbol: str, position: LivePosition, current_price: float) -> bool:
+        """
+        Check trailing close for position marked after SL hit on other side.
+        When this position closes, we finalize stop for day.
+        Returns True if position was closed, False otherwise.
+        """
+        leverage = STRATEGY_CONFIG["leverage"]
+        margin = position.margin_used
+
+        if margin <= 0:
+            return False
+
+        # Calculate current ROI
+        if position.side == "LONG":
+            pnl = (current_price - position.avg_entry_price) * position.quantity
+            roi = (current_price - position.avg_entry_price) / position.avg_entry_price * leverage
+        else:
+            pnl = (position.avg_entry_price - current_price) * position.quantity
+            roi = (position.avg_entry_price - current_price) / position.avg_entry_price * leverage
+
+        # Get peak ROI from stop_for_day tracking
+        peak_roi = self.boosted_peak_roi.get(symbol, roi)
+
+        # Update peak if current is higher
+        if roi > peak_roi:
+            peak_roi = roi
+            self.boosted_peak_roi[symbol] = peak_roi
+
+        # Trailing params (use backtest params)
+        activation_roi = 0.02  # 2% ROI to activate trailing
+        trail_distance = 0.03  # 3% pullback triggers close
+
+        # Check if trailing should trigger
+        if peak_roi >= activation_roi:
+            pullback = peak_roi - roi
+            if pullback >= trail_distance and roi > 0:  # Only close if still profitable
+                self.log(
+                    f">>> [TRAILING CLOSE] {symbol} {position.side}: "
+                    f"Peak {peak_roi*100:.1f}% -> Current {roi*100:.1f}% (Pullback: {pullback*100:.1f}%)",
+                    level="TRADE"
+                )
+
+                # Close position
+                close_side = "SELL" if position.side == "LONG" else "BUY"
+                hedge_position_side = position.side if self.hedge_mode else None
+                order_result = self.client.place_market_order(symbol, close_side, position.quantity, position_side=hedge_position_side)
+
+                if "orderId" in order_result:
+                    fill_price = float(order_result.get("avgPrice", current_price))
+
+                    if position.side == "LONG":
+                        final_pnl = (fill_price - position.avg_entry_price) * position.quantity
+                    else:
+                        final_pnl = (position.avg_entry_price - fill_price) * position.quantity
+
+                    self.log(
+                        f">>> [TRAILING CLOSE] {symbol} {position.side} CLOSED @ ${fill_price:,.4f} | "
+                        f"P&L: ${final_pnl:+.2f} | Peak was {peak_roi*100:.1f}%",
+                        level="TRADE"
+                    )
+
+                    # Update stats
+                    self.daily_pnl += final_pnl
+                    self.daily_trades += 1
+                    if final_pnl > 0:
+                        self.daily_wins += 1
+                    else:
+                        self.daily_losses += 1
+
+                    # Log trade
+                    self.log_trade(
+                        symbol=symbol,
+                        side=position.side,
+                        entry_price=position.avg_entry_price,
+                        exit_price=fill_price,
+                        quantity=position.quantity,
+                        pnl=final_pnl,
+                        exit_type="TRAILING_CLOSE",
+                        dca_level=position.dca_count
+                    )
+
+                    # Cancel remaining orders
+                    try:
+                        self.client.cancel_all_orders(symbol)
+                    except:
+                        pass
+
+                    # Release margin
+                    position_key = f"{symbol}_{position.side}"
+                    if position_key in self.positions:
+                        del self.positions[position_key]
+                    self.symbol_margin_used[symbol] = max(0, self.symbol_margin_used.get(symbol, 0) - margin)
+
+                    # Clear trailing state
+                    self.trailing_active[symbol] = False
+                    self.boosted_peak_roi[symbol] = 0
+
+                    # NOW finalize stop for day
+                    self.log(f">>> [TRAILING CLOSE] {symbol}: Trailing close complete - now stopping for day", level="TRADE")
+                    self._finalize_stop_for_day(symbol)
+
+                    return True
+                else:
+                    self.log(f">>> [TRAILING CLOSE] {symbol}: Close failed: {order_result}", level="ERROR")
                     return False
 
         return False
