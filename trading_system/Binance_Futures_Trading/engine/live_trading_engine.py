@@ -969,6 +969,11 @@ class BinanceLiveTradingEngine:
         if not position.is_boosted:
             return False
 
+        # SAFETY CHECK: Skip if entry price is 0 or invalid
+        if position.avg_entry_price <= 0:
+            self.log(f"[BOOST HALF-CLOSE] {symbol}: SKIPPED - Invalid entry price ${position.avg_entry_price}", level="WARN")
+            return False
+
         pos_key = self.get_position_key(symbol, position.side)
 
         # Calculate 50% quantity to close
@@ -3203,6 +3208,11 @@ class BinanceLiveTradingEngine:
             tp_roi = DCA_CONFIG["take_profit_roi"]
 
         tp_price_pct = tp_roi / leverage
+
+        # SAFETY CHECK: Skip if entry price is 0 or invalid
+        if position.avg_entry_price <= 0:
+            self.log(f"SKIP AUTO-TP {symbol}: Invalid entry price ${position.avg_entry_price}", level="WARN")
+            return False
 
         # Calculate expected TP price
         if position.side == "LONG":
