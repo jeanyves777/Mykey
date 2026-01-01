@@ -688,8 +688,8 @@ def run_90_day_test():
     print("          Continue until losing side recovers or SL")
     print("="*80)
 
-    # Test DOT, BTC, AVAX and SOL
-    symbols = ["BTCUSDT", "AVAXUSDT", "DOTUSDT", "SOLUSDT", "BNBUSDT"]
+    # Test BTC, DOT and BNB
+    symbols = ["BTCUSDT", "DOTUSDT", "BNBUSDT"]
 
     all_results = []
     total_starting = 0
