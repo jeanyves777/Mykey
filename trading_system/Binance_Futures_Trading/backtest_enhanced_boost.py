@@ -589,11 +589,22 @@ class EnhancedBoostBacktester:
 
         self.print_results(df, total_unrealized)
 
+        # Calculate best/worst trades
+        trade_pnls = [t["pnl"] for t in self.trades] if self.trades else [0]
+        best_trade = max(trade_pnls)
+        worst_trade = min(trade_pnls)
+
+        # Max DD in dollars (from percentage)
+        max_dd_dollars = self.start_balance * (self.max_drawdown / 100)
+
         return {
             "balance": self.balance,
             "return_pct": (self.balance - self.start_balance) / self.start_balance * 100,
             "win_rate": (self.total_wins / len(self.trades) * 100) if self.trades else 0,
             "max_drawdown": self.max_drawdown,
+            "max_dd_dollars": max_dd_dollars,
+            "best_trade": best_trade,
+            "worst_trade": worst_trade,
             "total_trades": len(self.trades),
             "wins": self.total_wins,
             "losses": self.total_losses,
@@ -671,8 +682,8 @@ def run_90_day_test():
     print("          Continue until losing side recovers or SL")
     print("="*80)
 
-    # Only test DOT and AVAX (no BTC/ETH - insufficient capital)
-    symbols = ["DOTUSDT", "AVAXUSDT"]
+    # Test DOT, BTC, AVAX and SOL
+    symbols = ["BTCUSDT", "AVAXUSDT", "DOTUSDT", "SOLUSDT", "BNBUSDT"]
 
     all_results = []
     total_starting = 0
@@ -709,15 +720,18 @@ def run_90_day_test():
             print(f"ERROR: No data for {symbol}")
 
     # Print combined summary
-    print("\n" + "="*80)
+    print("\n" + "="*100)
     print("COMBINED RESULTS - 90 DAY ENHANCED BOOST")
-    print("="*80)
+    print("="*100)
 
-    print(f"\n{'Symbol':<12} {'Price %':<12} {'Balance':<12} {'Return %':<12} {'Win Rate':<12} {'Half-Closes':<12}")
-    print("-"*72)
+    print(f"\n{'Symbol':<12} {'Market':<10} {'Balance':<10} {'Return':<10} {'Trades':<8} {'WinRate':<8} {'MaxDD':<10} {'BestTrade':<12} {'WorstTrade':<12}")
+    print("-"*100)
     for r in all_results:
-        status = "LIQUIDATED" if r["liquidated"] else ""
-        print(f"{r['symbol']:<12} {r['price_change']:+.1f}%{'':<6} ${r['balance']:<10.2f} {r['return_pct']:+.1f}%{'':<6} {r['win_rate']:.1f}%{'':<6} {r['half_closes']:<12} {status}")
+        status = " LIQUIDATED" if r["liquidated"] else ""
+        best_trade = r.get("best_trade", 0)
+        worst_trade = r.get("worst_trade", 0)
+        max_dd = r.get("max_dd_dollars", 0)
+        print(f"{r['symbol']:<12} {r['price_change']:+.1f}%{'':<4} ${r['balance']:<8.2f} {r['return_pct']:+.1f}%{'':<4} {r['total_trades']:<8} {r['win_rate']:.1f}%{'':<3} ${max_dd:<8.2f} ${best_trade:+.2f}{'':<5} ${worst_trade:+.2f}{status}")
 
     print(f"\n{'='*80}")
     print(f"GRAND TOTAL:")
