@@ -130,7 +130,8 @@ class PortfolioBacktester:
         Apply PNL with SMART COMPOUNDING:
         - 50% of profits go to reserve fund (protected)
         - 50% of profits compound to trading capital
-        - Losses only affect trading capital (reserve protected)
+        - Losses only affect trading capital
+        - If trading capital gets too low, reserve fund replenishes it (BACKUP)
         """
         if pnl > 0:
             # PROFIT: Split between compound and reserve
@@ -141,12 +142,29 @@ class PortfolioBacktester:
             self.reserve_fund += reserve_amount
 
         else:
-            # LOSS: Only affects trading capital (reserve protected)
+            # LOSS: Only affects trading capital
             self.trading_capital += pnl  # pnl is negative
 
             # Can't go below zero
             if self.trading_capital < 0:
                 self.trading_capital = 0
+
+        # RESERVE FUND REPLENISHMENT - acts as backup when trading capital is low
+        # Trigger when trading capital drops below 50% of original
+        min_trading_capital = self.total_capital * 0.50  # 50% of original = $300 trigger
+
+        if self.trading_capital < min_trading_capital and self.reserve_fund > 0:
+            # Calculate how much we need to replenish - bring back to 60% of original
+            target_capital = self.total_capital * 0.60  # Target: 60% = $360
+            needed = target_capital - self.trading_capital
+            # Use reserve fund - can use all of it if needed (it's a BACKUP)
+            transfer = min(needed, self.reserve_fund)
+
+            if transfer > 0:
+                self.reserve_fund -= transfer
+                self.trading_capital += transfer
+                print(f"  >>> RESERVE FUND REPLENISHMENT: ${transfer:.2f} transferred to trading capital")
+                print(f"      Trading Capital: ${self.trading_capital:.2f} | Reserve: ${self.reserve_fund:.2f}")
 
         # Track peak and drawdown
         current_total = self.trading_capital + self.reserve_fund
