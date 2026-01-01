@@ -179,7 +179,7 @@ class PortfolioBacktester:
             df_chunk = client.get_klines(
                 symbol=symbol,
                 interval=interval,
-                start_time=current_start,
+                start_time=int(current_start.timestamp() * 1000),
                 limit=1000
             )
 
