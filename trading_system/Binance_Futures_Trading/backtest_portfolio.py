@@ -246,12 +246,17 @@ class PortfolioBacktester:
         if dca_level >= len(state["dca_levels"]):
             return None
 
-        dca_drop = state["dca_levels"][dca_level]
+        # DCA levels are dicts with trigger_roi key
+        dca_level_config = state["dca_levels"][dca_level]
+        trigger_roi = dca_level_config["trigger_roi"]  # e.g., -0.05 for -5% ROI
+
+        # Convert ROI to price drop: price_move = roi / leverage
+        price_drop = abs(trigger_roi) / self.leverage
 
         if side == "LONG":
-            return entry_price * (1 - dca_drop)
+            return entry_price * (1 - price_drop)
         else:
-            return entry_price * (1 + dca_drop)
+            return entry_price * (1 + price_drop)
 
     def open_position(self, symbol: str, side: str, price: float,
                       boost_multiplier: float = 1.0) -> dict:
