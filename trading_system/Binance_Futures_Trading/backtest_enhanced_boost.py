@@ -106,6 +106,129 @@ class EnhancedBoostBacktester:
         self.cooldown_bars = 5  # Wait 5 candles after SL before re-entry
         self.cooldown_remaining = 0  # Current cooldown counter
 
+        # STRONG TREND MODE - ADX-based trend detection
+        self.strong_trend_mode = False
+        self.trend_direction = None  # "UP" or "DOWN"
+        self.adx_threshold = 40  # ADX > 40 = strong trend (lowered from 50 for more activations)
+        self.adx_period = 14  # Standard ADX period
+        self.current_adx = 0
+        self.current_plus_di = 0
+        self.current_minus_di = 0
+
+        # Scale-in on consecutive TPs
+        self.consecutive_tp_count = {"LONG": 0, "SHORT": 0}
+        self.scale_in_after_tps = 2  # Scale in after 2 consecutive TPs
+        self.scale_in_multiplier = 1.5  # 1.5x position on scale-in
+        self.scaled_in_side = None  # Track which side is scaled in
+
+        # Strong trend stats
+        self.strong_trend_activations = 0
+        self.scale_in_count = 0
+
+    def calculate_adx(self, df: pd.DataFrame, period: int = 14) -> tuple:
+        """
+        Calculate ADX (Average Directional Index) for trend strength detection
+        Returns: (adx, plus_di, minus_di) for each row
+        """
+        high = df['high']
+        low = df['low']
+        close = df['close']
+
+        # Calculate True Range
+        tr1 = high - low
+        tr2 = abs(high - close.shift(1))
+        tr3 = abs(low - close.shift(1))
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+        # Calculate +DM and -DM
+        plus_dm = high.diff()
+        minus_dm = -low.diff()
+
+        plus_dm[plus_dm < 0] = 0
+        minus_dm[minus_dm < 0] = 0
+
+        # When +DM > -DM, -DM = 0 and vice versa
+        plus_dm[(plus_dm < minus_dm)] = 0
+        minus_dm[(minus_dm < plus_dm)] = 0
+
+        # Smoothed TR, +DM, -DM using Wilder's smoothing
+        atr = tr.ewm(alpha=1/period, min_periods=period).mean()
+        plus_dm_smooth = plus_dm.ewm(alpha=1/period, min_periods=period).mean()
+        minus_dm_smooth = minus_dm.ewm(alpha=1/period, min_periods=period).mean()
+
+        # Calculate +DI and -DI
+        plus_di = 100 * plus_dm_smooth / atr
+        minus_di = 100 * minus_dm_smooth / atr
+
+        # Calculate DX
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+
+        # Calculate ADX (smoothed DX)
+        adx = dx.ewm(alpha=1/period, min_periods=period).mean()
+
+        return adx, plus_di, minus_di
+
+    def check_strong_trend(self, idx: int, adx_series: pd.Series, plus_di_series: pd.Series, minus_di_series: pd.Series) -> tuple:
+        """
+        Check if we're in a strong trend based on ADX
+        Returns: (is_strong_trend, trend_direction)
+        """
+        if idx < self.adx_period * 2:
+            return False, None
+
+        adx = adx_series.iloc[idx]
+        plus_di = plus_di_series.iloc[idx]
+        minus_di = minus_di_series.iloc[idx]
+
+        self.current_adx = adx
+        self.current_plus_di = plus_di
+        self.current_minus_di = minus_di
+
+        if pd.isna(adx) or adx < self.adx_threshold:
+            return False, None
+
+        # Determine trend direction
+        if plus_di > minus_di:
+            return True, "UP"
+        else:
+            return True, "DOWN"
+
+    def activate_strong_trend_mode(self, direction: str, timestamp):
+        """Activate strong trend mode"""
+        if self.strong_trend_mode:
+            return  # Already active
+
+        self.strong_trend_mode = True
+        self.trend_direction = direction
+        self.strong_trend_activations += 1
+        print(f"[{timestamp}] >>> STRONG TREND MODE ACTIVATED! Direction: {direction} | ADX: {self.current_adx:.1f}")
+        print(f"    [TREND LOGIC] Winner: 2x, half-close, trail | Loser: DCA 2+ BLOCKED")
+
+    def deactivate_strong_trend_mode(self, timestamp, reason: str):
+        """Deactivate strong trend mode"""
+        if not self.strong_trend_mode:
+            return
+
+        print(f"[{timestamp}] >>> STRONG TREND MODE ENDED - {reason}")
+        self.strong_trend_mode = False
+        self.trend_direction = None
+
+    def apply_scale_in(self, position: dict, timestamp) -> dict:
+        """Scale in position after consecutive TPs (1.5x)"""
+        if position is None:
+            return position
+
+        old_margin = position["margin"]
+        position["quantity"] *= self.scale_in_multiplier
+        position["margin"] *= self.scale_in_multiplier
+        position["is_scaled_in"] = True
+        self.scaled_in_side = position["side"]
+        self.scale_in_count += 1
+
+        print(f"[{timestamp}] >>> SCALE-IN {position['side']}: margin ${old_margin:.2f} -> ${position['margin']:.2f} (after {self.scale_in_after_tps} consecutive TPs)")
+
+        return position
+
     def get_historical_data(self, days: int = 30, interval: str = "1h", days_ago_start: int = 0):
         """Fetch historical klines from Binance MAINNET with pagination for large date ranges"""
         print(f"Fetching {days} days of {interval} data for {self.symbol}...")
@@ -466,7 +589,7 @@ class EnhancedBoostBacktester:
         return False, None
 
     def run_backtest(self, df: pd.DataFrame):
-        """Run the backtest with enhanced boost mode"""
+        """Run the backtest with enhanced boost mode + Strong Trend Mode + Scale-in"""
         print("\n" + "="*70)
         print("RUNNING HEDGE + DCA + ENHANCED BOOST MODE BACKTEST")
         print("="*70)
@@ -480,7 +603,15 @@ class EnhancedBoostBacktester:
         print(f"  - Trailing activates AFTER first half-close")
         print(f"  - Continue until losing side recovers or SL")
         print(f"  - AFTER SL: STOP for the day, restart next day")
+        print(f"STRONG TREND MODE: ADX > {self.adx_threshold}")
+        print(f"  - Winner: 2x entry, half-close, trail")
+        print(f"  - Loser: DCA 2+ BLOCKED")
+        print(f"SCALE-IN: After {self.scale_in_after_tps} consecutive TPs -> {self.scale_in_multiplier}x")
         print("="*70)
+
+        # Calculate ADX for trend detection
+        print("Calculating ADX for trend detection...")
+        adx_series, plus_di_series, minus_di_series = self.calculate_adx(df, self.adx_period)
 
         # Open initial positions
         first_price = df['close'].iloc[0]
@@ -517,6 +648,39 @@ class EnhancedBoostBacktester:
             # Skip if stopped for the day
             if self.stopped_for_day:
                 continue
+
+            # Check for STRONG TREND MODE (ADX-based)
+            is_strong_trend, trend_direction = self.check_strong_trend(i, adx_series, plus_di_series, minus_di_series)
+
+            if is_strong_trend and not self.strong_trend_mode:
+                # Activate strong trend mode
+                self.activate_strong_trend_mode(trend_direction, timestamp)
+
+                # Determine winner/loser based on trend direction
+                # UP trend = LONG is winner, SHORT is loser
+                # DOWN trend = SHORT is winner, LONG is loser
+                winner_side = "LONG" if trend_direction == "UP" else "SHORT"
+                loser_side = "SHORT" if trend_direction == "UP" else "LONG"
+
+                # Apply 2x to winner if exists (trend boost)
+                winner_pos = self.long_position if winner_side == "LONG" else self.short_position
+                if winner_pos and not winner_pos.get("is_trend_boosted", False):
+                    old_margin = winner_pos["margin"]
+                    winner_pos["quantity"] *= 2.0  # 2x for strong trend winner
+                    winner_pos["margin"] *= 2.0
+                    winner_pos["is_trend_boosted"] = True
+                    winner_pos["is_boosted"] = True  # Enable trailing/half-close logic
+                    print(f"[{timestamp}] >>> TREND BOOST {winner_side}: margin ${old_margin:.2f} -> ${winner_pos['margin']:.2f} (2x)")
+
+            elif not is_strong_trend and self.strong_trend_mode:
+                # Deactivate strong trend mode when ADX drops
+                self.deactivate_strong_trend_mode(timestamp, f"ADX dropped below {self.adx_threshold}")
+
+                # Remove trend boost flag from positions
+                if self.long_position:
+                    self.long_position["is_trend_boosted"] = False
+                if self.short_position:
+                    self.short_position["is_trend_boosted"] = False
 
             # Check LONG position
             if self.long_position:
@@ -570,6 +734,10 @@ class EnhancedBoostBacktester:
                         self.boost_profits += pnl
                     print(f"[{timestamp}] LONG TP @ ${self.long_position['tp_price']:.4f} | P&L: ${pnl:+.2f} | DCA: {self.long_position['dca_level']}")
 
+                    # Track consecutive TPs for scale-in
+                    self.consecutive_tp_count["LONG"] += 1
+                    self.consecutive_tp_count["SHORT"] = 0  # Reset opposite side
+
                     # Check if this was the trigger side - deactivate boost
                     if self.boost_mode_active and self.boost_trigger_side == "LONG":
                         self.deactivate_boost_mode(timestamp, "LONG recovered (TP)")
@@ -577,6 +745,11 @@ class EnhancedBoostBacktester:
                     # Re-enter (boost if in boost mode and this side is boosted)
                     boost_mult = self.boost_multiplier if (self.boost_mode_active and self.boosted_side == "LONG") else 1.0
                     self.long_position = self.open_position("LONG", close, boost_multiplier=boost_mult)
+
+                    # SCALE-IN: After consecutive TPs, scale position to 1.5x
+                    if self.consecutive_tp_count["LONG"] >= self.scale_in_after_tps and self.scaled_in_side != "LONG":
+                        self.long_position = self.apply_scale_in(self.long_position, timestamp)
+
                     if boost_mult > 1.0:
                         self.boosted_peak_roi = 0
                         self.trailing_active = False
@@ -588,6 +761,12 @@ class EnhancedBoostBacktester:
                         self.boost_profits += pnl
                     self.sl_hits_long += 1
                     print(f"[{timestamp}] LONG SL @ ${self.long_position['sl_price']:.4f} | P&L: ${pnl:+.2f} | DCA: {self.long_position['dca_level']}")
+
+                    # Reset consecutive TPs and scale-in on SL
+                    self.consecutive_tp_count["LONG"] = 0
+                    if self.scaled_in_side == "LONG":
+                        self.scaled_in_side = None
+
                     self.long_position = None
 
                     # Deactivate boost if this was the trigger side
@@ -606,10 +785,16 @@ class EnhancedBoostBacktester:
                         continue
 
                 # Check DCA - BUT NOT if this side is boosted!
+                # Also block DCA 2+ on loser side during strong trend (LONG is loser in DOWN trend)
                 elif self.check_dca_trigger(self.long_position, close):
+                    current_dca_level = self.long_position["dca_level"]
+
                     # Skip DCA if this side is boosted
                     if self.boost_mode_active and self.boosted_side == "LONG":
                         pass  # No DCA on boosted side!
+                    # STRONG TREND MODE: Block DCA 2+ on loser side (LONG is loser in DOWN trend)
+                    elif self.strong_trend_mode and self.trend_direction == "DOWN" and current_dca_level >= 1:
+                        print(f"[{timestamp}] LONG DCA {current_dca_level + 1} BLOCKED - Strong DOWN trend (ADX: {self.current_adx:.1f})")
                     else:
                         old_level = self.long_position["dca_level"]
                         old_entry = self.long_position["entry_price"]
@@ -681,6 +866,10 @@ class EnhancedBoostBacktester:
                         self.boost_profits += pnl
                     print(f"[{timestamp}] SHORT TP @ ${self.short_position['tp_price']:.4f} | P&L: ${pnl:+.2f} | DCA: {self.short_position['dca_level']}")
 
+                    # Track consecutive TPs for scale-in
+                    self.consecutive_tp_count["SHORT"] += 1
+                    self.consecutive_tp_count["LONG"] = 0  # Reset opposite side
+
                     # Check if this was the trigger side - deactivate boost
                     if self.boost_mode_active and self.boost_trigger_side == "SHORT":
                         self.deactivate_boost_mode(timestamp, "SHORT recovered (TP)")
@@ -688,6 +877,11 @@ class EnhancedBoostBacktester:
                     # Re-enter (boost if in boost mode and this side is boosted)
                     boost_mult = self.boost_multiplier if (self.boost_mode_active and self.boosted_side == "SHORT") else 1.0
                     self.short_position = self.open_position("SHORT", close, boost_multiplier=boost_mult)
+
+                    # SCALE-IN: After consecutive TPs, scale position to 1.5x
+                    if self.consecutive_tp_count["SHORT"] >= self.scale_in_after_tps and self.scaled_in_side != "SHORT":
+                        self.short_position = self.apply_scale_in(self.short_position, timestamp)
+
                     if boost_mult > 1.0:
                         self.boosted_peak_roi = 0
                         self.trailing_active = False
@@ -699,6 +893,12 @@ class EnhancedBoostBacktester:
                         self.boost_profits += pnl
                     self.sl_hits_short += 1
                     print(f"[{timestamp}] SHORT SL @ ${self.short_position['sl_price']:.4f} | P&L: ${pnl:+.2f} | DCA: {self.short_position['dca_level']}")
+
+                    # Reset consecutive TPs and scale-in on SL
+                    self.consecutive_tp_count["SHORT"] = 0
+                    if self.scaled_in_side == "SHORT":
+                        self.scaled_in_side = None
+
                     self.short_position = None
 
                     # Deactivate boost if this was the trigger side
@@ -717,10 +917,16 @@ class EnhancedBoostBacktester:
                         continue
 
                 # Check DCA - BUT NOT if this side is boosted!
+                # Also block DCA 2+ on loser side during strong trend (SHORT is loser in UP trend)
                 elif self.check_dca_trigger(self.short_position, close):
+                    current_dca_level = self.short_position["dca_level"]
+
                     # Skip DCA if this side is boosted
                     if self.boost_mode_active and self.boosted_side == "SHORT":
                         pass  # No DCA on boosted side!
+                    # STRONG TREND MODE: Block DCA 2+ on loser side (SHORT is loser in UP trend)
+                    elif self.strong_trend_mode and self.trend_direction == "UP" and current_dca_level >= 1:
+                        print(f"[{timestamp}] SHORT DCA {current_dca_level + 1} BLOCKED - Strong UP trend (ADX: {self.current_adx:.1f})")
                     else:
                         old_level = self.short_position["dca_level"]
                         old_entry = self.short_position["entry_price"]
@@ -787,6 +993,8 @@ class EnhancedBoostBacktester:
             "boost_activations": self.boost_activations,
             "half_closes": self.half_close_count,
             "trailing_closes": self.trailing_closes,
+            "strong_trend_activations": self.strong_trend_activations,
+            "scale_in_count": self.scale_in_count,
             "liquidated": self.balance <= 0
         }
 
@@ -880,6 +1088,16 @@ class EnhancedBoostBacktester:
         print(f"  SL Hits (SHORT):     {self.sl_hits_short}")
         print(f"  Total SL Hits:       {self.sl_hits_long + self.sl_hits_short}")
         print(f"  Days Stopped:        {self.days_stopped}")
+
+        # Strong Trend Mode Analysis
+        print(f"\n>>> STRONG TREND MODE Analysis:")
+        print(f"  Trend Activations:   {self.strong_trend_activations}")
+        print(f"  ADX Threshold:       {self.adx_threshold}")
+
+        # Scale-in Analysis
+        print(f"\n>>> SCALE-IN Analysis:")
+        print(f"  Scale-in Count:      {self.scale_in_count}")
+        print(f"  After Consecutive:   {self.scale_in_after_tps} TPs")
 
         # Boosted trades analysis
         boosted_trades = [t for t in self.trades if t.get("is_boosted", False)]
