@@ -678,18 +678,19 @@ class EnhancedBoostBacktester:
 
 
 def run_90_day_test():
-    """Test Enhanced Boost over 90 days with all 4 pairs"""
+    """Test Enhanced Boost over specified days with selected pairs"""
+    # Configuration
+    BACKTEST_DAYS = 365  # 12 months
+    symbols = ["BTCUSDT", "DOTUSDT", "BNBUSDT"]
+
     print("="*80)
-    print("ENHANCED BOOST MODE - 90 DAY BACKTEST")
+    print(f"ENHANCED BOOST MODE - {BACKTEST_DAYS} DAY BACKTEST")
     print("="*80)
     print("Strategy: At DCA 3 -> Boost opposite 1.5x")
     print("          At TP: Close HALF, lock profit, add 0.5x back")
     print("          Trailing starts AFTER each half-close")
     print("          Continue until losing side recovers or SL")
     print("="*80)
-
-    # Test BTC, DOT and BNB
-    symbols = ["BTCUSDT", "DOTUSDT", "BNBUSDT"]
 
     all_results = []
     total_starting = 0
@@ -706,7 +707,7 @@ def run_90_day_test():
         print(f"{'='*80}")
 
         backtester = EnhancedBoostBacktester(symbol, start_balance=100.0)
-        df = backtester.get_historical_data(days=90, interval="1h")
+        df = backtester.get_historical_data(days=BACKTEST_DAYS, interval="1h")
 
         if df is not None and len(df) > 0:
             result = backtester.run_backtest(df)
@@ -744,10 +745,9 @@ def run_90_day_test():
         wins = r["wins"]
         losses = r["losses"]
         total = r["total_trades"]
-        days = 90
-        trades_per_day = total / days
-        wins_per_day = wins / days
-        losses_per_day = losses / days
+        trades_per_day = total / BACKTEST_DAYS
+        wins_per_day = wins / BACKTEST_DAYS
+        losses_per_day = losses / BACKTEST_DAYS
 
         # Calculate total win $ and total loss $
         total_win_dollars = r.get("total_win_dollars", 0)
@@ -786,12 +786,12 @@ def run_90_day_test():
         print(f"    Losing Trades:       {losses} ({losses/total*100:.1f}%)")
         print(f"    Win Rate:            {r['win_rate']:.1f}%")
         print(f"")
-        print(f"  DAILY AVERAGES (90 days):")
+        print(f"  DAILY AVERAGES ({BACKTEST_DAYS} days):")
         print(f"    Trades/Day:          {trades_per_day:.1f}")
         print(f"    Wins/Day:            {wins_per_day:.1f}")
         print(f"    Losses/Day:          {losses_per_day:.2f}")
-        print(f"    Daily Return:        {r['return_pct']/90:.2f}%")
-        print(f"    Daily P&L:           ${(r['balance'] - allocation_per_symbol)/90:+.2f}")
+        print(f"    Daily Return:        {r['return_pct']/BACKTEST_DAYS:.2f}%")
+        print(f"    Daily P&L:           ${(r['balance'] - allocation_per_symbol)/BACKTEST_DAYS:+.2f}")
         print(f"")
         print(f"  PROFIT/LOSS BREAKDOWN:")
         print(f"    Total Won:           ${total_win_dollars:+.2f}")
@@ -815,7 +815,7 @@ def run_90_day_test():
     print(f"\n{'Symbol':<10} {'Market':<8} {'Return':<8} {'Trades':<7} {'Wins':<6} {'Losses':<7} {'WinRate':<8} {'T/Day':<6} {'TotalWon':<10} {'TotalLost':<11} {'DD($)':<8} {'DD(%Port)':<10} {'PF':<6}")
     print("-"*140)
     for r in all_results:
-        trades_day = r['total_trades'] / 90
+        trades_day = r['total_trades'] / BACKTEST_DAYS
         max_dd = r.get('max_dd_dollars', 0)
         max_dd_pct_port = (max_dd / portfolio_capital) * 100
         total_won = r.get('total_win_dollars', 0)
@@ -827,7 +827,7 @@ def run_90_day_test():
     # Grand totals
     total_profit = total_ending - total_starting
     avg_return = total_profit / len(all_results)
-    total_trades_per_day = total_trades / 90
+    total_trades_per_day = total_trades / BACKTEST_DAYS
 
     # Calculate total won/lost across all symbols
     grand_total_won = sum(r.get('total_win_dollars', 0) for r in all_results)
@@ -835,7 +835,7 @@ def run_90_day_test():
     grand_profit_factor = abs(grand_total_won / grand_total_lost) if grand_total_lost != 0 else 999
 
     print(f"\n{'='*140}")
-    print(f"GRAND TOTAL - PORTFOLIO PERFORMANCE (Based on ${portfolio_capital:.0f} Capital)")
+    print(f"GRAND TOTAL - PORTFOLIO PERFORMANCE (Based on ${portfolio_capital:.0f} Capital) - {BACKTEST_DAYS} DAYS")
     print(f"{'='*140}")
     print(f"  CAPITAL:")
     print(f"    Starting Capital:    ${total_starting:.2f} ({len(all_results)} symbols × ${allocation_per_symbol:.0f})")
@@ -843,7 +843,8 @@ def run_90_day_test():
     print(f"    Net Profit:          ${total_profit:+.2f}")
     print(f"    Portfolio Return:    {total_profit/total_starting*100:+.1f}%")
     print(f"    Avg Return/Symbol:   {total_profit/total_starting*100/len(all_results):.1f}%")
-    print(f"    Daily Avg Return:    {total_profit/total_starting*100/90:.2f}%")
+    print(f"    Daily Avg Return:    {total_profit/total_starting*100/BACKTEST_DAYS:.2f}%")
+    print(f"    Monthly Avg Return:  {total_profit/total_starting*100/(BACKTEST_DAYS/30):.1f}%")
     print(f"")
     print(f"  DRAWDOWN (Portfolio-Based):")
     print(f"    Max DD (Sum):        ${total_max_dd_dollars:.2f}")
@@ -861,8 +862,8 @@ def run_90_day_test():
     print(f"    Total Losses:        {total_losses}")
     print(f"    Overall Win Rate:    {total_wins/total_trades*100:.1f}%")
     print(f"    Trades/Day (all):    {total_trades_per_day:.1f}")
-    print(f"    Wins/Day:            {total_wins/90:.1f}")
-    print(f"    Losses/Day:          {total_losses/90:.2f}")
+    print(f"    Wins/Day:            {total_wins/BACKTEST_DAYS:.1f}")
+    print(f"    Losses/Day:          {total_losses/BACKTEST_DAYS:.2f}")
     print(f"")
     print(f"  BOOST MODE:")
     print(f"    Half-Close Cycles:   {total_half_closes}")
