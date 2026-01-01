@@ -730,6 +730,15 @@ def run_90_day_test():
     print("COMPREHENSIVE ANALYTICS - 90 DAY ENHANCED BOOST BACKTEST")
     print("="*120)
 
+    # Calculate portfolio-level metrics
+    num_symbols = len(all_results)
+    portfolio_capital = total_starting  # Total portfolio capital (e.g., $500 for 5 symbols)
+    allocation_per_symbol = portfolio_capital / num_symbols  # $100 per symbol
+
+    # Calculate portfolio max drawdown (sum of all symbol drawdowns at worst point)
+    total_max_dd_dollars = sum(r.get('max_dd_dollars', 0) for r in all_results)
+    portfolio_max_dd_pct = (total_max_dd_dollars / portfolio_capital) * 100
+
     # Detailed per-symbol analysis
     for r in all_results:
         wins = r["wins"]
@@ -749,6 +758,11 @@ def run_90_day_test():
         # Profit factor
         profit_factor = abs(total_win_dollars / total_loss_dollars) if total_loss_dollars != 0 else float('inf')
 
+        # Max DD calculations - both for symbol allocation AND portfolio
+        max_dd_dollars = r.get('max_dd_dollars', 0)
+        max_dd_pct_of_allocation = r['max_drawdown']  # % of $100
+        max_dd_pct_of_portfolio = (max_dd_dollars / portfolio_capital) * 100  # % of $500
+
         print(f"\n{'='*60}")
         print(f"  {r['symbol']} - DETAILED ANALYTICS")
         print(f"{'='*60}")
@@ -756,11 +770,15 @@ def run_90_day_test():
         print(f"    Price Change:        {r['price_change']:+.1f}%")
         print(f"")
         print(f"  ACCOUNT PERFORMANCE:")
-        print(f"    Starting Balance:    $100.00")
+        print(f"    Allocation:          ${allocation_per_symbol:.0f} ({100/num_symbols:.0f}% of ${portfolio_capital:.0f} portfolio)")
         print(f"    Ending Balance:      ${r['balance']:.2f}")
-        print(f"    Net Profit/Loss:     ${r['balance'] - 100:+.2f}")
-        print(f"    Return:              {r['return_pct']:+.1f}%")
-        print(f"    Max Drawdown:        ${r.get('max_dd_dollars', 0):.2f} ({r['max_drawdown']:.1f}%)")
+        print(f"    Net Profit/Loss:     ${r['balance'] - allocation_per_symbol:+.2f}")
+        print(f"    Return (on alloc):   {r['return_pct']:+.1f}%")
+        print(f"    Return (portfolio):  {(r['balance'] - allocation_per_symbol) / portfolio_capital * 100:+.2f}%")
+        print(f"")
+        print(f"  MAX DRAWDOWN:")
+        print(f"    DD on Allocation:    ${max_dd_dollars:.2f} ({max_dd_pct_of_allocation:.1f}% of ${allocation_per_symbol:.0f})")
+        print(f"    DD on Portfolio:     ${max_dd_dollars:.2f} ({max_dd_pct_of_portfolio:.1f}% of ${portfolio_capital:.0f})")
         print(f"")
         print(f"  TRADE STATISTICS:")
         print(f"    Total Trades:        {total}")
@@ -773,6 +791,7 @@ def run_90_day_test():
         print(f"    Wins/Day:            {wins_per_day:.1f}")
         print(f"    Losses/Day:          {losses_per_day:.2f}")
         print(f"    Daily Return:        {r['return_pct']/90:.2f}%")
+        print(f"    Daily P&L:           ${(r['balance'] - allocation_per_symbol)/90:+.2f}")
         print(f"")
         print(f"  PROFIT/LOSS BREAKDOWN:")
         print(f"    Total Won:           ${total_win_dollars:+.2f}")
@@ -789,31 +808,52 @@ def run_90_day_test():
         status = "LIQUIDATED!" if r["liquidated"] else "SURVIVED"
         print(f"    Status:              {status}")
 
-    # Summary table
-    print("\n" + "="*120)
+    # Summary table with portfolio-based DD
+    print("\n" + "="*140)
     print("SUMMARY TABLE")
-    print("="*120)
-    print(f"\n{'Symbol':<10} {'Market':<8} {'Return':<8} {'Trades':<7} {'Wins':<6} {'Losses':<7} {'WinRate':<8} {'Trades/Day':<11} {'MaxDD':<9} {'Best':<8} {'Worst':<10}")
-    print("-"*120)
+    print("="*140)
+    print(f"\n{'Symbol':<10} {'Market':<8} {'Return':<8} {'Trades':<7} {'Wins':<6} {'Losses':<7} {'WinRate':<8} {'T/Day':<6} {'TotalWon':<10} {'TotalLost':<11} {'DD($)':<8} {'DD(%Port)':<10} {'PF':<6}")
+    print("-"*140)
     for r in all_results:
         trades_day = r['total_trades'] / 90
+        max_dd = r.get('max_dd_dollars', 0)
+        max_dd_pct_port = (max_dd / portfolio_capital) * 100
+        total_won = r.get('total_win_dollars', 0)
+        total_lost = r.get('total_loss_dollars', 0)
+        pf = abs(total_won / total_lost) if total_lost != 0 else 999
         status = " *LIQD*" if r["liquidated"] else ""
-        print(f"{r['symbol']:<10} {r['price_change']:+.1f}%{'':<2} {r['return_pct']:+.1f}%{'':<2} {r['total_trades']:<7} {r['wins']:<6} {r['losses']:<7} {r['win_rate']:.1f}%{'':<3} {trades_day:.1f}{'':<6} ${r.get('max_dd_dollars',0):<7.2f} ${r.get('best_trade',0):+.2f}{'':<2} ${r.get('worst_trade',0):+.2f}{status}")
+        print(f"{r['symbol']:<10} {r['price_change']:+.1f}%{'':<2} {r['return_pct']:+.1f}%{'':<2} {r['total_trades']:<7} {r['wins']:<6} {r['losses']:<7} {r['win_rate']:.1f}%{'':<3} {trades_day:.1f}{'':<2} ${total_won:<8.2f} ${total_lost:<9.2f} ${max_dd:<6.2f} {max_dd_pct_port:.1f}%{'':<5} {pf:.2f}x{status}")
 
     # Grand totals
     total_profit = total_ending - total_starting
     avg_return = total_profit / len(all_results)
     total_trades_per_day = total_trades / 90
 
-    print(f"\n{'='*120}")
-    print(f"GRAND TOTAL - PORTFOLIO PERFORMANCE")
-    print(f"{'='*120}")
+    # Calculate total won/lost across all symbols
+    grand_total_won = sum(r.get('total_win_dollars', 0) for r in all_results)
+    grand_total_lost = sum(r.get('total_loss_dollars', 0) for r in all_results)
+    grand_profit_factor = abs(grand_total_won / grand_total_lost) if grand_total_lost != 0 else 999
+
+    print(f"\n{'='*140}")
+    print(f"GRAND TOTAL - PORTFOLIO PERFORMANCE (Based on ${portfolio_capital:.0f} Capital)")
+    print(f"{'='*140}")
     print(f"  CAPITAL:")
-    print(f"    Starting Capital:    ${total_starting:.2f} ({len(all_results)} symbols × $100)")
+    print(f"    Starting Capital:    ${total_starting:.2f} ({len(all_results)} symbols × ${allocation_per_symbol:.0f})")
     print(f"    Ending Capital:      ${total_ending:.2f}")
     print(f"    Net Profit:          ${total_profit:+.2f}")
     print(f"    Portfolio Return:    {total_profit/total_starting*100:+.1f}%")
     print(f"    Avg Return/Symbol:   {total_profit/total_starting*100/len(all_results):.1f}%")
+    print(f"    Daily Avg Return:    {total_profit/total_starting*100/90:.2f}%")
+    print(f"")
+    print(f"  DRAWDOWN (Portfolio-Based):")
+    print(f"    Max DD (Sum):        ${total_max_dd_dollars:.2f}")
+    print(f"    Max DD % of Port:    {portfolio_max_dd_pct:.1f}%")
+    print(f"    Worst Symbol DD:     ${max(r.get('max_dd_dollars', 0) for r in all_results):.2f} ({max(r.get('max_dd_dollars', 0) for r in all_results)/portfolio_capital*100:.1f}% of portfolio)")
+    print(f"")
+    print(f"  PROFIT/LOSS:")
+    print(f"    Total Won (all):     ${grand_total_won:+.2f}")
+    print(f"    Total Lost (all):    ${grand_total_lost:+.2f}")
+    print(f"    Portfolio P/F:       {grand_profit_factor:.2f}x")
     print(f"")
     print(f"  TRADES:")
     print(f"    Total Trades:        {total_trades}")
@@ -821,11 +861,13 @@ def run_90_day_test():
     print(f"    Total Losses:        {total_losses}")
     print(f"    Overall Win Rate:    {total_wins/total_trades*100:.1f}%")
     print(f"    Trades/Day (all):    {total_trades_per_day:.1f}")
+    print(f"    Wins/Day:            {total_wins/90:.1f}")
+    print(f"    Losses/Day:          {total_losses/90:.2f}")
     print(f"")
     print(f"  BOOST MODE:")
     print(f"    Half-Close Cycles:   {total_half_closes}")
     print(f"    Liquidations:        {liquidations}/{len(all_results)}")
-    print(f"{'='*120}")
+    print(f"{'='*140}")
 
 
 if __name__ == "__main__":
