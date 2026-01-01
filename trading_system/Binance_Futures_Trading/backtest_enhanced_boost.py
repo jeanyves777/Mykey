@@ -60,7 +60,8 @@ class EnhancedBoostBacktester:
         self.trailing_activation_roi = 0.02  # Start trailing after 2% ROI profit
         self.trailing_distance_roi = 0.03    # Trail 3% behind peak
 
-        # STOP FOR DAY AFTER SL - restart next day
+        # STOP FOR DAY AFTER SL - restart next day (CONFIGURABLE)
+        self.stop_for_day_enabled = True  # Set to False to disable stop for day
         self.stopped_for_day = False  # True when SL hit, waiting for next day
         self.sl_hit_date = None  # Date when SL was hit
 
@@ -135,30 +136,47 @@ class EnhancedBoostBacktester:
 
         return df
 
-    def stop_for_day(self, timestamp, exit_price: float):
+    def stop_for_day(self, timestamp, exit_price: float, sl_side: str):
         """
-        STOP TRADING FOR THE DAY after SL hit.
-        Close remaining position and wait until next day.
+        After SL hit on one side:
+        - Keep the WINNING side open with trailing stop
+        - Only fully stop when winning side closes via trailing
+        - Then restart both sides next candle
         """
-        self.stopped_for_day = True
-        self.sl_hit_date = timestamp.date() if hasattr(timestamp, 'date') else timestamp
         self.days_stopped += 1
 
-        # Close remaining position if exists
-        if self.long_position:
-            pnl = self.close_position(self.long_position, exit_price, "STOP_DAY", timestamp)
-            print(f"[{timestamp}] Closing LONG for day stop @ ${exit_price:.4f} | P&L: ${pnl:+.2f}")
-            self.long_position = None
+        # Determine winning side (opposite of SL side)
+        winning_side = "SHORT" if sl_side == "LONG" else "LONG"
+        winning_pos = self.short_position if sl_side == "LONG" else self.long_position
 
-        if self.short_position:
-            pnl = self.close_position(self.short_position, exit_price, "STOP_DAY", timestamp)
-            print(f"[{timestamp}] Closing SHORT for day stop @ ${exit_price:.4f} | P&L: ${pnl:+.2f}")
-            self.short_position = None
+        # If winning side exists and is in profit, activate trailing and let it run
+        if winning_pos:
+            current_roi = self.calculate_roi(winning_pos["entry_price"], exit_price, winning_side)
+
+            if current_roi > 0:
+                # Winning side is profitable - activate trailing stop on it
+                self.trailing_active = True
+                self.boosted_peak_roi = current_roi
+                winning_pos["trailing_for_close"] = True  # Mark for trailing close
+                print(f"[{timestamp}] >>> {winning_side} PROFITABLE ({current_roi*100:.1f}% ROI) - Trailing activated")
+                print(f"[{timestamp}] >>> Will close {winning_side} via trailing, then restart both sides")
+                return  # Don't stop for day yet - let trailing run
+            else:
+                # Winning side not profitable - close it too
+                pnl = self.close_position(winning_pos, exit_price, "STOP_DAY", timestamp)
+                print(f"[{timestamp}] Closing {winning_side} for day stop @ ${exit_price:.4f} | P&L: ${pnl:+.2f}")
+                if winning_side == "LONG":
+                    self.long_position = None
+                else:
+                    self.short_position = None
 
         # Deactivate boost mode
         if self.boost_mode_active:
-            self.deactivate_boost_mode(timestamp, "Stopped for day")
+            self.deactivate_boost_mode(timestamp, "SL hit - stopping")
 
+        # Now stop for day
+        self.stopped_for_day = True
+        self.sl_hit_date = timestamp.date() if hasattr(timestamp, 'date') else timestamp
         print(f"[{timestamp}] >>> STOPPED FOR THE DAY - Will restart tomorrow")
 
     def check_new_day(self, timestamp) -> bool:
@@ -472,6 +490,21 @@ class EnhancedBoostBacktester:
             if self.long_position:
                 is_boosted = self.long_position.get("is_boosted", False)
 
+                # Check if this position is marked for trailing close (after SL on other side)
+                if self.long_position.get("trailing_for_close", False) and self.trailing_active:
+                    should_trail_close, trail_price = self.check_trailing_stop(self.long_position, close)
+                    if should_trail_close:
+                        pnl = self.close_position(self.long_position, trail_price, "TRAILING_CLOSE", timestamp)
+                        print(f"[{timestamp}] LONG TRAILING CLOSE @ ${trail_price:.4f} | P&L: ${pnl:+.2f} | Peak ROI: {self.boosted_peak_roi*100:.1f}%")
+                        self.long_position = None
+                        self.trailing_active = False
+                        self.boosted_peak_roi = 0
+                        # Now stop for day and restart next day
+                        self.stopped_for_day = True
+                        self.sl_hit_date = timestamp.date() if hasattr(timestamp, 'date') else timestamp
+                        print(f"[{timestamp}] >>> Trailing close complete - STOPPED FOR THE DAY")
+                        continue
+
                 # Check trailing stop first (only for boosted positions AFTER half-close)
                 if is_boosted and self.boost_mode_active and self.boosted_side == "LONG" and self.trailing_active:
                     should_trail_close, trail_price = self.check_trailing_stop(self.long_position, close)
@@ -525,9 +558,18 @@ class EnhancedBoostBacktester:
                     print(f"[{timestamp}] LONG SL @ ${self.long_position['sl_price']:.4f} | P&L: ${pnl:+.2f} | DCA: {self.long_position['dca_level']}")
                     self.long_position = None
 
-                    # STOP FOR THE DAY - close other position and wait
-                    self.stop_for_day(timestamp, close)
-                    continue
+                    # Deactivate boost if this was the trigger side
+                    if self.boost_mode_active and self.boost_trigger_side == "LONG":
+                        self.deactivate_boost_mode(timestamp, "Trigger side hit SL")
+
+                    # Handle winning side - keep with trailing or stop for day (if enabled)
+                    if self.stop_for_day_enabled:
+                        self.stop_for_day(timestamp, close, sl_side="LONG")
+                        continue
+                    else:
+                        # Just re-enter LONG immediately
+                        self.long_position = self.open_position("LONG", close)
+                        continue
 
                 # Check DCA - BUT NOT if this side is boosted!
                 elif self.check_dca_trigger(self.long_position, close):
@@ -556,6 +598,21 @@ class EnhancedBoostBacktester:
             # Check SHORT position
             if self.short_position:
                 is_boosted = self.short_position.get("is_boosted", False)
+
+                # Check if this position is marked for trailing close (after SL on other side)
+                if self.short_position.get("trailing_for_close", False) and self.trailing_active:
+                    should_trail_close, trail_price = self.check_trailing_stop(self.short_position, close)
+                    if should_trail_close:
+                        pnl = self.close_position(self.short_position, trail_price, "TRAILING_CLOSE", timestamp)
+                        print(f"[{timestamp}] SHORT TRAILING CLOSE @ ${trail_price:.4f} | P&L: ${pnl:+.2f} | Peak ROI: {self.boosted_peak_roi*100:.1f}%")
+                        self.short_position = None
+                        self.trailing_active = False
+                        self.boosted_peak_roi = 0
+                        # Now stop for day and restart next day
+                        self.stopped_for_day = True
+                        self.sl_hit_date = timestamp.date() if hasattr(timestamp, 'date') else timestamp
+                        print(f"[{timestamp}] >>> Trailing close complete - STOPPED FOR THE DAY")
+                        continue
 
                 # Check trailing stop first (only for boosted positions AFTER half-close)
                 if is_boosted and self.boost_mode_active and self.boosted_side == "SHORT" and self.trailing_active:
@@ -610,9 +667,18 @@ class EnhancedBoostBacktester:
                     print(f"[{timestamp}] SHORT SL @ ${self.short_position['sl_price']:.4f} | P&L: ${pnl:+.2f} | DCA: {self.short_position['dca_level']}")
                     self.short_position = None
 
-                    # STOP FOR THE DAY - close other position and wait
-                    self.stop_for_day(timestamp, close)
-                    continue
+                    # Deactivate boost if this was the trigger side
+                    if self.boost_mode_active and self.boost_trigger_side == "SHORT":
+                        self.deactivate_boost_mode(timestamp, "Trigger side hit SL")
+
+                    # Handle winning side - keep with trailing or stop for day (if enabled)
+                    if self.stop_for_day_enabled:
+                        self.stop_for_day(timestamp, close, sl_side="SHORT")
+                        continue
+                    else:
+                        # Just re-enter SHORT immediately
+                        self.short_position = self.open_position("SHORT", close)
+                        continue
 
                 # Check DCA - BUT NOT if this side is boosted!
                 elif self.check_dca_trigger(self.short_position, close):
