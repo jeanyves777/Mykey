@@ -535,6 +535,11 @@ class EnhancedBoostBacktester:
 
     def activate_boost_mode(self, trigger_side: str, timestamp):
         """Activate enhanced boost mode when one side hits DCA 3"""
+        # IMPORTANT: If strong trend mode is active, deactivate it first
+        # Boost mode and Strong Trend mode should NEVER be active together
+        if self.strong_trend_mode:
+            self.deactivate_strong_trend_mode(timestamp, "Boost mode taking over")
+
         self.boost_mode_active = True
         self.boosted_side = "SHORT" if trigger_side == "LONG" else "LONG"
         self.boost_trigger_side = trigger_side
@@ -653,24 +658,30 @@ class EnhancedBoostBacktester:
             is_strong_trend, trend_direction = self.check_strong_trend(i, adx_series, plus_di_series, minus_di_series)
 
             if is_strong_trend and not self.strong_trend_mode:
-                # Activate strong trend mode
-                self.activate_strong_trend_mode(trend_direction, timestamp)
+                # NEVER activate strong trend mode if BOOST MODE is already active
+                # These two should NEVER happen together - boost mode takes priority
+                if self.boost_mode_active:
+                    pass  # Skip trend mode - boost mode already active
+                else:
+                    # Activate strong trend mode
+                    self.activate_strong_trend_mode(trend_direction, timestamp)
 
-                # Determine winner/loser based on trend direction
-                # UP trend = LONG is winner, SHORT is loser
-                # DOWN trend = SHORT is winner, LONG is loser
-                winner_side = "LONG" if trend_direction == "UP" else "SHORT"
-                loser_side = "SHORT" if trend_direction == "UP" else "LONG"
+                    # Determine winner/loser based on trend direction
+                    # UP trend = LONG is winner, SHORT is loser
+                    # DOWN trend = SHORT is winner, LONG is loser
+                    winner_side = "LONG" if trend_direction == "UP" else "SHORT"
+                    loser_side = "SHORT" if trend_direction == "UP" else "LONG"
 
-                # Apply 2x to winner if exists (trend boost)
-                winner_pos = self.long_position if winner_side == "LONG" else self.short_position
-                if winner_pos and not winner_pos.get("is_trend_boosted", False):
-                    old_margin = winner_pos["margin"]
-                    winner_pos["quantity"] *= 2.0  # 2x for strong trend winner
-                    winner_pos["margin"] *= 2.0
-                    winner_pos["is_trend_boosted"] = True
-                    winner_pos["is_boosted"] = True  # Enable trailing/half-close logic
-                    print(f"[{timestamp}] >>> TREND BOOST {winner_side}: margin ${old_margin:.2f} -> ${winner_pos['margin']:.2f} (2x)")
+                    # Apply 2x to winner if exists (trend boost)
+                    # BUT ONLY if not already boosted from DCA boost mode
+                    winner_pos = self.long_position if winner_side == "LONG" else self.short_position
+                    if winner_pos and not winner_pos.get("is_trend_boosted", False) and not winner_pos.get("is_boosted", False):
+                        old_margin = winner_pos["margin"]
+                        winner_pos["quantity"] *= 2.0  # 2x for strong trend winner
+                        winner_pos["margin"] *= 2.0
+                        winner_pos["is_trend_boosted"] = True
+                        winner_pos["is_boosted"] = True  # Enable trailing/half-close logic
+                        print(f"[{timestamp}] >>> TREND BOOST {winner_side}: margin ${old_margin:.2f} -> ${winner_pos['margin']:.2f} (2x)")
 
             elif not is_strong_trend and self.strong_trend_mode:
                 # Deactivate strong trend mode when ADX drops
