@@ -135,6 +135,10 @@ class BinanceLiveTradingEngine:
         self.boost_cycle_count: Dict[str, int] = {}       # symbol -> number of half-close cycles
         self.boost_multiplier = 1.5                       # 1.5x boost
 
+        # STOP FOR DAY - After SL hit, stop trading that symbol until next day
+        self.stopped_for_day: Dict[str, bool] = {}        # symbol -> True if stopped for the day
+        self.sl_hit_date: Dict[str, datetime] = {}        # symbol -> date when SL hit
+
         # SMART COMPOUNDING - Reserve Fund System
         # Instead of 100% compounding, split profits: 50% compound, 50% reserve
         self.smart_compounding_enabled = SMART_COMPOUNDING_CONFIG.get("enabled", True)
@@ -778,6 +782,124 @@ class BinanceLiveTradingEngine:
             # (e.g., SHORT boosted hit SL because price went UP, so LONG should be recovering)
             self._deactivate_boost_mode(symbol, f"{boosted_side} SL (trigger side recovering)")
 
+    def _stop_for_day(self, symbol: str):
+        """
+        STOP TRADING THIS SYMBOL FOR THE DAY after SL hit.
+        Close remaining position and don't re-enter until next day.
+        """
+        self.stopped_for_day[symbol] = True
+        self.sl_hit_date[symbol] = datetime.now()
+
+        self.log(f">>> [STOP FOR DAY] {symbol}: SL hit - STOPPING trading until tomorrow", level="TRADE")
+
+        # Close the OTHER side position if exists
+        opposite_positions_to_close = []
+        for pos_key, position in list(self.positions.items()):
+            if position.symbol == symbol:
+                opposite_positions_to_close.append((pos_key, position))
+
+        for pos_key, position in opposite_positions_to_close:
+            try:
+                # Get current price
+                price_data = self.client.get_current_price(symbol)
+                current_price = price_data["price"]
+
+                # Close position
+                close_side = "SELL" if position.side == "LONG" else "BUY"
+                hedge_position_side = position.side if self.hedge_mode else None
+
+                close_order = self.client.place_market_order(
+                    symbol, close_side, position.quantity, position_side=hedge_position_side
+                )
+
+                if "orderId" in close_order:
+                    fill_price = float(close_order.get("avgPrice", current_price))
+                    if position.side == "LONG":
+                        pnl = (fill_price - position.avg_entry_price) * position.quantity
+                    else:
+                        pnl = (position.avg_entry_price - fill_price) * position.quantity
+
+                    self.log(f"    [STOP DAY] Closed {position.side} @ ${fill_price:,.4f} | P&L: ${pnl:+.2f}", level="TRADE")
+
+                    # Update daily stats
+                    self.daily_pnl += pnl
+                    self.daily_trades += 1
+                    if pnl >= 0:
+                        self.daily_wins += 1
+                    else:
+                        self.daily_losses += 1
+
+                    # Log trade
+                    self.log_trade(
+                        symbol=symbol,
+                        side=position.side,
+                        entry_price=position.avg_entry_price,
+                        exit_price=fill_price,
+                        quantity=position.quantity,
+                        pnl=pnl,
+                        exit_type="STOP_DAY",
+                        dca_level=position.dca_count
+                    )
+
+                # Cancel all orders for this symbol
+                try:
+                    self.client.cancel_all_orders(symbol)
+                    self.log(f"    [STOP DAY] Cancelled all orders for {symbol}")
+                except Exception as e:
+                    self.log(f"    [STOP DAY] Warning: Could not cancel orders: {e}", level="WARN")
+
+                # Release margin
+                margin_released = position.margin_used
+                current_margin = self.symbol_margin_used.get(symbol, 0)
+                self.symbol_margin_used[symbol] = max(0, current_margin - margin_released)
+
+                # Remove from tracking
+                del self.positions[pos_key]
+
+            except Exception as e:
+                self.log(f"    [STOP DAY] Error closing {position.side}: {e}", level="ERROR")
+
+        # Deactivate boost mode if active
+        if self.boost_mode_active.get(symbol, False):
+            self._deactivate_boost_mode(symbol, "Stopped for day")
+
+        # Clear pending re-entries
+        if symbol in self.pending_reentry:
+            del self.pending_reentry[symbol]
+        if f"{symbol}_LONG" in self.pending_reentry:
+            del self.pending_reentry[f"{symbol}_LONG"]
+        if f"{symbol}_SHORT" in self.pending_reentry:
+            del self.pending_reentry[f"{symbol}_SHORT"]
+
+        self.log(f">>> [STOP FOR DAY] {symbol}: All positions closed. Will restart tomorrow.", level="TRADE")
+
+        # Save state
+        self._save_position_state()
+
+    def _check_new_day_restart(self, symbol: str) -> bool:
+        """
+        Check if it's a new day and we should restart trading for a stopped symbol.
+        Returns True if trading should restart.
+        """
+        if not self.stopped_for_day.get(symbol, False):
+            return False
+
+        sl_date = self.sl_hit_date.get(symbol)
+        if sl_date is None:
+            return False
+
+        current_date = datetime.now().date()
+        sl_hit_date = sl_date.date() if hasattr(sl_date, 'date') else sl_date
+
+        if current_date > sl_hit_date:
+            # New day - restart trading
+            self.stopped_for_day[symbol] = False
+            self.sl_hit_date[symbol] = None
+            self.log(f">>> [NEW DAY] {symbol}: Restarting trading after yesterday's SL stop", level="TRADE")
+            return True
+
+        return False
+
     def _handle_boosted_tp(self, symbol: str, position: LivePosition, current_price: float) -> bool:
         """
         Handle TP for BOOSTED positions with half-close cycle:
@@ -1210,6 +1332,11 @@ class BinanceLiveTradingEngine:
         Returns True if positions were entered.
         """
         try:
+            # CHECK IF STOPPED FOR DAY - Don't enter if symbol is stopped
+            if self.stopped_for_day.get(symbol, False):
+                self.log(f"HEDGE AUTO-ENTER: {symbol} SKIPPED - stopped for the day", level="WARN")
+                return False
+
             hedge_config = DCA_CONFIG.get("hedge_mode", {})
             if not hedge_config.get("enabled", True):
                 return False
@@ -1634,6 +1761,11 @@ class BinanceLiveTradingEngine:
         ALWAYS HOLD STRATEGY: Re-enter immediately, no momentum check needed!
         """
         try:
+            # CHECK IF STOPPED FOR DAY - Don't re-enter if symbol is stopped
+            if self.stopped_for_day.get(symbol, False):
+                self.log(f"Re-enter {symbol}: BLOCKED - stopped for the day (SL hit)", level="WARN")
+                return
+
             hybrid_config = DCA_CONFIG.get("hybrid_hold", {})
             if not hybrid_config.get("reenter_on_tp", True):
                 self.log(f"Re-enter {symbol}: Disabled in config", level="INFO")
@@ -2215,16 +2347,23 @@ class BinanceLiveTradingEngine:
                     self._save_position_state()
 
                     # ============================================
-                    # HEDGE MODE or HYBRID HOLD: ALWAYS RE-ENTER
-                    # Re-enter same direction after ANY exit (TP, SL, BE, manual)
-                    # Stay in market at all times with both LONG and SHORT
+                    # HEDGE MODE or HYBRID HOLD: RE-ENTER LOGIC
+                    # CHANGED: If SL hit -> STOP FOR THE DAY (no re-entry)
+                    #          If TP hit -> Re-enter same direction
                     # ============================================
                     hedge_config = DCA_CONFIG.get("hedge_mode", {})
                     hybrid_config = DCA_CONFIG.get("hybrid_hold", {})
 
-                    # ALWAYS re-enter in hedge mode - never stop trading
+                    # CHECK IF SL HIT - STOP FOR THE DAY
+                    if exit_type == "SL":
+                        # SL hit - STOP trading this symbol for the day
+                        self._stop_for_day(actual_symbol)
+                        # Don't re-enter - skip to next position check
+                        continue
+
+                    # TP HIT - Re-enter in hedge mode
                     if self.hedge_mode and hedge_config.get("reenter_on_tp", True):
-                        # HEDGE MODE: ALWAYS re-enter the SAME SIDE that just closed
+                        # HEDGE MODE: Re-enter the SAME SIDE that just closed (TP only)
                         exit_label = "WIN" if realized_pnl >= 0 else "LOSS"
                         self.log(f"HEDGE: {actual_symbol} [{closed_side}] closed ({exit_type}, {exit_label}), IMMEDIATE RE-ENTRY", level="TRADE")
                         self.pending_reentry[position_key] = closed_side
@@ -2233,7 +2372,7 @@ class BinanceLiveTradingEngine:
 
                     elif (hybrid_config.get("enabled", False) and
                           hybrid_config.get("reenter_on_tp", True)):
-                        # HYBRID MODE: ALWAYS re-enter same direction
+                        # HYBRID MODE: Re-enter same direction (TP only)
                         exit_label = "WIN" if realized_pnl >= 0 else "LOSS"
                         self.log(f"HYBRID: {actual_symbol} closed ({exit_type}, {exit_label}), IMMEDIATE RE-ENTRY {closed_side}", level="TRADE")
                         self.pending_reentry[actual_symbol] = closed_side
@@ -3519,6 +3658,13 @@ class BinanceLiveTradingEngine:
         try:
             while self.running and (continuous or datetime.now() < end_time):
                 self.check_daily_reset()
+
+                # CHECK FOR NEW DAY - Restart trading for stopped symbols
+                for symbol in self.symbols:
+                    if self._check_new_day_restart(symbol):
+                        # New day - auto-enter positions for this symbol
+                        self.auto_enter_hedge_positions(symbol)
+
                 self.check_entry_signals()
                 self.manage_positions()
 

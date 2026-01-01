@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-Backtest Hedge + DCA + ENHANCED BOOST MODE Strategy
-====================================================
+Backtest Hedge + DCA + ENHANCED BOOST MODE Strategy v3
+=======================================================
+IMPROVEMENTS:
+1. Smart Boost at DCA 2 (earlier trigger)
+2. Increased TP levels ONLY during boost mode
+3. STOP FOR THE DAY after SL hit - restart next day
+4. CSV trade journal export
+
 Enhanced Boost Mode with:
-1. At DCA 3 trigger -> Boost opposite side 1.5x
+1. At DCA 2 trigger -> Boost opposite side 1.5x
 2. When boosted side hits TP: Close HALF, lock profit, add back 0.5x
 3. Trailing stop activates AFTER each half-close cycle
 4. Continue until losing side recovers (TP) or hits SL
+5. After SL: Close remaining position, STOP for the day, restart next day
 """
 
 import sys
@@ -15,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pandas as pd
 import numpy as np
+import csv
 from datetime import datetime, timedelta
 from engine.binance_client import BinanceClient
 from config.trading_config import DCA_CONFIG, STRATEGY_CONFIG, SYMBOL_SETTINGS
@@ -45,14 +53,19 @@ class EnhancedBoostBacktester:
             DCA_CONFIG.get("dca4_pct", 0.30),           # 30%
         ]
 
-        # ENHANCED BOOST PARAMETERS - USE SYMBOL-SPECIFIC if available
-        self.boost_multiplier = 1.5  # 1.5x instead of 2x
-        self.boost_trigger_dca_level = symbol_config.get("boost_trigger_dca", 3)  # DCA 2 for BTC/ETH, DCA 3 for others
+        # ENHANCED BOOST PARAMETERS - BOOST AT DCA 3
+        self.boost_multiplier = 1.5  # 1.5x boost
+        self.boost_trigger_dca_level = 3  # DCA 3 trigger
+        self.boost_tp_multiplier = 1.5  # Increase TP by 50% during boost mode
         self.trailing_activation_roi = 0.02  # Start trailing after 2% ROI profit
         self.trailing_distance_roi = 0.03    # Trail 3% behind peak
 
+        # STOP FOR DAY AFTER SL - restart next day
+        self.stopped_for_day = False  # True when SL hit, waiting for next day
+        self.sl_hit_date = None  # Date when SL was hit
+
         # Log symbol-specific settings
-        print(f"[{symbol}] TP ROI: {self.tp_roi*100:.0f}% | Boost Trigger: DCA {self.boost_trigger_dca_level}")
+        print(f"[{symbol}] TP ROI: {self.tp_roi*100:.0f}% | Boost Trigger: DCA {self.boost_trigger_dca_level} | Boost TP: +{(self.boost_tp_multiplier-1)*100:.0f}%")
 
         # Positions
         self.long_position = None
@@ -82,6 +95,11 @@ class EnhancedBoostBacktester:
         self.boost_profits = 0
         self.half_close_count = 0
         self.trailing_closes = 0
+
+        # SL stats
+        self.sl_hits_long = 0
+        self.sl_hits_short = 0
+        self.days_stopped = 0  # Count of days stopped due to SL
 
     def get_historical_data(self, days: int = 30, interval: str = "1h", days_ago_start: int = 0):
         """Fetch historical klines from Binance MAINNET (real data)"""
@@ -117,6 +135,44 @@ class EnhancedBoostBacktester:
 
         return df
 
+    def stop_for_day(self, timestamp, exit_price: float):
+        """
+        STOP TRADING FOR THE DAY after SL hit.
+        Close remaining position and wait until next day.
+        """
+        self.stopped_for_day = True
+        self.sl_hit_date = timestamp.date() if hasattr(timestamp, 'date') else timestamp
+        self.days_stopped += 1
+
+        # Close remaining position if exists
+        if self.long_position:
+            pnl = self.close_position(self.long_position, exit_price, "STOP_DAY", timestamp)
+            print(f"[{timestamp}] Closing LONG for day stop @ ${exit_price:.4f} | P&L: ${pnl:+.2f}")
+            self.long_position = None
+
+        if self.short_position:
+            pnl = self.close_position(self.short_position, exit_price, "STOP_DAY", timestamp)
+            print(f"[{timestamp}] Closing SHORT for day stop @ ${exit_price:.4f} | P&L: ${pnl:+.2f}")
+            self.short_position = None
+
+        # Deactivate boost mode
+        if self.boost_mode_active:
+            self.deactivate_boost_mode(timestamp, "Stopped for day")
+
+        print(f"[{timestamp}] >>> STOPPED FOR THE DAY - Will restart tomorrow")
+
+    def check_new_day(self, timestamp) -> bool:
+        """Check if it's a new day and we should restart trading"""
+        if not self.stopped_for_day:
+            return False
+
+        current_date = timestamp.date() if hasattr(timestamp, 'date') else timestamp
+        if current_date > self.sl_hit_date:
+            self.stopped_for_day = False
+            self.sl_hit_date = None
+            return True
+        return False
+
     def calculate_roi(self, entry_price: float, current_price: float, side: str) -> float:
         """Calculate ROI based on position side"""
         if side == "LONG":
@@ -129,12 +185,16 @@ class EnhancedBoostBacktester:
         """Get current DCA level from position"""
         return position.get("dca_level", 0)
 
-    def get_tp_price(self, entry_price: float, side: str, dca_level: int) -> float:
-        """Calculate TP price based on DCA level"""
+    def get_tp_price(self, entry_price: float, side: str, dca_level: int, is_boosted: bool = False) -> float:
+        """Calculate TP price based on DCA level. INCREASE TP during boost mode."""
         if dca_level > 0 and dca_level <= len(self.dca_levels):
             tp_roi = self.dca_levels[dca_level - 1].get("tp_roi", self.tp_roi)
         else:
             tp_roi = self.tp_roi
+
+        # INCREASE TP by 50% during boost mode
+        if is_boosted and self.boost_mode_active:
+            tp_roi = tp_roi * self.boost_tp_multiplier
 
         tp_pct = tp_roi / self.leverage
 
@@ -199,6 +259,7 @@ class EnhancedBoostBacktester:
         initial_margin *= boost_multiplier
 
         quantity = (initial_margin * self.leverage) / price
+        is_boosted = boost_multiplier > 1.0
 
         position = {
             "side": side,
@@ -206,9 +267,9 @@ class EnhancedBoostBacktester:
             "quantity": quantity,
             "margin": initial_margin,
             "dca_level": 0,
-            "tp_price": self.get_tp_price(price, side, 0),
+            "tp_price": self.get_tp_price(price, side, 0, is_boosted=is_boosted),  # Use boosted TP
             "sl_price": self.get_sl_price(price, side),
-            "is_boosted": boost_multiplier > 1.0,
+            "is_boosted": is_boosted,
             "boost_multiplier": boost_multiplier
         }
         return position
@@ -373,6 +434,7 @@ class EnhancedBoostBacktester:
         print(f"  - At TP: Close HALF, lock profit, add 0.5x back")
         print(f"  - Trailing activates AFTER first half-close")
         print(f"  - Continue until losing side recovers or SL")
+        print(f"  - AFTER SL: STOP for the day, restart next day")
         print("="*70)
 
         # Open initial positions
@@ -392,6 +454,19 @@ class EnhancedBoostBacktester:
             high = row['high']
             low = row['low']
             close = row['close']
+
+            # Check if new day - restart trading after stop
+            if self.check_new_day(timestamp):
+                print(f"[{timestamp}] >>> NEW DAY - Restarting trading")
+                self.long_position = self.open_position("LONG", close)
+                self.short_position = self.open_position("SHORT", close)
+                print(f"[{timestamp}] Opened LONG @ ${close:.4f}")
+                print(f"[{timestamp}] Opened SHORT @ ${close:.4f}")
+                continue
+
+            # Skip if stopped for the day
+            if self.stopped_for_day:
+                continue
 
             # Check LONG position
             if self.long_position:
@@ -446,18 +521,13 @@ class EnhancedBoostBacktester:
                     pnl = self.close_position(self.long_position, self.long_position["sl_price"], "SL", timestamp)
                     if is_boosted:
                         self.boost_profits += pnl
+                    self.sl_hits_long += 1
                     print(f"[{timestamp}] LONG SL @ ${self.long_position['sl_price']:.4f} | P&L: ${pnl:+.2f} | DCA: {self.long_position['dca_level']}")
+                    self.long_position = None
 
-                    # Check if this was the trigger side - deactivate boost
-                    if self.boost_mode_active and self.boost_trigger_side == "LONG":
-                        self.deactivate_boost_mode(timestamp, "LONG hit SL (lost)")
-
-                    # Re-enter
-                    boost_mult = self.boost_multiplier if (self.boost_mode_active and self.boosted_side == "LONG") else 1.0
-                    self.long_position = self.open_position("LONG", close, boost_multiplier=boost_mult)
-                    if boost_mult > 1.0:
-                        self.boosted_peak_roi = 0
-                        self.trailing_active = False
+                    # STOP FOR THE DAY - close other position and wait
+                    self.stop_for_day(timestamp, close)
+                    continue
 
                 # Check DCA - BUT NOT if this side is boosted!
                 elif self.check_dca_trigger(self.long_position, close):
@@ -536,18 +606,13 @@ class EnhancedBoostBacktester:
                     pnl = self.close_position(self.short_position, self.short_position["sl_price"], "SL", timestamp)
                     if is_boosted:
                         self.boost_profits += pnl
+                    self.sl_hits_short += 1
                     print(f"[{timestamp}] SHORT SL @ ${self.short_position['sl_price']:.4f} | P&L: ${pnl:+.2f} | DCA: {self.short_position['dca_level']}")
+                    self.short_position = None
 
-                    # Check if this was the trigger side - deactivate boost
-                    if self.boost_mode_active and self.boost_trigger_side == "SHORT":
-                        self.deactivate_boost_mode(timestamp, "SHORT hit SL (lost)")
-
-                    # Re-enter
-                    boost_mult = self.boost_multiplier if (self.boost_mode_active and self.boosted_side == "SHORT") else 1.0
-                    self.short_position = self.open_position("SHORT", close, boost_multiplier=boost_mult)
-                    if boost_mult > 1.0:
-                        self.boosted_peak_roi = 0
-                        self.trailing_active = False
+                    # STOP FOR THE DAY - close other position and wait
+                    self.stop_for_day(timestamp, close)
+                    continue
 
                 # Check DCA - BUT NOT if this side is boosted!
                 elif self.check_dca_trigger(self.short_position, close):
@@ -589,6 +654,9 @@ class EnhancedBoostBacktester:
 
         self.print_results(df, total_unrealized)
 
+        # Export trade journal to CSV
+        self.export_trade_journal()
+
         # Calculate best/worst trades
         trade_pnls = [t["pnl"] for t in self.trades] if self.trades else [0]
         best_trade = max(trade_pnls)
@@ -619,6 +687,52 @@ class EnhancedBoostBacktester:
             "trailing_closes": self.trailing_closes,
             "liquidated": self.balance <= 0
         }
+
+    def export_trade_journal(self, filename: str = None):
+        """Export all trades to CSV trade journal"""
+        if not self.trades:
+            print("No trades to export")
+            return
+
+        if filename is None:
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"trade_journal_{self.symbol}_{timestamp_str}.csv"
+
+        fieldnames = [
+            "timestamp", "symbol", "side", "entry_price", "exit_price",
+            "quantity", "margin", "dca_level", "pnl", "pnl_pct", "exit_type",
+            "balance_after", "is_boosted", "close_pct", "cumulative_pnl"
+        ]
+
+        cumulative_pnl = 0
+        with open(filename, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+
+            for trade in self.trades:
+                cumulative_pnl += trade["pnl"]
+                pnl_pct = (trade["pnl"] / trade["margin"] * 100) if trade["margin"] > 0 else 0
+
+                writer.writerow({
+                    "timestamp": trade["timestamp"],
+                    "symbol": self.symbol,
+                    "side": trade["side"],
+                    "entry_price": f"{trade['entry_price']:.6f}",
+                    "exit_price": f"{trade['exit_price']:.6f}",
+                    "quantity": f"{trade['quantity']:.6f}",
+                    "margin": f"{trade['margin']:.2f}",
+                    "dca_level": trade["dca_level"],
+                    "pnl": f"{trade['pnl']:.2f}",
+                    "pnl_pct": f"{pnl_pct:.2f}",
+                    "exit_type": trade["exit_type"],
+                    "balance_after": f"{trade['balance']:.2f}",
+                    "is_boosted": trade.get("is_boosted", False),
+                    "close_pct": f"{trade.get('close_pct', 1.0):.2f}",
+                    "cumulative_pnl": f"{cumulative_pnl:.2f}"
+                })
+
+        print(f"\n>>> Trade journal exported to: {filename}")
+        print(f"    Total trades: {len(self.trades)}")
 
     def print_results(self, df: pd.DataFrame, unrealized_pnl: float):
         """Print backtest results"""
@@ -657,6 +771,13 @@ class EnhancedBoostBacktester:
         print(f"  Half-Close Cycles:   {self.half_close_count}")
         print(f"  Trailing Closes:     {self.trailing_closes}")
         print(f"  Total Boost P&L:     ${self.boost_profits:+.2f}")
+
+        # Stop For Day Analysis
+        print(f"\n>>> STOP FOR DAY Analysis:")
+        print(f"  SL Hits (LONG):      {self.sl_hits_long}")
+        print(f"  SL Hits (SHORT):     {self.sl_hits_short}")
+        print(f"  Total SL Hits:       {self.sl_hits_long + self.sl_hits_short}")
+        print(f"  Days Stopped:        {self.days_stopped}")
 
         # Boosted trades analysis
         boosted_trades = [t for t in self.trades if t.get("is_boosted", False)]
