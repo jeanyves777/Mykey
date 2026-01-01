@@ -681,7 +681,7 @@ def run_90_day_test():
     """Test Enhanced Boost over specified days with selected pairs"""
     # Configuration
     BACKTEST_DAYS = 365  # 12 months
-    symbols = ["BTCUSDT", "DOTUSDT", "BNBUSDT"]
+    symbols = ["BTCUSDT", "DOTUSDT", "BNBUSDT", "AVAXUSDT", "SOLUSDT"]
 
     print("="*80)
     print(f"ENHANCED BOOST MODE - {BACKTEST_DAYS} DAY BACKTEST")
