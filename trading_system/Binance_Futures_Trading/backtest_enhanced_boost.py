@@ -102,8 +102,12 @@ class EnhancedBoostBacktester:
         self.sl_hits_short = 0
         self.days_stopped = 0  # Count of days stopped due to SL
 
+        # Signal cooldown after SL (bars to wait before re-entering)
+        self.cooldown_bars = 5  # Wait 5 candles after SL before re-entry
+        self.cooldown_remaining = 0  # Current cooldown counter
+
     def get_historical_data(self, days: int = 30, interval: str = "1h", days_ago_start: int = 0):
-        """Fetch historical klines from Binance MAINNET (real data)"""
+        """Fetch historical klines from Binance MAINNET with pagination for large date ranges"""
         print(f"Fetching {days} days of {interval} data for {self.symbol}...")
         print("Using Binance MAINNET for real historical data...")
 
@@ -112,17 +116,38 @@ class EnhancedBoostBacktester:
         end_time = datetime.now() - timedelta(days=days_ago_start)
         start_time = end_time - timedelta(days=days)
 
-        df = client.get_klines(
-            self.symbol,
-            interval=interval,
-            start_time=int(start_time.timestamp() * 1000),
-            end_time=int(end_time.timestamp() * 1000),
-            limit=1000
-        )
+        # Paginate to get all data (1000 candles per request max)
+        all_data = []
+        current_start = start_time
 
-        if df is None or (hasattr(df, 'empty') and df.empty) or len(df) == 0:
+        while current_start < end_time:
+            df_chunk = client.get_klines(
+                self.symbol,
+                interval=interval,
+                start_time=int(current_start.timestamp() * 1000),
+                limit=1000
+            )
+
+            if df_chunk is None or len(df_chunk) == 0:
+                break
+
+            all_data.append(df_chunk)
+
+            if len(df_chunk) < 1000:
+                break
+
+            # Move start to after last candle
+            last_time = df_chunk.index[-1]
+            current_start = last_time + timedelta(hours=1)
+
+        if not all_data:
             print("No data returned!")
             return None
+
+        # Combine all chunks
+        df = pd.concat(all_data)
+        df = df[~df.index.duplicated(keep='first')]
+        df = df.sort_index()
 
         # Ensure numeric types
         for col in ['open', 'high', 'low', 'close', 'volume']:
@@ -372,14 +397,16 @@ class EnhancedBoostBacktester:
         position["quantity"] = new_qty
         position["margin"] += add_margin
         position["entry_price"] = new_entry
-        position["tp_price"] = self.get_tp_price(new_entry, position["side"], 0)
+        position["tp_price"] = self.get_tp_price(new_entry, position["side"], 0, is_boosted=True)  # Keep boost TP
         position["sl_price"] = self.get_sl_price(new_entry, position["side"])
 
         # Activate trailing after half-close cycle
+        # Start tracking from current price (not 0) so trailing can work immediately
         self.trailing_active = True
-        self.boosted_peak_roi = 0
+        current_roi = self.calculate_roi(new_entry, exit_price, position["side"])
+        self.boosted_peak_roi = max(current_roi, self.trailing_activation_roi)  # Start at activation threshold
 
-        print(f"[{timestamp}] >>> HALF CLOSE @ ${exit_price:.4f} | Locked: ${half_pnl:+.2f} | Added 0.5x back | Trailing NOW ACTIVE")
+        print(f"[{timestamp}] >>> HALF CLOSE @ ${exit_price:.4f} | Locked: ${half_pnl:+.2f} | Added 0.5x back | Trailing NOW ACTIVE (Peak: {self.boosted_peak_roi*100:.1f}%)")
 
         return position
 
@@ -473,9 +500,14 @@ class EnhancedBoostBacktester:
             low = row['low']
             close = row['close']
 
+            # Decrement cooldown counter
+            if self.cooldown_remaining > 0:
+                self.cooldown_remaining -= 1
+
             # Check if new day - restart trading after stop
             if self.check_new_day(timestamp):
                 print(f"[{timestamp}] >>> NEW DAY - Restarting trading")
+                self.cooldown_remaining = 0  # Reset cooldown on new day
                 self.long_position = self.open_position("LONG", close)
                 self.short_position = self.open_position("SHORT", close)
                 print(f"[{timestamp}] Opened LONG @ ${close:.4f}")
@@ -528,7 +560,7 @@ class EnhancedBoostBacktester:
                             self.long_position["tp_price"],
                             timestamp
                         )
-                        self.boost_profits += self.boost_locked_profit
+                        # Note: PNL already added to balance in close_position() called by half_close_and_readd()
                         continue
 
                 # Check TP hit (non-boosted or full close)
@@ -567,7 +599,9 @@ class EnhancedBoostBacktester:
                         self.stop_for_day(timestamp, close, sl_side="LONG")
                         continue
                     else:
-                        # Just re-enter LONG immediately
+                        # Set cooldown before re-entry
+                        self.cooldown_remaining = self.cooldown_bars
+                        # Just re-enter LONG immediately (cooldown affects next SL only)
                         self.long_position = self.open_position("LONG", close)
                         continue
 
@@ -637,7 +671,7 @@ class EnhancedBoostBacktester:
                             self.short_position["tp_price"],
                             timestamp
                         )
-                        self.boost_profits += self.boost_locked_profit
+                        # Note: PNL already added to balance in close_position() called by half_close_and_readd()
                         continue
 
                 # Check TP hit (non-boosted or full close)
@@ -676,7 +710,9 @@ class EnhancedBoostBacktester:
                         self.stop_for_day(timestamp, close, sl_side="SHORT")
                         continue
                     else:
-                        # Just re-enter SHORT immediately
+                        # Set cooldown before re-entry
+                        self.cooldown_remaining = self.cooldown_bars
+                        # Just re-enter SHORT immediately (cooldown affects next SL only)
                         self.short_position = self.open_position("SHORT", close)
                         continue
 

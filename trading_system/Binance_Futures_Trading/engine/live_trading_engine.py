@@ -2498,9 +2498,6 @@ class BinanceLiveTradingEngine:
         if position.avg_entry_price <= 0:
             return
 
-        if position.dca_count >= len(DCA_CONFIG["levels"]):
-            return
-
         # ENHANCED BOOST MODE: Skip DCA on boosted positions
         # When a position is boosted (1.5x), it should NOT DCA
         # It maintains its boosted size until TP (half-close) or losing side recovers
@@ -2523,14 +2520,28 @@ class BinanceLiveTradingEngine:
         # Convert to ROI: ROI = price_change * leverage
         current_roi_loss = price_drawdown * leverage  # e.g., 0.5% price loss * 20 = 10% ROI loss
 
-        # Check if DCA level triggered (ROI-based) with PAIR-SPECIFIC VOLATILITY MULTIPLIER
-        level = DCA_CONFIG["levels"][position.dca_count]
-        base_trigger_roi = abs(level["trigger_roi"])  # e.g., 0.20 = 20% ROI loss
+        # Check if DCA level triggered (ROI-based) with PAIR-SPECIFIC settings
+        symbol_settings = SYMBOL_SETTINGS.get(symbol, {})
+
+        # Use symbol-specific DCA levels if available (e.g., BTC has custom tighter levels)
+        dca_levels = symbol_settings.get("dca_levels", DCA_CONFIG["levels"])
+
+        # Check we have enough levels defined
+        if position.dca_count >= len(dca_levels):
+            return
+
+        level = dca_levels[position.dca_count]
+        base_trigger_roi = abs(level["trigger_roi"])  # e.g., 0.30 = 30% ROI loss
 
         # Apply volatility multiplier for this symbol (wider triggers for volatile pairs)
-        symbol_settings = SYMBOL_SETTINGS.get(symbol, {})
-        volatility_mult = symbol_settings.get("dca_volatility_mult", 1.0)
-        trigger_roi = base_trigger_roi * volatility_mult  # e.g., 0.20 * 1.8 = 0.36 (36% ROI for DOT)
+        # NOTE: Only apply volatility_mult if NOT using custom dca_levels
+        if "dca_levels" in symbol_settings:
+            # Symbol has custom DCA levels, don't apply multiplier (already calibrated)
+            trigger_roi = base_trigger_roi
+        else:
+            # Use default levels with volatility multiplier
+            volatility_mult = symbol_settings.get("dca_volatility_mult", 1.0)
+            trigger_roi = base_trigger_roi * volatility_mult  # e.g., 0.30 * 1.5 = 0.45 (45% ROI)
 
         if current_roi_loss >= trigger_roi:
             # =================================================================

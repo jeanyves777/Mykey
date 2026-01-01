@@ -99,12 +99,12 @@ SYMBOL_SETTINGS = {
         "dca_volatility_mult": 1.0,   # Default - BTC is stable
         # ENHANCED BOOST - Tighter settings for BTC
         "tp_roi": 0.05,               # 5% TP (vs 8% default) - faster exits
-        "boost_trigger_dca": 2,       # Trigger boost at DCA 2 (vs 3 default) - earlier
-        "dca_levels": [               # Tighter DCA triggers for BTC
-            {"trigger_roi": -0.03, "multiplier": 1.50, "tp_roi": 0.04},   # L1: -3% ROI
-            {"trigger_roi": -0.10, "multiplier": 1.75, "tp_roi": 0.04},   # L2: -10% ROI
-            {"trigger_roi": -0.18, "multiplier": 2.00, "tp_roi": 0.03},   # L3: -18% ROI
-            {"trigger_roi": -0.25, "multiplier": 2.25, "tp_roi": 0.03},   # L4: -25% ROI
+        "boost_trigger_dca": 3,       # Trigger boost at DCA 3 (same as default)
+        "dca_levels": [               # STRICTER DCA triggers for BTC
+            {"trigger_roi": -0.03, "multiplier": 1.50, "tp_roi": 0.04},   # L1: -3% ROI (unchanged)
+            {"trigger_roi": -0.18, "multiplier": 1.75, "tp_roi": 0.04},   # L2: -18% ROI (was -10%) - STRICTER
+            {"trigger_roi": -0.28, "multiplier": 2.00, "tp_roi": 0.03},   # L3: -28% ROI (was -18%) - STRICTER (boost trigger)
+            {"trigger_roi": -0.40, "multiplier": 2.25, "tp_roi": 0.03},   # L4: -40% ROI (was -25%) - STRICTER
         ],
     },
     "ETHUSDT": {
@@ -124,7 +124,15 @@ SYMBOL_SETTINGS = {
         "price_precision": 2,
         "qty_precision": 2,
         "tick_size": 0.01,
-        "dca_volatility_mult": 1.2,   # 20% wider DCA triggers
+        # BNB is LESS volatile - needs TIGHTER DCA triggers (faster averaging)
+        "tp_roi": 0.08,               # 8% TP (default)
+        "boost_trigger_dca": 3,       # Boost at DCA 3
+        "dca_levels": [               # TIGHTER DCA for BNB (similar to old defaults)
+            {"trigger_roi": -0.05, "multiplier": 1.50, "tp_roi": 0.06},   # L1: -5% ROI
+            {"trigger_roi": -0.20, "multiplier": 1.75, "tp_roi": 0.06},   # L2: -20% ROI (old default)
+            {"trigger_roi": -0.30, "multiplier": 2.00, "tp_roi": 0.05},   # L3: -30% ROI (old default)
+            {"trigger_roi": -0.40, "multiplier": 2.25, "tp_roi": 0.04},   # L4: -40% ROI (old default)
+        ],
     },
     "SOLUSDT": {
         "min_qty": 0.1,
@@ -275,15 +283,18 @@ DCA_CONFIG = {
     "position_divisor": 4,          # Initial size = 25% of normal
 
     # DCA Levels: ROI-BASED triggers (for 20x leverage)
-    # L1: Reduced trigger (-5% ROI instead of -10%) for faster averaging
-    # L2-L4: Keep original triggers
+    # STRICTER DCA TRIGGERS to avoid over-averaging in volatile markets
+    # L1: -5% ROI (unchanged - fast first average)
+    # L2: -30% ROI (stricter - was -20%)
+    # L3: -45% ROI (stricter - was -30%, this is boost trigger)
+    # L4: -60% ROI (stricter - was -40%)
     "levels": [
-        {"trigger_roi": -0.05, "multiplier": 1.50, "tp_roi": 0.06},   # Level 1: -5% ROI (0.25% price drop) - REDUCED
-        {"trigger_roi": -0.20, "multiplier": 1.75, "tp_roi": 0.06},   # Level 2: -20% ROI (1% price drop)
-        {"trigger_roi": -0.30, "multiplier": 2.00, "tp_roi": 0.05},   # Level 3: -30% ROI (1.5% price drop)
-        {"trigger_roi": -0.40, "multiplier": 2.25, "tp_roi": 0.04},   # Level 4: -40% ROI (2% price drop)
+        {"trigger_roi": -0.05, "multiplier": 1.50, "tp_roi": 0.06},   # Level 1: -5% ROI (0.25% price drop) - unchanged
+        {"trigger_roi": -0.30, "multiplier": 1.75, "tp_roi": 0.06},   # Level 2: -30% ROI (1.5% price drop) - STRICTER
+        {"trigger_roi": -0.45, "multiplier": 2.00, "tp_roi": 0.05},   # Level 3: -45% ROI (2.25% price drop) - STRICTER (boost trigger)
+        {"trigger_roi": -0.60, "multiplier": 2.25, "tp_roi": 0.04},   # Level 4: -60% ROI (3% price drop) - STRICTER
     ],
-    # Note: L1 triggers faster at -5% ROI, all DCA TPs also smaller
+    # Note: Stricter DCA triggers = less over-averaging, survive bigger crashes
 
     "max_exposure_multiplier": 4.00,  # Max 4x normal position with all DCAs
     "sl_after_dca_roi": 0.90,         # 90% ROI SL from avg entry after DCA (same as initial - WIDE)
