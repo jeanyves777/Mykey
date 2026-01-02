@@ -7,15 +7,33 @@ import os
 
 os.chdir('/root/thevolumeainative/trading_system/Binance_Futures_Trading')
 
-# Find all trade journals
+# Find all trade journals and get only the LATEST one per symbol
 journals = glob.glob('trade_journal_*.csv')
+
+# Group by symbol and get the most recent file for each
+symbol_files = {}
+for journal in journals:
+    parts = journal.split('_')
+    if len(parts) >= 3:
+        symbol = parts[2]
+        # Get file modification time
+        mtime = os.path.getmtime(journal)
+        if symbol not in symbol_files or mtime > symbol_files[symbol][1]:
+            symbol_files[symbol] = (journal, mtime)
+
+# Use only the latest file per symbol
+latest_journals = [v[0] for v in symbol_files.values()]
+
 print('='*120)
 print('COMPREHENSIVE BACKTEST ANALYSIS - ALL SYMBOLS')
 print('='*120)
+print(f'Using latest CSV per symbol: {len(latest_journals)} files')
+for j in sorted(latest_journals):
+    print(f'  - {j}')
 
 all_trades = []
 
-for journal in sorted(journals):
+for journal in sorted(latest_journals):
     symbol = journal.split('_')[2]
     df = pd.read_csv(journal)
     df['symbol'] = symbol
