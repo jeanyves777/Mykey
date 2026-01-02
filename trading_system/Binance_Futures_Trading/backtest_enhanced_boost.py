@@ -1,23 +1,15 @@
 #!/usr/bin/env python3
 """
-Backtest Hedge + DCA + ENHANCED BOOST MODE Strategy v5
-=======================================================
-LIMITED DCA TEST - Only DCA 0 and DCA 1 (no DCA 2-4)
-Boost triggers at DCA 1 (-20% ROI)
+Backtest Hedge + NO DCA + BOOST MODE Strategy v6
+=================================================
+NO DCA TEST - Only initial entry (DCA 0), no averaging down
+DCA 0 made +$5,205 profit, DCA levels caused losses
 
-IMPROVEMENTS:
-1. Smart Boost at DCA 1 (-20% ROI trigger)
-2. Increased TP levels ONLY during boost mode
-3. STOP FOR THE DAY after SL hit - restart next day
-4. STRONG TREND MODE - Block ALL DCA on loser side when ADX > 40
-5. CSV trade journal export
-
-Enhanced Boost Mode with:
-1. At DCA 1 trigger (-20% ROI) -> Boost opposite side 1.5x
-2. When boosted side hits TP: Close HALF, lock profit, add back 0.5x
-3. Trailing stop activates AFTER each half-close cycle
-4. Continue until losing side recovers (TP) or hits SL
-5. After SL: STOP for the day, restart next day
+Strategy:
+- Initial entry only (NO DCA)
+- Boost mode at -20% ROI (boost opposite side 1.5x)
+- Strong trend mode blocks losing side
+- Stop for day after SL hit
 """
 
 import sys
@@ -47,21 +39,19 @@ class EnhancedBoostBacktester:
         self.sl_roi = DCA_CONFIG["stop_loss_roi"]    # 90% (same for all)
         self.budget_split = DCA_CONFIG["hedge_mode"]["budget_split"]  # 50%
 
-        # DCA LEVELS - LIMITED TO 1 ONLY (no DCA 2-4)
-        # Override any symbol-specific settings
-        self.dca_levels = [
-            {"trigger_roi": -0.20, "multiplier": 1.50, "tp_roi": 0.06},   # DCA 1: -20% ROI trigger
-        ]
+        # NO DCA - Empty list means no DCA levels at all
+        self.dca_levels = []  # NO DCA - only initial entry
 
-        # DCA budget allocation percentages (only 2 entries needed: initial + DCA1)
+        # Budget allocation - 100% for initial entry (no DCA)
         self.dca_pcts = [
-            0.40,  # 40% for initial entry (larger since fewer DCA levels)
-            0.60,  # 60% for DCA level 1
+            1.00,  # 100% for initial entry (no DCA levels)
         ]
 
-        # ENHANCED BOOST PARAMETERS - BOOST AT DCA 1 (only 1 DCA level now)
+        # BOOST MODE - Triggers at -20% ROI (even without DCA)
+        # When position hits -20% ROI, boost opposite side 1.5x
         self.boost_multiplier = 1.5  # 1.5x boost
-        self.boost_trigger_dca_level = 1  # DCA 1 trigger (at -20% ROI)
+        self.boost_trigger_roi = -0.20  # Trigger boost at -20% ROI (no DCA needed)
+        self.boost_trigger_dca_level = 999  # Disabled - we use ROI trigger instead
         self.boost_tp_multiplier = 1.5  # Increase TP by 50% during boost mode
         self.trailing_activation_roi = 0.02  # Start trailing after 2% ROI profit
         self.trailing_distance_roi = 0.03    # Trail 3% behind peak
@@ -891,27 +881,17 @@ class EnhancedBoostBacktester:
                         self.long_position = self.open_position("LONG", close)
                         continue
 
-                # Check DCA - BUT NOT if this side is boosted!
-                # Also block DCA 2+ on loser side during strong trend (LONG is loser in DOWN trend)
-                elif self.check_dca_trigger(self.long_position, close):
-                    current_dca_level = self.long_position["dca_level"]
-
-                    # Skip DCA if this side is boosted
-                    if self.boost_mode_active and self.boosted_side == "LONG":
-                        pass  # No DCA on boosted side!
-                    # STRONG TREND MODE: Block ALL DCA on loser side (LONG is loser in DOWN trend)
-                    elif self.strong_trend_mode and self.trend_direction == "DOWN" and current_dca_level >= 0:
-                        print(f"[{timestamp}] LONG DCA {current_dca_level + 1} BLOCKED - Strong DOWN trend (ADX: {self.current_adx:.1f})")
-                    else:
-                        old_level = self.long_position["dca_level"]
-                        old_entry = self.long_position["entry_price"]
-                        self.long_position = self.execute_dca(self.long_position, close)
-                        new_level = self.long_position["dca_level"]
-                        print(f"[{timestamp}] LONG DCA {new_level} @ ${close:.4f} | Avg: ${old_entry:.4f} -> ${self.long_position['entry_price']:.4f}")
-
-                        # Check if DCA 3 triggered - activate boost mode
-                        if new_level == self.boost_trigger_dca_level and not self.boost_mode_active:
+                # NO DCA MODE - Check ROI-based boost trigger instead
+                # Activate boost when position hits -20% ROI
+                else:
+                    long_roi = self.calculate_roi(self.long_position["entry_price"], close, "LONG")
+                    if long_roi <= self.boost_trigger_roi and not self.boost_mode_active:
+                        # STRONG TREND MODE: Don't boost if this is the loser side in a strong trend
+                        if self.strong_trend_mode and self.trend_direction == "DOWN":
+                            pass  # Don't activate boost on loser side during strong trend
+                        else:
                             self.activate_boost_mode("LONG", timestamp)
+                            print(f"[{timestamp}] >>> BOOST TRIGGERED! LONG at {long_roi*100:.1f}% ROI -> SHORT boosted 1.5x")
                             # Boost the SHORT position (1.5x)
                             if self.short_position:
                                 old_margin = self.short_position["margin"]
@@ -1057,26 +1037,17 @@ class EnhancedBoostBacktester:
                         continue
 
                 # Check DCA - BUT NOT if this side is boosted!
-                # Also block DCA 2+ on loser side during strong trend (SHORT is loser in UP trend)
-                elif self.check_dca_trigger(self.short_position, close):
-                    current_dca_level = self.short_position["dca_level"]
-
-                    # Skip DCA if this side is boosted
-                    if self.boost_mode_active and self.boosted_side == "SHORT":
-                        pass  # No DCA on boosted side!
-                    # STRONG TREND MODE: Block ALL DCA on loser side (SHORT is loser in UP trend)
-                    elif self.strong_trend_mode and self.trend_direction == "UP" and current_dca_level >= 0:
-                        print(f"[{timestamp}] SHORT DCA {current_dca_level + 1} BLOCKED - Strong UP trend (ADX: {self.current_adx:.1f})")
-                    else:
-                        old_level = self.short_position["dca_level"]
-                        old_entry = self.short_position["entry_price"]
-                        self.short_position = self.execute_dca(self.short_position, close)
-                        new_level = self.short_position["dca_level"]
-                        print(f"[{timestamp}] SHORT DCA {new_level} @ ${close:.4f} | Avg: ${old_entry:.4f} -> ${self.short_position['entry_price']:.4f}")
-
-                        # Check if DCA 3 triggered - activate boost mode
-                        if new_level == self.boost_trigger_dca_level and not self.boost_mode_active:
+                # NO DCA MODE - Check ROI-based boost trigger instead
+                # Activate boost when position hits -20% ROI
+                else:
+                    short_roi = self.calculate_roi(self.short_position["entry_price"], close, "SHORT")
+                    if short_roi <= self.boost_trigger_roi and not self.boost_mode_active:
+                        # STRONG TREND MODE: Don't boost if this is the loser side in a strong trend
+                        if self.strong_trend_mode and self.trend_direction == "UP":
+                            pass  # Don't activate boost on loser side during strong trend
+                        else:
                             self.activate_boost_mode("SHORT", timestamp)
+                            print(f"[{timestamp}] >>> BOOST TRIGGERED! SHORT at {short_roi*100:.1f}% ROI -> LONG boosted 1.5x")
                             # Boost the LONG position (1.5x)
                             if self.long_position:
                                 old_margin = self.long_position["margin"]
