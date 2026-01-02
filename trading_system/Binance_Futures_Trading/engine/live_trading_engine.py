@@ -4248,6 +4248,17 @@ class BinanceLiveTradingEngine:
                     trailing_active = False
                     self.log(f"  [STATE] {position_key}: No saved state, estimated DCA={dca_level}/4")
 
+                # ================================================================
+                # FIX: Cross-reference global boost_state with position
+                # If boost_state says this symbol+side should be boosted, apply it
+                # ================================================================
+                if self.boost_mode_active.get(symbol, False):
+                    boosted_side_for_symbol = self.boosted_side.get(symbol, None)
+                    if boosted_side_for_symbol == position_side and not is_boosted:
+                        is_boosted = True
+                        boost_multiplier = self.boost_multiplier
+                        self.log(f"  [BOOST FIX] {position_key}: Applied boost from global state (was missing)")
+
                 # Create local position object
                 self.positions[position_key] = LivePosition(
                     symbol=symbol,
