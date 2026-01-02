@@ -824,7 +824,11 @@ class BinanceLiveTradingEngine:
             return True, "DOWN"
 
     def activate_strong_trend_mode(self, symbol: str, direction: str):
-        """Activate strong trend mode for a symbol."""
+        """
+        Activate strong trend mode for a symbol.
+        - Block ALL DCA on loser side
+        - BOOST winner side by 2x (add 1x to current position)
+        """
         if self.boost_mode_active.get(symbol, False):
             self.log(f"[STRONG TREND] {symbol}: NOT activating - Boost Mode already active", level="INFO")
             return False
@@ -836,10 +840,58 @@ class BinanceLiveTradingEngine:
         self.strong_trend_direction[symbol] = direction
 
         adx = self.current_adx.get(symbol, 0)
+        winner_side = "LONG" if direction == "UP" else "SHORT"
+        loser_side = "SHORT" if direction == "UP" else "LONG"
+
         self.log(f"[STRONG TREND] >>> {symbol} ACTIVATED! Direction: {direction} | ADX: {adx:.1f}")
-        winner = "LONG" if direction == "UP" else "SHORT"
-        loser = "SHORT" if direction == "UP" else "LONG"
-        self.log(f"[STRONG TREND]     Winner ({winner}): 2x boost | Loser ({loser}): ALL DCA BLOCKED")
+        self.log(f"[STRONG TREND]     Winner ({winner_side}): 2x boost | Loser ({loser_side}): ALL DCA BLOCKED")
+
+        # ================================================================
+        # ACTUALLY BOOST THE WINNER SIDE: Add 1x to make it 2x total
+        # This is the key feature - don't just log, actually increase position!
+        # ================================================================
+        winner_key = self.get_position_key(symbol, winner_side)
+        winner_pos = self.positions.get(winner_key)
+
+        if winner_pos and winner_pos.quantity > 0:
+            # Already boosted for this trend? (Prevent double-boost)
+            if self.trend_boosted_side.get(symbol) == winner_side:
+                self.log(f"[STRONG TREND]     {winner_side} already boosted, skipping")
+                return True
+
+            try:
+                boost_add_qty = winner_pos.quantity * 1.0  # Add 100% to make 2x
+
+                # Round quantity to symbol precision
+                symbol_config = SYMBOL_SETTINGS.get(symbol, {})
+                qty_precision = symbol_config.get("qty_precision", 1)
+                boost_add_qty = round(boost_add_qty, qty_precision)
+
+                if boost_add_qty > 0:
+                    # Place market order to add to the winner position
+                    order_side = "BUY" if winner_side == "LONG" else "SELL"
+                    self.log(f"[STRONG TREND]     Adding {boost_add_qty} to {winner_side} position (2x trend boost)")
+
+                    boost_order = self.client.place_market_order(
+                        symbol,
+                        order_side,
+                        boost_add_qty,
+                        position_side=winner_side
+                    )
+
+                    if "orderId" in boost_order:
+                        # Update position quantity
+                        winner_pos.quantity += boost_add_qty
+                        self.trend_boosted_side[symbol] = winner_side
+                        self.log(f"[STRONG TREND]     SUCCESS: {winner_side} now has {winner_pos.quantity} qty (2x trend boost)")
+                        # SAVE STATE after trend boost
+                        self._save_position_state()
+                    else:
+                        self.log(f"[STRONG TREND]     WARNING: Failed to add trend boost qty: {boost_order}", level="WARN")
+            except Exception as e:
+                self.log(f"[STRONG TREND]     ERROR adding trend boost position: {e}", level="ERROR")
+        else:
+            self.log(f"[STRONG TREND]     No {winner_side} position to boost (will boost on next entry)")
 
         return True
 
@@ -937,7 +989,122 @@ class BinanceLiveTradingEngine:
     def _get_boost_trigger_level(self, symbol: str) -> int:
         """Get the DCA level that triggers boost mode for this symbol."""
         symbol_config = SYMBOL_SETTINGS.get(symbol, {})
-        return symbol_config.get("boost_trigger_dca", 3)  # Default: DCA 3
+        return symbol_config.get("boost_trigger_dca", 3)  # Default: DCA 3 (legacy, now ROI-based)
+
+    def _get_boost_trigger_roi(self, symbol: str) -> float:
+        """Get the ROI threshold that triggers boost mode. Default: -20%"""
+        symbol_config = SYMBOL_SETTINGS.get(symbol, {})
+        return symbol_config.get("boost_trigger_roi", 0.20)  # Default: 20% loss = -20% ROI
+
+    def _check_roi_boost_activation(self, symbol: str, current_price: float):
+        """
+        ROI-BASED BOOST ACTIVATION (replaces DCA level-based)
+        When one side's ROI drops below -20%, boost the opposite side.
+        This triggers EARLIER than waiting for DCA 3 (-45%).
+        """
+        if not self.hedge_mode:
+            return  # Boost only works in hedge mode
+
+        # Already in boost mode for this symbol?
+        if self.boost_mode_active.get(symbol, False):
+            return
+
+        # Get both positions
+        long_key = self.get_position_key(symbol, "LONG")
+        short_key = self.get_position_key(symbol, "SHORT")
+        long_pos = self.positions.get(long_key)
+        short_pos = self.positions.get(short_key)
+
+        # Need both positions for boost mode
+        if not long_pos or not short_pos:
+            return
+
+        # Get ROI trigger threshold
+        roi_trigger = self._get_boost_trigger_roi(symbol)  # Default 0.20 = -20%
+
+        # Calculate ROI for both positions
+        leverage = STRATEGY_CONFIG.get("leverage", 20)
+
+        # LONG ROI
+        long_roi = 0
+        if long_pos.avg_entry_price > 0 and long_pos.margin_used > 0:
+            long_pnl = (current_price - long_pos.avg_entry_price) * long_pos.quantity
+            long_roi = long_pnl / long_pos.margin_used  # Positive = profit, Negative = loss
+
+        # SHORT ROI
+        short_roi = 0
+        if short_pos.avg_entry_price > 0 and short_pos.margin_used > 0:
+            short_pnl = (short_pos.avg_entry_price - current_price) * short_pos.quantity
+            short_roi = short_pnl / short_pos.margin_used
+
+        # Check if either side hit the trigger (ROI below -20%)
+        trigger_side = None
+        boost_side = None
+
+        if long_roi <= -roi_trigger:  # LONG at -20% or worse
+            trigger_side = "LONG"
+            boost_side = "SHORT"
+            self.log(f"[BOOST ROI] {symbol}: LONG ROI {long_roi*100:.1f}% <= -{roi_trigger*100:.0f}% TRIGGER")
+        elif short_roi <= -roi_trigger:  # SHORT at -20% or worse
+            trigger_side = "SHORT"
+            boost_side = "LONG"
+            self.log(f"[BOOST ROI] {symbol}: SHORT ROI {short_roi*100:.1f}% <= -{roi_trigger*100:.0f}% TRIGGER")
+
+        if not trigger_side:
+            return  # Neither side hit trigger
+
+        # IMPORTANT: Deactivate Strong Trend Mode when activating Boost Mode
+        if self.strong_trend_mode.get(symbol, False):
+            self.deactivate_strong_trend_mode(symbol, "Boost Mode taking over (ROI trigger)")
+
+        # Get the position to boost
+        boost_pos = long_pos if boost_side == "LONG" else short_pos
+
+        # ACTIVATE BOOST MODE
+        self.boost_mode_active[symbol] = True
+        self.boosted_side[symbol] = boost_side
+        self.boost_trigger_side[symbol] = trigger_side
+        self.boost_locked_profit[symbol] = 0.0
+        self.boost_cycle_count[symbol] = 0
+
+        # Mark the boosted position
+        boost_pos.is_boosted = True
+        boost_pos.boost_multiplier = self.boost_multiplier
+
+        self.log(f">>> [BOOST] {symbol}: ACTIVATED! {trigger_side} hit -{roi_trigger*100:.0f}% ROI -> {boost_side} now BOOSTED 1.5x")
+        self.log(f"    [BOOST] Logic: At TP -> Close HALF, lock profit, add 0.5x, trailing starts")
+
+        # ACTUALLY BOOST THE POSITION: Add 0.5x more to make it 1.5x total
+        try:
+            boost_add_qty = boost_pos.quantity * 0.5  # Add 50% to make 1.5x
+
+            # Round quantity to symbol precision
+            symbol_config = SYMBOL_SETTINGS.get(symbol, {})
+            qty_precision = symbol_config.get("qty_precision", 1)
+            boost_add_qty = round(boost_add_qty, qty_precision)
+
+            if boost_add_qty > 0:
+                # Place market order to add to the boosted position
+                order_side = "SELL" if boost_side == "SHORT" else "BUY"
+                self.log(f"    [BOOST] Adding {boost_add_qty} to {boost_side} position (0.5x boost)")
+
+                boost_order = self.client.place_market_order(
+                    symbol,
+                    order_side,
+                    boost_add_qty,
+                    position_side=boost_side
+                )
+
+                if "orderId" in boost_order:
+                    # Update position quantity
+                    boost_pos.quantity += boost_add_qty
+                    self.log(f"    [BOOST] SUCCESS: {boost_side} now has {boost_pos.quantity} qty (1.5x)")
+                    # SAVE STATE after boost activation
+                    self._save_position_state()
+                else:
+                    self.log(f"    [BOOST] WARNING: Failed to add boost qty: {boost_order}", level="WARN")
+        except Exception as e:
+            self.log(f"    [BOOST] ERROR adding boost position: {e}", level="ERROR")
 
     def _check_boost_activation(self, symbol: str, position: LivePosition, dca_level: int):
         """
@@ -3160,12 +3327,21 @@ class BinanceLiveTradingEngine:
 
 
         # Check each position
+        roi_boost_checked = set()  # Track symbols we've already checked for ROI boost
         for position_key, position in list(self.positions.items()):
             try:
                 # Extract actual symbol from key (handles both 'DOTUSDT' and 'DOTUSDT_LONG')
                 symbol = self.get_symbol_from_key(position_key)
                 price_data = self.client.get_current_price(symbol)
                 current_price = price_data["price"]
+
+                # ================================================================
+                # ROI-BASED BOOST: Check if any side hit -20% ROI (once per symbol)
+                # This triggers EARLIER than DCA 3 for faster hedge recovery
+                # ================================================================
+                if self.hedge_mode and symbol not in roi_boost_checked:
+                    roi_boost_checked.add(symbol)
+                    self._check_roi_boost_activation(symbol, current_price)
 
                 # ================================================================
                 # HEDGE MANAGEMENT: Check if position is waiting for breakeven
