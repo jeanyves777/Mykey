@@ -47,8 +47,6 @@ class LivePosition:
     hedge_side: Optional[str] = None  # Side of hedge position ("LONG" or "SHORT")
     waiting_for_breakeven: bool = False  # True if waiting to exit at breakeven
     hedge_start_time: Optional[datetime] = None  # When hedge was opened
-    # Stop for day trailing close
-    trailing_for_close: bool = False  # True when marked for trailing close after other side SL
     # ENHANCED BOOST MODE tracking
     is_boosted: bool = False       # True if this position is boosted (1.5x)
     boost_multiplier: float = 1.0  # Current boost multiplier (1.0 = normal, 1.5 = boosted)
@@ -103,6 +101,17 @@ class BinanceLiveTradingEngine:
         self.daily_pnl = 0.0
         self.daily_wins = 0
         self.daily_losses = 0
+        
+        # Per-symbol trade statistics
+        self.symbol_stats: Dict[str, Dict] = {}  # symbol -> {wins, losses, tp_count, sl_count, pnl}
+        for symbol in self.symbols:
+            self.symbol_stats[symbol] = {
+                "wins": 0,
+                "losses": 0,
+                "tp_count": 0,
+                "sl_count": 0,
+                "pnl": 0.0
+            }
         self.starting_balance = 0.0
         self.daily_start_balance = 0.0  # Balance at start of day (for daily loss limit)
         self.last_reset_date = datetime.now().date()
@@ -136,6 +145,16 @@ class BinanceLiveTradingEngine:
         self.boost_locked_profit: Dict[str, float] = {}   # symbol -> profit locked from half-closes
         self.boost_cycle_count: Dict[str, int] = {}       # symbol -> number of half-close cycles
         self.boost_multiplier = 1.5                       # 1.5x boost
+        # STRONG TREND MODE - ADX-based trend detection for DCA blocking
+        # When ADX > 40, block DCA 2+ on loser side and 2x boost winner side
+        # MUTUALLY EXCLUSIVE with Boost Mode (Boost Mode takes priority)
+        self.strong_trend_mode: Dict[str, bool] = {}       # symbol -> True if strong trend active
+        self.strong_trend_direction: Dict[str, str] = {}   # symbol -> "UP" or "DOWN"
+        self.adx_threshold = 40                            # ADX > 40 = strong trend
+        self.current_adx: Dict[str, float] = {}            # symbol -> current ADX value
+        self.current_plus_di: Dict[str, float] = {}        # symbol -> current +DI value
+        self.current_minus_di: Dict[str, float] = {}       # symbol -> current -DI value
+        self.trend_boosted_side: Dict[str, str] = {}       # symbol -> side that got 2x trend boost
 
         # STOP FOR DAY - After SL hit, stop trading that symbol until next day
         self.stopped_for_day: Dict[str, bool] = {}        # symbol -> True if stopped for the day
@@ -177,6 +196,10 @@ class BinanceLiveTradingEngine:
         self.trades = []
 
         self.running = False
+
+        # Order cleanup tracking
+        self.last_order_cleanup: datetime = datetime.now()
+        self.order_cleanup_interval = 300  # Clean up orphaned orders every 5 minutes
 
     def log(self, message: str, level: str = "INFO"):
         """Print log message with timestamp"""
@@ -239,17 +262,57 @@ class BinanceLiveTradingEngine:
     # =========================================================================
 
     def _load_reserve_fund(self):
-        """Load reserve fund state from file"""
+        """
+        Load reserve fund state from file.
+        IMPORTANT: On startup, sync trading_capital with ACTUAL Binance balance
+        to prevent sizing based on outdated/wrong capital.
+        """
         try:
+            # FIRST: Get ACTUAL balance from Binance
+            actual_balance = self.client.get_balance()
+
             if os.path.exists(self.reserve_file):
                 with open(self.reserve_file, 'r') as f:
                     data = json.load(f)
                     self.reserve_fund = data.get("reserve_fund", 0.0)
                     self.total_realized_profit = data.get("total_realized_profit", 0.0)
-                    self.trading_capital = data.get("trading_capital", self.initial_capital)
-                    self.log(f"[SMART COMPOUND] Loaded: Trading=${self.trading_capital:.2f} | Reserve=${self.reserve_fund:.2f}")
+                    saved_trading_capital = data.get("trading_capital", self.initial_capital)
+                    saved_initial = data.get("initial_capital", self.initial_capital)
+
+                    # CHECK: If actual balance is significantly different from saved capital,
+                    # reset to actual balance (prevents sizing based on wrong capital)
+                    capital_diff = abs(actual_balance - saved_trading_capital)
+
+                    if capital_diff > 10:  # More than $10 difference = reset to actual
+                        self.log(f"[SMART COMPOUND] WARNING: Saved capital ${saved_trading_capital:.2f} differs from actual ${actual_balance:.2f}")
+                        self.log(f"[SMART COMPOUND] RESETTING to actual balance ${actual_balance:.2f}")
+                        self.trading_capital = actual_balance
+                        self.initial_capital = actual_balance
+                        self.reserve_fund = 0.0
+                        self.total_realized_profit = 0.0
+                        self._save_reserve_fund()  # Save the reset state
+                    else:
+                        # Normal load - use saved values
+                        self.trading_capital = saved_trading_capital
+                        self.log(f"[SMART COMPOUND] Loaded: Trading=${self.trading_capital:.2f} | Reserve=${self.reserve_fund:.2f}")
+            else:
+                # No saved file - initialize from actual balance
+                self.log(f"[SMART COMPOUND] No saved state - initializing from actual balance ${actual_balance:.2f}")
+                self.trading_capital = actual_balance
+                self.initial_capital = actual_balance
+                self._save_reserve_fund()
+
         except Exception as e:
             self.log(f"[SMART COMPOUND] Error loading reserve fund: {e}", level="WARN")
+            # Fallback to actual balance on error
+            try:
+                actual_balance = self.client.get_balance()
+                self.trading_capital = actual_balance
+                self.initial_capital = actual_balance
+                self.log(f"[SMART COMPOUND] Fallback: Using actual balance ${actual_balance:.2f}")
+            except:
+                pass
+
 
     def _save_reserve_fund(self):
         """Save reserve fund state to file"""
@@ -656,6 +719,221 @@ class BinanceLiveTradingEngine:
     # Trailing activates AFTER each half-close cycle
     # Continue until losing side recovers (TP) or hits SL
 
+
+    # =========================================================================
+    # STRONG TREND MODE - ADX-BASED TREND DETECTION
+    # =========================================================================
+    # When ADX > 40, we're in a strong trend:
+    # - Winner side (LONG in UP, SHORT in DOWN): Gets 2x entry boost
+    # - Loser side (SHORT in UP, LONG in DOWN): DCA 2+ is BLOCKED
+    # This prevents adding to losing positions in strong trending markets
+
+    def calculate_adx_for_symbol(self, symbol: str, df=None) -> tuple:
+        """
+        Calculate ADX (Average Directional Index) for a symbol.
+        Returns: (adx, plus_di, minus_di)
+        """
+        try:
+            # Get market data if not provided
+            if df is None:
+                if symbol in self.data_buffer and self.data_buffer[symbol] is not None:
+                    if isinstance(self.data_buffer[symbol], dict):
+                        df = self.data_buffer[symbol].get("1m")
+                    else:
+                        df = self.data_buffer[symbol]
+
+                if df is None:
+                    market_data = self.client.get_market_data(symbol)
+                    if market_data and "1m" in market_data:
+                        df = market_data["1m"]
+
+            if df is None or len(df) < 28:
+                return 0.0, 0.0, 0.0
+
+            period = 14
+            high = df['high'].astype(float)
+            low = df['low'].astype(float)
+            close = df['close'].astype(float)
+
+            # Calculate True Range
+            tr1 = high - low
+            tr2 = abs(high - close.shift(1))
+            tr3 = abs(low - close.shift(1))
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+            # Calculate +DM and -DM
+            plus_dm = high.diff()
+            minus_dm = -low.diff()
+
+            plus_dm[plus_dm < 0] = 0
+            minus_dm[minus_dm < 0] = 0
+
+            # When +DM > -DM, -DM = 0 and vice versa
+            plus_dm_copy = plus_dm.copy()
+            minus_dm_copy = minus_dm.copy()
+            plus_dm_copy[(plus_dm < minus_dm)] = 0
+            minus_dm_copy[(minus_dm < plus_dm)] = 0
+            plus_dm = plus_dm_copy
+            minus_dm = minus_dm_copy
+
+            # Smoothed TR, +DM, -DM using Wilder's smoothing
+            atr = tr.ewm(alpha=1/period, min_periods=period).mean()
+            plus_dm_smooth = plus_dm.ewm(alpha=1/period, min_periods=period).mean()
+            minus_dm_smooth = minus_dm.ewm(alpha=1/period, min_periods=period).mean()
+
+            # Calculate +DI and -DI
+            plus_di = 100 * plus_dm_smooth / atr
+            minus_di = 100 * minus_dm_smooth / atr
+
+            # Calculate DX
+            di_sum = plus_di + minus_di
+            di_sum = di_sum.replace(0, 0.0001)  # Avoid division by zero
+            dx = 100 * abs(plus_di - minus_di) / di_sum
+
+            # Calculate ADX (smoothed DX)
+            adx = dx.ewm(alpha=1/period, min_periods=period).mean()
+
+            # Return latest values
+            adx_val = float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else 0.0
+            plus_di_val = float(plus_di.iloc[-1]) if not pd.isna(plus_di.iloc[-1]) else 0.0
+            minus_di_val = float(minus_di.iloc[-1]) if not pd.isna(minus_di.iloc[-1]) else 0.0
+
+            return adx_val, plus_di_val, minus_di_val
+
+        except Exception as e:
+            self.log(f"[STRONG TREND] ADX calculation error for {symbol}: {e}", level="WARN")
+            return 0.0, 0.0, 0.0
+
+    def check_strong_trend_mode(self, symbol: str) -> tuple:
+        """
+        Check if we're in a strong trend based on ADX.
+        Returns: (is_strong_trend, trend_direction)
+        """
+        adx, plus_di, minus_di = self.calculate_adx_for_symbol(symbol)
+
+        self.current_adx[symbol] = adx
+        self.current_plus_di[symbol] = plus_di
+        self.current_minus_di[symbol] = minus_di
+
+        if adx < self.adx_threshold:
+            return False, None
+
+        if plus_di > minus_di:
+            return True, "UP"
+        else:
+            return True, "DOWN"
+
+    def activate_strong_trend_mode(self, symbol: str, direction: str):
+        """Activate strong trend mode for a symbol."""
+        if self.boost_mode_active.get(symbol, False):
+            self.log(f"[STRONG TREND] {symbol}: NOT activating - Boost Mode already active", level="INFO")
+            return False
+
+        if self.strong_trend_mode.get(symbol, False):
+            return False
+
+        self.strong_trend_mode[symbol] = True
+        self.strong_trend_direction[symbol] = direction
+
+        adx = self.current_adx.get(symbol, 0)
+        self.log(f"[STRONG TREND] >>> {symbol} ACTIVATED! Direction: {direction} | ADX: {adx:.1f}")
+        winner = "LONG" if direction == "UP" else "SHORT"
+        loser = "SHORT" if direction == "UP" else "LONG"
+        self.log(f"[STRONG TREND]     Winner ({winner}): 2x boost | Loser ({loser}): ALL DCA BLOCKED")
+
+        return True
+
+    def deactivate_strong_trend_mode(self, symbol: str, reason: str):
+        """Deactivate strong trend mode for a symbol."""
+        if not self.strong_trend_mode.get(symbol, False):
+            return
+
+        self.log(f"[STRONG TREND] >>> {symbol} ENDED - {reason}")
+        self.strong_trend_mode[symbol] = False
+        self.strong_trend_direction[symbol] = None
+        self.trend_boosted_side[symbol] = None
+
+    def is_dca_blocked_by_strong_trend(self, symbol: str, position_side: str, dca_level: int) -> tuple:
+        """
+        Check if DCA should be blocked due to Strong Trend Mode.
+        ALL DCA is blocked on the LOSER side during strong trends (ADX > 40).
+        Returns: (is_blocked, reason)
+        """
+        # First check if strong trend mode is active
+        if not self.strong_trend_mode.get(symbol, False):
+            return False, None
+
+        direction = self.strong_trend_direction.get(symbol)
+        if not direction:
+            return False, None
+
+        # Determine loser side based on trend direction
+        loser_side = "SHORT" if direction == "UP" else "LONG"
+
+        # Block ALL DCA on loser side (regardless of DCA level)
+        if position_side == loser_side:
+            adx = self.current_adx.get(symbol, 0)
+            reason = f"Strong {direction} trend (ADX: {adx:.1f}) - ALL DCA blocked on {position_side} (loser side)"
+            return True, reason
+
+        return False, None
+
+    def cleanup_orphaned_orders(self):
+        """
+        Clean up orphaned/stale orders that don't match current positions.
+        Runs periodically to catch orders that weren't cancelled properly.
+        """
+        try:
+            for symbol in self.symbols:
+                open_orders = self.client.get_open_orders(symbol)
+                if not open_orders:
+                    continue
+
+                long_key = f"{symbol}_LONG"
+                short_key = f"{symbol}_SHORT"
+                long_pos = self.positions.get(long_key)
+                short_pos = self.positions.get(short_key)
+
+                for order in open_orders:
+                    order_id = order.get("orderId")
+                    order_position_side = order.get("positionSide", "BOTH")
+                    order_type = order.get("type", "")
+
+                    is_orphaned = False
+
+                    if self.hedge_mode:
+                        if order_position_side == "LONG":
+                            if not long_pos:
+                                is_orphaned = True
+                                self.log(f"[CLEANUP] Found orphaned LONG order for {symbol}: {order_type} #{order_id}")
+                            elif long_pos.stop_loss_order_id != order_id and long_pos.take_profit_order_id != order_id:
+                                is_orphaned = True
+                                self.log(f"[CLEANUP] Found untracked LONG order for {symbol}: {order_type} #{order_id}")
+                        elif order_position_side == "SHORT":
+                            if not short_pos:
+                                is_orphaned = True
+                                self.log(f"[CLEANUP] Found orphaned SHORT order for {symbol}: {order_type} #{order_id}")
+                            elif short_pos.stop_loss_order_id != order_id and short_pos.take_profit_order_id != order_id:
+                                is_orphaned = True
+                                self.log(f"[CLEANUP] Found untracked SHORT order for {symbol}: {order_type} #{order_id}")
+                    else:
+                        pos = self.positions.get(symbol)
+                        if not pos:
+                            is_orphaned = True
+                            self.log(f"[CLEANUP] Found orphaned order for {symbol}: {order_type} #{order_id}")
+
+                    if is_orphaned:
+                        try:
+                            is_algo = order_type in ["TAKE_PROFIT_MARKET", "STOP_MARKET", "TRAILING_STOP_MARKET"]
+                            self.client.cancel_order(symbol, order_id, is_algo_order=is_algo)
+                            self.log(f"[CLEANUP] Cancelled orphaned order #{order_id} for {symbol}")
+                        except Exception as e:
+                            self.log(f"[CLEANUP] Could not cancel order #{order_id}: {e}", level="WARN")
+
+        except Exception as e:
+            self.log(f"[CLEANUP] Error during order cleanup: {e}", level="WARN")
+
+
     def _get_boost_trigger_level(self, symbol: str) -> int:
         """Get the DCA level that triggers boost mode for this symbol."""
         symbol_config = SYMBOL_SETTINGS.get(symbol, {})
@@ -672,6 +950,11 @@ class BinanceLiveTradingEngine:
         # Already in boost mode for this symbol?
         if self.boost_mode_active.get(symbol, False):
             return
+
+        # IMPORTANT: Deactivate Strong Trend Mode when activating Boost Mode
+        # These two should NEVER be active together - Boost Mode takes priority
+        if self.strong_trend_mode.get(symbol, False):
+            self.deactivate_strong_trend_mode(symbol, "Boost Mode taking over")
 
         # Check if this DCA level triggers boost
         boost_trigger = self._get_boost_trigger_level(symbol)
@@ -784,133 +1067,82 @@ class BinanceLiveTradingEngine:
             # (e.g., SHORT boosted hit SL because price went UP, so LONG should be recovering)
             self._deactivate_boost_mode(symbol, f"{boosted_side} SL (trigger side recovering)")
 
-    def _stop_for_day(self, symbol: str, sl_side: str = None):
+    def _stop_for_day(self, symbol: str):
         """
-        After SL hit on one side:
-        - Keep the WINNING side open with trailing stop
-        - Only fully stop when winning side closes via trailing
-        - Then restart both sides next day
-
-        Args:
-            symbol: The trading pair
-            sl_side: The side that hit SL ("LONG" or "SHORT")
+        STOP TRADING THIS SYMBOL FOR THE DAY after SL hit.
+        Close remaining position and don't re-enter until next day.
         """
-        self.log(f">>> [STOP FOR DAY] {symbol}: {sl_side} hit SL", level="TRADE")
+        self.stopped_for_day[symbol] = True
+        self.sl_hit_date[symbol] = datetime.now()
 
-        # Determine winning side (opposite of SL side)
-        winning_side = "SHORT" if sl_side == "LONG" else "LONG"
-        winning_pos_key = f"{symbol}_{winning_side}"
-        winning_pos = self.positions.get(winning_pos_key)
+        self.log(f">>> [STOP FOR DAY] {symbol}: SL hit - STOPPING trading until tomorrow", level="TRADE")
 
-        # Get current price
-        try:
-            price_data = self.client.get_current_price(symbol)
-            current_price = price_data["price"]
-        except Exception as e:
-            self.log(f"    [STOP DAY] Error getting price: {e}", level="ERROR")
-            current_price = None
+        # Close the OTHER side position if exists
+        opposite_positions_to_close = []
+        for pos_key, position in list(self.positions.items()):
+            if position.symbol == symbol:
+                opposite_positions_to_close.append((pos_key, position))
 
-        # Check if winning side is profitable
-        if winning_pos and current_price:
-            if winning_side == "LONG":
-                unrealized_pnl = (current_price - winning_pos.avg_entry_price) * winning_pos.quantity
-                roi = (current_price - winning_pos.avg_entry_price) / winning_pos.avg_entry_price * self.leverage
-            else:
-                unrealized_pnl = (winning_pos.avg_entry_price - current_price) * winning_pos.quantity
-                roi = (winning_pos.avg_entry_price - current_price) / winning_pos.avg_entry_price * self.leverage
-
-            if unrealized_pnl > 0:
-                # Winning side is profitable - mark for trailing close, don't stop for day yet
-                winning_pos.trailing_for_close = True
-                self.trailing_active[symbol] = True
-                self.boosted_peak_roi[symbol] = roi
-
-                self.log(f"    [STOP DAY] {winning_side} is PROFITABLE (${unrealized_pnl:+.2f}, {roi*100:.1f}% ROI)", level="TRADE")
-                self.log(f"    [STOP DAY] Activating TRAILING STOP on {winning_side} - will close via trailing", level="TRADE")
-                self.log(f"    [STOP DAY] After trailing close, will restart both sides", level="TRADE")
-
-                # DON'T set stopped_for_day yet - let trailing run
-                # The trailing close handler will set it when done
-                return
-
-            else:
-                # Winning side not profitable - close it too
-                self.log(f"    [STOP DAY] {winning_side} not profitable (${unrealized_pnl:+.2f}) - closing", level="TRADE")
-                self._close_position_for_stop_day(winning_pos_key, winning_pos, current_price)
-
-        # If we get here, close all remaining positions and stop for day
-        self._finalize_stop_for_day(symbol)
-
-    def _close_position_for_stop_day(self, pos_key: str, position, current_price: float):
-        """Helper to close a position during stop for day"""
-        symbol = position.symbol
-        try:
-            close_side = "SELL" if position.side == "LONG" else "BUY"
-            hedge_position_side = position.side if self.hedge_mode else None
-
-            close_order = self.client.place_market_order(
-                symbol, close_side, position.quantity, position_side=hedge_position_side
-            )
-
-            if "orderId" in close_order:
-                fill_price = float(close_order.get("avgPrice", current_price))
-                if position.side == "LONG":
-                    pnl = (fill_price - position.avg_entry_price) * position.quantity
-                else:
-                    pnl = (position.avg_entry_price - fill_price) * position.quantity
-
-                self.log(f"    [STOP DAY] Closed {position.side} @ ${fill_price:,.4f} | P&L: ${pnl:+.2f}", level="TRADE")
-
-                # Update daily stats
-                self.daily_pnl += pnl
-                self.daily_trades += 1
-                if pnl >= 0:
-                    self.daily_wins += 1
-                else:
-                    self.daily_losses += 1
-
-                # Log trade
-                self.log_trade(
-                    symbol=symbol,
-                    side=position.side,
-                    entry_price=position.avg_entry_price,
-                    exit_price=fill_price,
-                    quantity=position.quantity,
-                    pnl=pnl,
-                    exit_type="STOP_DAY",
-                    dca_level=position.dca_count
-                )
-
-            # Release margin
-            margin_released = position.margin_used
-            current_margin = self.symbol_margin_used.get(symbol, 0)
-            self.symbol_margin_used[symbol] = max(0, current_margin - margin_released)
-
-            # Remove from tracking
-            if pos_key in self.positions:
-                del self.positions[pos_key]
-
-        except Exception as e:
-            self.log(f"    [STOP DAY] Error closing {position.side}: {e}", level="ERROR")
-
-    def _finalize_stop_for_day(self, symbol: str):
-        """Finalize stop for day - close remaining positions and set flags"""
-        # Close any remaining positions for this symbol
-        positions_to_close = [(k, v) for k, v in list(self.positions.items()) if v.symbol == symbol]
-        for pos_key, position in positions_to_close:
+        for pos_key, position in opposite_positions_to_close:
             try:
+                # Get current price
                 price_data = self.client.get_current_price(symbol)
                 current_price = price_data["price"]
-                self._close_position_for_stop_day(pos_key, position, current_price)
-            except Exception as e:
-                self.log(f"    [STOP DAY] Error in finalize: {e}", level="ERROR")
 
-        # Cancel all orders for this symbol
-        try:
-            self.client.cancel_all_orders(symbol)
-            self.log(f"    [STOP DAY] Cancelled all orders for {symbol}")
-        except Exception as e:
-            self.log(f"    [STOP DAY] Warning: Could not cancel orders: {e}", level="WARN")
+                # Close position
+                close_side = "SELL" if position.side == "LONG" else "BUY"
+                hedge_position_side = position.side if self.hedge_mode else None
+
+                close_order = self.client.place_market_order(
+                    symbol, close_side, position.quantity, position_side=hedge_position_side
+                )
+
+                if "orderId" in close_order:
+                    fill_price = float(close_order.get("avgPrice", current_price))
+                    if position.side == "LONG":
+                        pnl = (fill_price - position.avg_entry_price) * position.quantity
+                    else:
+                        pnl = (position.avg_entry_price - fill_price) * position.quantity
+
+                    self.log(f"    [STOP DAY] Closed {position.side} @ ${fill_price:,.4f} | P&L: ${pnl:+.2f}", level="TRADE")
+
+                    # Update daily stats
+                    self.daily_pnl += pnl
+                    self.daily_trades += 1
+                    if pnl >= 0:
+                        self.daily_wins += 1
+                    else:
+                        self.daily_losses += 1
+
+                    # Log trade
+                    self.log_trade(
+                        symbol=symbol,
+                        side=position.side,
+                        entry_price=position.avg_entry_price,
+                        exit_price=fill_price,
+                        quantity=position.quantity,
+                        pnl=pnl,
+                        exit_type="STOP_DAY",
+                        dca_level=position.dca_count
+                    )
+
+                # Cancel all orders for this symbol
+                try:
+                    self.client.cancel_all_orders(symbol)
+                    self.log(f"    [STOP DAY] Cancelled all orders for {symbol}")
+                except Exception as e:
+                    self.log(f"    [STOP DAY] Warning: Could not cancel orders: {e}", level="WARN")
+
+                # Release margin
+                margin_released = position.margin_used
+                current_margin = self.symbol_margin_used.get(symbol, 0)
+                self.symbol_margin_used[symbol] = max(0, current_margin - margin_released)
+
+                # Remove from tracking
+                del self.positions[pos_key]
+
+            except Exception as e:
+                self.log(f"    [STOP DAY] Error closing {position.side}: {e}", level="ERROR")
 
         # Deactivate boost mode if active
         if self.boost_mode_active.get(symbol, False):
@@ -923,10 +1155,6 @@ class BinanceLiveTradingEngine:
             del self.pending_reentry[f"{symbol}_LONG"]
         if f"{symbol}_SHORT" in self.pending_reentry:
             del self.pending_reentry[f"{symbol}_SHORT"]
-
-        # NOW set stopped for day
-        self.stopped_for_day[symbol] = True
-        self.sl_hit_date[symbol] = datetime.now()
 
         self.log(f">>> [STOP FOR DAY] {symbol}: All positions closed. Will restart tomorrow.", level="TRADE")
 
@@ -967,11 +1195,6 @@ class BinanceLiveTradingEngine:
         Returns True if half-close was executed, False otherwise.
         """
         if not position.is_boosted:
-            return False
-
-        # SAFETY CHECK: Skip if entry price is 0 or invalid
-        if position.avg_entry_price <= 0:
-            self.log(f"[BOOST HALF-CLOSE] {symbol}: SKIPPED - Invalid entry price ${position.avg_entry_price}", level="WARN")
             return False
 
         pos_key = self.get_position_key(symbol, position.side)
@@ -1121,6 +1344,17 @@ class BinanceLiveTradingEngine:
             self.daily_pnl = 0.0
             self.daily_wins = 0
             self.daily_losses = 0
+
+            # Reset per-symbol stats
+            if hasattr(self, "symbol_stats"):
+                for symbol in self.symbols:
+                    self.symbol_stats[symbol] = {
+                        "wins": 0,
+                        "losses": 0,
+                        "tp_count": 0,
+                        "sl_count": 0,
+                        "pnl": 0.0
+                    }
             current_balance = self.client.get_balance()
             self.daily_start_balance = current_balance  # Reset daily loss limit baseline
             self.last_reset_date = today
@@ -1544,7 +1778,7 @@ class BinanceLiveTradingEngine:
             order_result = self.client.place_market_order(symbol, close_side, position.quantity, position_side=position_side)
 
             if "orderId" in order_result:
-                fill_price = float(order_result.get("avgPrice", 0))
+                fill_price = float(order_result.get("avgPrice", 0)) or current_price
                 if fill_price == 0:
                     price_data = self.client.get_current_price(symbol)
                     fill_price = price_data["price"]
@@ -2093,7 +2327,7 @@ class BinanceLiveTradingEngine:
                 return
 
             # Get actual fill price - market orders may return 0 initially
-            fill_price = float(order_result.get("avgPrice", 0))
+            fill_price = float(order_result.get("avgPrice", 0)) or current_price
             filled_qty = float(order_result.get("executedQty", 0))
 
             # If avgPrice is 0, retry multiple times to get actual entry price
@@ -2354,6 +2588,20 @@ class BinanceLiveTradingEngine:
                     self.daily_pnl += realized_pnl
                     self.daily_trades += 1
 
+                    # Update per-symbol stats
+                    if hasattr(self, "symbol_stats") and actual_symbol in self.symbol_stats:
+                        self.symbol_stats[actual_symbol]["pnl"] += realized_pnl
+                        if exit_type == "TP":
+                            self.symbol_stats[actual_symbol]["tp_count"] += 1
+                            self.symbol_stats[actual_symbol]["wins"] += 1
+                        elif exit_type == "SL":
+                            self.symbol_stats[actual_symbol]["sl_count"] += 1
+                            self.symbol_stats[actual_symbol]["losses"] += 1
+                        elif realized_pnl >= 0:
+                            self.symbol_stats[actual_symbol]["wins"] += 1
+                        else:
+                            self.symbol_stats[actual_symbol]["losses"] += 1
+
                     hedge_label = f" [{closed_side}]" if self.hedge_mode else ""
                     self.log(
                         f"Position {actual_symbol}{hedge_label} CLOSED ({exit_type}) | "
@@ -2419,8 +2667,7 @@ class BinanceLiveTradingEngine:
                     # CHECK IF SL HIT - STOP FOR THE DAY
                     if exit_type == "SL":
                         # SL hit - STOP trading this symbol for the day
-                        # Pass the side that hit SL so we can keep winning side with trailing
-                        self._stop_for_day(actual_symbol, sl_side=closed_side)
+                        self._stop_for_day(actual_symbol)
                         # Don't re-enter - skip to next position check
                         continue
 
@@ -2503,6 +2750,9 @@ class BinanceLiveTradingEngine:
         if position.avg_entry_price <= 0:
             return
 
+        if position.dca_count >= len(DCA_CONFIG["levels"]):
+            return
+
         # ENHANCED BOOST MODE: Skip DCA on boosted positions
         # When a position is boosted (1.5x), it should NOT DCA
         # It maintains its boosted size until TP (half-close) or losing side recovers
@@ -2525,30 +2775,68 @@ class BinanceLiveTradingEngine:
         # Convert to ROI: ROI = price_change * leverage
         current_roi_loss = price_drawdown * leverage  # e.g., 0.5% price loss * 20 = 10% ROI loss
 
-        # Check if DCA level triggered (ROI-based) with PAIR-SPECIFIC settings
+        # Check if DCA level triggered (ROI-based) with SYMBOL-SPECIFIC DCA LEVELS
         symbol_settings = SYMBOL_SETTINGS.get(symbol, {})
-
-        # Use symbol-specific DCA levels if available (e.g., BTC has custom tighter levels)
-        dca_levels = symbol_settings.get("dca_levels", DCA_CONFIG["levels"])
-
-        # Check we have enough levels defined
-        if position.dca_count >= len(dca_levels):
-            return
-
-        level = dca_levels[position.dca_count]
-        base_trigger_roi = abs(level["trigger_roi"])  # e.g., 0.30 = 30% ROI loss
-
-        # Apply volatility multiplier for this symbol (wider triggers for volatile pairs)
-        # NOTE: Only apply volatility_mult if NOT using custom dca_levels
-        if "dca_levels" in symbol_settings:
-            # Symbol has custom DCA levels, don't apply multiplier (already calibrated)
-            trigger_roi = base_trigger_roi
+        
+        # Use symbol-specific DCA levels if defined, otherwise use default
+        symbol_dca_levels = symbol_settings.get("dca_levels", None)
+        if symbol_dca_levels and position.dca_count < len(symbol_dca_levels):
+            level = symbol_dca_levels[position.dca_count]
+            trigger_roi = abs(level["trigger_roi"])  # Already symbol-specific, no multiplier needed
+            self.log(f"[DCA] Using symbol-specific DCA level for {symbol}: trigger={trigger_roi*100:.0f}%", level="DEBUG")
         else:
-            # Use default levels with volatility multiplier
+            # Fall back to default levels with volatility multiplier
+            level = DCA_CONFIG["levels"][position.dca_count]
+            base_trigger_roi = abs(level["trigger_roi"])  # e.g., 0.20 = 20% ROI loss
             volatility_mult = symbol_settings.get("dca_volatility_mult", 1.0)
-            trigger_roi = base_trigger_roi * volatility_mult  # e.g., 0.30 * 1.5 = 0.45 (45% ROI)
+            trigger_roi = base_trigger_roi * volatility_mult  # e.g., 0.20 * 1.8 = 0.36 (36% ROI for DOT)
 
         if current_roi_loss >= trigger_roi:
+            # ================================================================
+            # CHECK require_trend_filter FROM SYMBOL CONFIG
+            # Symbol-specific DCA levels can require trend validation
+            # ================================================================
+            if symbol_dca_levels and position.dca_count < len(symbol_dca_levels):
+                require_filter = symbol_dca_levels[position.dca_count].get("require_trend_filter", False)
+                if require_filter:
+                    # Must pass strict trend/reversal validation
+                    if symbol in self.data_buffer and self.data_buffer[symbol] is not None:
+                        df = self.data_buffer[symbol].get("1m") if isinstance(self.data_buffer[symbol], dict) else self.data_buffer[symbol]
+                        if df is not None and len(df) > 14:
+                            # Strict check: RSI extreme + reversal candle
+                            delta = df["close"].diff()
+                            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+                            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                            rs = gain / loss
+                            rsi = 100 - (100 / (1 + rs))
+                            current_rsi = rsi.iloc[-1]
+                            
+                            last_candle = df.iloc[-1]
+                            prev_candle = df.iloc[-2]
+                            
+                            # Check for reversal pattern
+                            if position.side == "LONG":
+                                is_reversal = (last_candle["close"] > last_candle["open"] and 
+                                              prev_candle["close"] < prev_candle["open"])
+                                rsi_ok = current_rsi < 35  # Oversold
+                            else:
+                                is_reversal = (last_candle["close"] < last_candle["open"] and 
+                                              prev_candle["close"] > prev_candle["open"])
+                                rsi_ok = current_rsi > 65  # Overbought
+                            
+                            if not (is_reversal or rsi_ok):
+                                self.log(f"[TREND FILTER] {symbol} {position.side} DCA {dca_level} BLOCKED - No reversal (RSI:{current_rsi:.0f})", level="DCA")
+                                return
+
+            # ================================================================
+            # STRONG TREND MODE: Block DCA 2+ on loser side
+            # In strong trends (ADX > 40), don't add to losing positions
+            # ================================================================
+            is_blocked, block_reason = self.is_dca_blocked_by_strong_trend(symbol, position.side, dca_level)
+            if is_blocked:
+                self.log(f"[STRONG TREND] {symbol} {position.side} DCA {dca_level} BLOCKED - {block_reason}", level="DCA")
+                return
+
             # =================================================================
             # HYBRID DCA FILTER: Easy for L1-2, Strict for L3-4
             # =================================================================
@@ -2755,6 +3043,28 @@ class BinanceLiveTradingEngine:
         # Sync with Binance
         self.sync_positions()
 
+        # ================================================================
+        # STRONG TREND MODE: Check and update for each symbol
+        # When ADX > 40, activate Strong Trend Mode and block DCA 2+ on loser side
+        # ================================================================
+        processed_symbols = set()
+        for pos_key in list(self.positions.keys()):
+            sym = self.get_symbol_from_key(pos_key)
+            if sym in processed_symbols:
+                continue
+            processed_symbols.add(sym)
+
+            if self.boost_mode_active.get(sym, False):
+                continue
+
+            is_strong, direction = self.check_strong_trend_mode(sym)
+
+            if is_strong and not self.strong_trend_mode.get(sym, False):
+                self.activate_strong_trend_mode(sym, direction)
+            elif not is_strong and self.strong_trend_mode.get(sym, False):
+                self.deactivate_strong_trend_mode(sym, f"ADX dropped below {self.adx_threshold}")
+
+
         # Check each position
         for position_key, position in list(self.positions.items()):
             try:
@@ -2804,15 +3114,6 @@ class BinanceLiveTradingEngine:
                 # ================================================================
                 if position.avg_entry_price > 0:
                     should_close = self._check_stale_exit(symbol, position, current_price)
-                    if should_close:
-                        continue  # Position was closed, skip to next
-
-                # ================================================================
-                # TRAILING FOR CLOSE: Position marked for trailing close after SL on other side
-                # This takes priority - close via trailing then stop for day
-                # ================================================================
-                if position.trailing_for_close and self.trailing_active.get(symbol, False):
-                    should_close = self._check_trailing_for_close(symbol, position, current_price)
                     if should_close:
                         continue  # Position was closed, skip to next
 
@@ -3082,114 +3383,6 @@ class BinanceLiveTradingEngine:
 
         return False
 
-    def _check_trailing_for_close(self, symbol: str, position: LivePosition, current_price: float) -> bool:
-        """
-        Check trailing close for position marked after SL hit on other side.
-        When this position closes, we finalize stop for day.
-        Returns True if position was closed, False otherwise.
-        """
-        leverage = STRATEGY_CONFIG["leverage"]
-        margin = position.margin_used
-
-        if margin <= 0:
-            return False
-
-        # Calculate current ROI
-        if position.side == "LONG":
-            pnl = (current_price - position.avg_entry_price) * position.quantity
-            roi = (current_price - position.avg_entry_price) / position.avg_entry_price * leverage
-        else:
-            pnl = (position.avg_entry_price - current_price) * position.quantity
-            roi = (position.avg_entry_price - current_price) / position.avg_entry_price * leverage
-
-        # Get peak ROI from stop_for_day tracking
-        peak_roi = self.boosted_peak_roi.get(symbol, roi)
-
-        # Update peak if current is higher
-        if roi > peak_roi:
-            peak_roi = roi
-            self.boosted_peak_roi[symbol] = peak_roi
-
-        # Trailing params (use backtest params)
-        activation_roi = 0.02  # 2% ROI to activate trailing
-        trail_distance = 0.03  # 3% pullback triggers close
-
-        # Check if trailing should trigger
-        if peak_roi >= activation_roi:
-            pullback = peak_roi - roi
-            if pullback >= trail_distance and roi > 0:  # Only close if still profitable
-                self.log(
-                    f">>> [TRAILING CLOSE] {symbol} {position.side}: "
-                    f"Peak {peak_roi*100:.1f}% -> Current {roi*100:.1f}% (Pullback: {pullback*100:.1f}%)",
-                    level="TRADE"
-                )
-
-                # Close position
-                close_side = "SELL" if position.side == "LONG" else "BUY"
-                hedge_position_side = position.side if self.hedge_mode else None
-                order_result = self.client.place_market_order(symbol, close_side, position.quantity, position_side=hedge_position_side)
-
-                if "orderId" in order_result:
-                    fill_price = float(order_result.get("avgPrice", current_price))
-
-                    if position.side == "LONG":
-                        final_pnl = (fill_price - position.avg_entry_price) * position.quantity
-                    else:
-                        final_pnl = (position.avg_entry_price - fill_price) * position.quantity
-
-                    self.log(
-                        f">>> [TRAILING CLOSE] {symbol} {position.side} CLOSED @ ${fill_price:,.4f} | "
-                        f"P&L: ${final_pnl:+.2f} | Peak was {peak_roi*100:.1f}%",
-                        level="TRADE"
-                    )
-
-                    # Update stats
-                    self.daily_pnl += final_pnl
-                    self.daily_trades += 1
-                    if final_pnl > 0:
-                        self.daily_wins += 1
-                    else:
-                        self.daily_losses += 1
-
-                    # Log trade
-                    self.log_trade(
-                        symbol=symbol,
-                        side=position.side,
-                        entry_price=position.avg_entry_price,
-                        exit_price=fill_price,
-                        quantity=position.quantity,
-                        pnl=final_pnl,
-                        exit_type="TRAILING_CLOSE",
-                        dca_level=position.dca_count
-                    )
-
-                    # Cancel remaining orders
-                    try:
-                        self.client.cancel_all_orders(symbol)
-                    except:
-                        pass
-
-                    # Release margin
-                    position_key = f"{symbol}_{position.side}"
-                    if position_key in self.positions:
-                        del self.positions[position_key]
-                    self.symbol_margin_used[symbol] = max(0, self.symbol_margin_used.get(symbol, 0) - margin)
-
-                    # Clear trailing state
-                    self.trailing_active[symbol] = False
-                    self.boosted_peak_roi[symbol] = 0
-
-                    # NOW finalize stop for day
-                    self.log(f">>> [TRAILING CLOSE] {symbol}: Trailing close complete - now stopping for day", level="TRADE")
-                    self._finalize_stop_for_day(symbol)
-
-                    return True
-                else:
-                    self.log(f">>> [TRAILING CLOSE] {symbol}: Close failed: {order_result}", level="ERROR")
-                    return False
-
-        return False
-
     def _check_auto_close_tp(self, symbol: str, position: LivePosition, current_price: float) -> bool:
         """
         Check if position should be auto-closed because price is past TP target.
@@ -3208,11 +3401,6 @@ class BinanceLiveTradingEngine:
             tp_roi = DCA_CONFIG["take_profit_roi"]
 
         tp_price_pct = tp_roi / leverage
-
-        # SAFETY CHECK: Skip if entry price is 0 or invalid
-        if position.avg_entry_price <= 0:
-            self.log(f"SKIP AUTO-TP {symbol}: Invalid entry price ${position.avg_entry_price}", level="WARN")
-            return False
 
         # Calculate expected TP price
         if position.side == "LONG":
@@ -3609,15 +3797,26 @@ class BinanceLiveTradingEngine:
 
                     # DCA level already set from pos.dca_count above
 
-                    # Next DCA info (ROI-based with PAIR-SPECIFIC VOLATILITY)
-                    if dca_level < len(DCA_CONFIG["levels"]):
+                    # Next DCA info (ROI-based with SYMBOL-SPECIFIC LEVELS)
+                    symbol_settings = SYMBOL_SETTINGS.get(symbol, {})
+                    symbol_dca_levels = symbol_settings.get("dca_levels", None)
+                    
+                    if symbol_dca_levels and dca_level < len(symbol_dca_levels):
+                        # Use symbol-specific DCA levels (no volatility multiplier needed)
+                        next_dca_roi = abs(symbol_dca_levels[dca_level]["trigger_roi"])
+                        volatility_mult = 1.0  # Custom levels = no multiplier
+                        
+                        next_dca_price_pct = next_dca_roi / leverage
+                        if side == "LONG":
+                            next_dca_price = entry_price * (1 - next_dca_price_pct)
+                        else:
+                            next_dca_price = entry_price * (1 + next_dca_price_pct)
+                    elif dca_level < len(DCA_CONFIG["levels"]):
+                        # Fall back to default levels with volatility multiplier
                         base_next_dca_roi = abs(DCA_CONFIG["levels"][dca_level]["trigger_roi"])
-
-                        # Apply volatility multiplier for this symbol
-                        symbol_settings = SYMBOL_SETTINGS.get(symbol, {})
                         volatility_mult = symbol_settings.get("dca_volatility_mult", 1.0)
-                        next_dca_roi = base_next_dca_roi * volatility_mult  # Adjusted for volatility
-
+                        next_dca_roi = base_next_dca_roi * volatility_mult
+                        
                         next_dca_price_pct = next_dca_roi / leverage
                         if side == "LONG":
                             next_dca_price = entry_price * (1 - next_dca_price_pct)
@@ -3713,6 +3912,24 @@ class BinanceLiveTradingEngine:
         print(f"  Win Rate: {win_rate:.1f}%")
         print(f"  Daily P&L: ${self.daily_pnl:+.2f}")
 
+        # Per-symbol statistics
+        if hasattr(self, "symbol_stats") and self.symbol_stats:
+            print(f"\n--- PER-SYMBOL STATS ---")
+            for symbol in self.symbols:
+                stats = self.symbol_stats.get(symbol, {"wins": 0, "losses": 0, "tp_count": 0, "sl_count": 0, "pnl": 0.0})
+                wins = stats["wins"]
+                losses = stats["losses"]
+                tp_count = stats["tp_count"]
+                sl_count = stats["sl_count"]
+                pnl = stats["pnl"]
+                total_trades = wins + losses
+                if total_trades > 0:
+                    sym_win_rate = wins / total_trades * 100
+                    pnl_sign = "+" if pnl >= 0 else ""
+                    print(f"  {symbol}: W:{wins}/L:{losses} ({sym_win_rate:.0f}%) | TP:{tp_count} SL:{sl_count} | P&L: ${pnl_sign}{pnl:.2f}")
+                else:
+                    print(f"  {symbol}: No trades yet")
+
         print(f"\nNext scan in 60 seconds... (Ctrl+C to stop)")
 
     def print_status(self):
@@ -3781,6 +3998,56 @@ class BinanceLiveTradingEngine:
 
         print("="*80 + "\n")
 
+
+    def log_trading_config(self):
+        """Log all trading configuration parameters at startup"""
+        self.log("="*70)
+        self.log("TRADING CONFIGURATION PARAMETERS")
+        self.log("="*70)
+
+        # General settings
+        self.log(f"Leverage: {STRATEGY_CONFIG.get('leverage', 20)}x")
+        self.log(f"ADX Threshold (Strong Trend): {self.adx_threshold}")
+        self.log(f"Strong Trend DCA Block: ALL DCA on loser side")
+
+        # Default DCA Levels
+        self.log("DEFAULT DCA LEVELS:")
+        self.log(f"  TP ROI: {DCA_CONFIG.get('take_profit_roi', 0.08)*100:.0f}%")
+        self.log(f"  SL ROI: {DCA_CONFIG.get('stop_loss_roi', 0.90)*100:.0f}%")
+        for i, lvl in enumerate(DCA_CONFIG.get('levels', []), 1):
+            self.log(f"  DCA {i}: Trigger={lvl.get('trigger_roi', 0)*100:.0f}% | Mult={lvl.get('multiplier', 1.0)}x | TP={lvl.get('tp_roi', 0.08)*100:.0f}%")
+
+        # Per-symbol settings
+        self.log("PER-SYMBOL DCA SETTINGS:")
+        for symbol in self.symbols:
+            settings = SYMBOL_SETTINGS.get(symbol, {})
+            symbol_dca = settings.get('dca_levels', None)
+            vol_mult = settings.get('dca_volatility_mult', 1.0)
+            tp_roi = settings.get('tp_roi', DCA_CONFIG.get('take_profit_roi', 0.08))
+
+            self.log(f"  {symbol}:")
+            self.log(f"    TP ROI: {tp_roi*100:.0f}%")
+
+            if symbol_dca:
+                self.log(f"    Custom DCA Levels (no volatility multiplier):")
+                for i, lvl in enumerate(symbol_dca, 1):
+                    trend_filter = "+ Trend Filter" if lvl.get('require_trend_filter', False) else ""
+                    self.log(f"      DCA {i}: Trigger={lvl.get('trigger_roi', 0)*100:.0f}% | Mult={lvl.get('multiplier', 1.0)}x {trend_filter}")
+            else:
+                self.log(f"    Using default levels with volatility_mult={vol_mult}x")
+                for i, lvl in enumerate(DCA_CONFIG.get('levels', []), 1):
+                    effective_trigger = lvl.get('trigger_roi', 0) * vol_mult
+                    self.log(f"      DCA {i}: Trigger={effective_trigger*100:.0f}% (base {lvl.get('trigger_roi', 0)*100:.0f}% x {vol_mult})")
+
+        # Boost Mode settings
+        self.log("BOOST MODE:")
+        self.log("  Trigger at DCA: 3")
+        self.log("  Boost multiplier: 1.5x")
+        self.log("  Half-close at TP: Yes")
+        self.log("  Trailing after half-close: Yes")
+
+        self.log("="*70)
+
     def run(self, duration_hours: float = 0):
         """
         Run live trading
@@ -3807,6 +4074,9 @@ class BinanceLiveTradingEngine:
         self.starting_balance = self.client.get_balance()
         self.daily_start_balance = self.starting_balance  # Also set daily baseline
         self.log(f"Starting balance: ${self.starting_balance:,.2f}")
+
+        # Log all trading configuration
+        self.log_trading_config()
 
         # Initialize dynamic fund allocation
         self.initialize_dynamic_allocation()
@@ -3863,6 +4133,11 @@ class BinanceLiveTradingEngine:
 
                 self.check_entry_signals()
                 self.manage_positions()
+
+                # PERIODIC ORDER CLEANUP - Cancel orphaned/stale orders
+                if (datetime.now() - self.last_order_cleanup).total_seconds() >= self.order_cleanup_interval:
+                    self.cleanup_orphaned_orders()
+                    self.last_order_cleanup = datetime.now()
 
                 if (datetime.now() - last_status).total_seconds() >= status_interval:
                     self.print_status()
@@ -4274,7 +4549,7 @@ class BinanceLiveTradingEngine:
                         pass
 
                     # Get fill price
-                    fill_price = float(order_result.get("avgPrice", 0))
+                    fill_price = float(order_result.get("avgPrice", 0)) or current_price
                     if fill_price == 0:
                         time.sleep(0.3)
                         price_data = self.client.get_current_price(symbol)

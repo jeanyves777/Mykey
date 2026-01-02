@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-Backtest Hedge + DCA + ENHANCED BOOST MODE Strategy v3
+Backtest Hedge + DCA + ENHANCED BOOST MODE Strategy v4
 =======================================================
 IMPROVEMENTS:
-1. Smart Boost at DCA 2 (earlier trigger)
+1. Smart Boost at DCA 3 (trigger level)
 2. Increased TP levels ONLY during boost mode
 3. STOP FOR THE DAY after SL hit - restart next day
-4. CSV trade journal export
+4. STRONG TREND MODE - Block ALL DCA on loser side when ADX > 40
+5. CSV trade journal export
 
 Enhanced Boost Mode with:
-1. At DCA 2 trigger -> Boost opposite side 1.5x
+1. At DCA 3 trigger -> Boost opposite side 1.5x
 2. When boosted side hits TP: Close HALF, lock profit, add back 0.5x
 3. Trailing stop activates AFTER each half-close cycle
 4. Continue until losing side recovers (TP) or hits SL
-5. After SL: Close remaining position, STOP for the day, restart next day
+5. After SL: STOP for the day, restart next day
 """
 
 import sys
@@ -202,7 +203,7 @@ class EnhancedBoostBacktester:
         self.trend_direction = direction
         self.strong_trend_activations += 1
         print(f"[{timestamp}] >>> STRONG TREND MODE ACTIVATED! Direction: {direction} | ADX: {self.current_adx:.1f}")
-        print(f"    [TREND LOGIC] Winner: 2x, half-close, trail | Loser: DCA 2+ BLOCKED")
+        print(f"    [TREND LOGIC] Winner: 2x, half-close, trail | Loser: ALL DCA BLOCKED")
 
     def deactivate_strong_trend_mode(self, timestamp, reason: str):
         """Deactivate strong trend mode"""
@@ -610,7 +611,7 @@ class EnhancedBoostBacktester:
         print(f"  - AFTER SL: STOP for the day, restart next day")
         print(f"STRONG TREND MODE: ADX > {self.adx_threshold}")
         print(f"  - Winner: 2x entry, half-close, trail")
-        print(f"  - Loser: DCA 2+ BLOCKED")
+        print(f"  - Loser: ALL DCA BLOCKED (no adding to losing side!)")
         print(f"SCALE-IN: After {self.scale_in_after_tps} consecutive TPs -> {self.scale_in_multiplier}x")
         print("="*70)
 
@@ -706,7 +707,7 @@ class EnhancedBoostBacktester:
                         self.long_position = None
                         self.trailing_active = False
                         self.boosted_peak_roi = 0
-                        # Now stop for day and restart next day
+                        # STOP FOR DAY - Both sides will restart together tomorrow
                         self.stopped_for_day = True
                         self.sl_hit_date = timestamp.date() if hasattr(timestamp, 'date') else timestamp
                         print(f"[{timestamp}] >>> Trailing close complete - STOPPED FOR THE DAY")
@@ -803,8 +804,8 @@ class EnhancedBoostBacktester:
                     # Skip DCA if this side is boosted
                     if self.boost_mode_active and self.boosted_side == "LONG":
                         pass  # No DCA on boosted side!
-                    # STRONG TREND MODE: Block DCA 2+ on loser side (LONG is loser in DOWN trend)
-                    elif self.strong_trend_mode and self.trend_direction == "DOWN" and current_dca_level >= 1:
+                    # STRONG TREND MODE: Block ALL DCA on loser side (LONG is loser in DOWN trend)
+                    elif self.strong_trend_mode and self.trend_direction == "DOWN" and current_dca_level >= 0:
                         print(f"[{timestamp}] LONG DCA {current_dca_level + 1} BLOCKED - Strong DOWN trend (ADX: {self.current_adx:.1f})")
                     else:
                         old_level = self.long_position["dca_level"]
@@ -838,7 +839,7 @@ class EnhancedBoostBacktester:
                         self.short_position = None
                         self.trailing_active = False
                         self.boosted_peak_roi = 0
-                        # Now stop for day and restart next day
+                        # STOP FOR DAY - Both sides will restart together tomorrow
                         self.stopped_for_day = True
                         self.sl_hit_date = timestamp.date() if hasattr(timestamp, 'date') else timestamp
                         print(f"[{timestamp}] >>> Trailing close complete - STOPPED FOR THE DAY")
@@ -935,8 +936,8 @@ class EnhancedBoostBacktester:
                     # Skip DCA if this side is boosted
                     if self.boost_mode_active and self.boosted_side == "SHORT":
                         pass  # No DCA on boosted side!
-                    # STRONG TREND MODE: Block DCA 2+ on loser side (SHORT is loser in UP trend)
-                    elif self.strong_trend_mode and self.trend_direction == "UP" and current_dca_level >= 1:
+                    # STRONG TREND MODE: Block ALL DCA on loser side (SHORT is loser in UP trend)
+                    elif self.strong_trend_mode and self.trend_direction == "UP" and current_dca_level >= 0:
                         print(f"[{timestamp}] SHORT DCA {current_dca_level + 1} BLOCKED - Strong UP trend (ADX: {self.current_adx:.1f})")
                     else:
                         old_level = self.short_position["dca_level"]

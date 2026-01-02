@@ -813,7 +813,7 @@ class BinanceClient:
         try:
             server_time = self.get_server_time()
             if server_time > 0:
-                mode = "Demo (demo.binance.com)" if self.use_demo else ("Testnet" if self.testnet else "Mainnet")
+                mode = "LIVE Futures" if self.use_demo else ("Testnet" if self.testnet else "Mainnet")
                 print(f"[OK] Connected to Binance {mode}")
                 print(f"[OK] Base URL: {self.base_url}")
                 print(f"[OK] Server time: {datetime.fromtimestamp(server_time/1000)}")
