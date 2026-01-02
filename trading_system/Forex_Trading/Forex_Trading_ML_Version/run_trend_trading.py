@@ -1,12 +1,15 @@
 """
-Run Momentum Trend Trading - NO DCA
-====================================
+Run Signal-Based Trading - NO DCA
+==================================
 
-Simple momentum strategy following H1 trend.
+Signal-based entries using ADX + Volatility + HTF confirmation.
 
 Strategy:
-1. Check H1 EMA50 vs EMA200 for trend direction
-2. Open position in trend direction
+1. Wait for entry signal:
+   - ADX > 25 (trending market)
+   - ATR expansion (volatility spike)
+   - H1 EMA50 vs EMA200 confirms direction
+2. Open position in signal direction
 3. 20 pips Take Profit
 4. 15 pips Stop Loss
 5. Trailing stop: activates at +10 pips, trails 8 pips behind
@@ -14,7 +17,7 @@ Strategy:
 NO DCA - Single entry only!
 
 Usage:
-    cd C:\Users\Jean-Yves\thevolumeainative
+    cd C:/Users/Jean-Yves/thevolumeainative
     py -m trading_system.Forex_Trading.Forex_Trading_ML_Version.run_trend_trading
 """
 
@@ -23,6 +26,7 @@ import os
 import time
 from datetime import datetime, timedelta
 import pandas as pd
+import numpy as np
 
 warnings.filterwarnings('ignore')
 
@@ -34,8 +38,8 @@ from .risk_management.trade_executor import TradeExecutor
 from .risk_management.trend_filter import TrendFilter
 
 
-class SimpleTrendEngine:
-    """Momentum trend-following engine - NO DCA."""
+class SignalTradingEngine:
+    """Signal-based trading engine - ADX + Volatility + HTF confirmation."""
 
     def __init__(self, config):
         self.config = config
@@ -58,6 +62,114 @@ class SimpleTrendEngine:
         # Track position info for trailing stop
         self.position_open_times = {}
         self.trailing_data = {}  # {symbol: {'peak_profit_pips': x, 'trailing_active': bool}}
+
+        # Signal tracking
+        self.last_signal = {}  # {symbol: {'direction': x, 'time': x}}
+
+    def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Calculate Average True Range."""
+        high = df['high']
+        low = df['low']
+        close = df['close']
+
+        tr1 = high - low
+        tr2 = abs(high - close.shift(1))
+        tr3 = abs(low - close.shift(1))
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+        atr = tr.rolling(window=period).mean()
+        return atr
+
+    def calculate_adx(self, df: pd.DataFrame, period: int = 14) -> tuple:
+        """Calculate ADX (Average Directional Index).
+        Returns: (adx, plus_di, minus_di) as Series
+        """
+        high = df['high']
+        low = df['low']
+        close = df['close']
+
+        # Calculate True Range
+        tr1 = high - low
+        tr2 = abs(high - close.shift(1))
+        tr3 = abs(low - close.shift(1))
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+        # Calculate +DM and -DM
+        plus_dm = high.diff()
+        minus_dm = -low.diff()
+
+        plus_dm = plus_dm.where(plus_dm > 0, 0)
+        minus_dm = minus_dm.where(minus_dm > 0, 0)
+
+        # When +DM > -DM, -DM = 0 and vice versa
+        plus_dm = plus_dm.where(plus_dm > minus_dm, 0)
+        minus_dm = minus_dm.where(minus_dm > plus_dm, 0)
+
+        # Smoothed TR, +DM, -DM using Wilder's smoothing
+        atr = tr.ewm(alpha=1/period, min_periods=period).mean()
+        plus_dm_smooth = plus_dm.ewm(alpha=1/period, min_periods=period).mean()
+        minus_dm_smooth = minus_dm.ewm(alpha=1/period, min_periods=period).mean()
+
+        # Calculate +DI and -DI
+        plus_di = 100 * plus_dm_smooth / atr
+        minus_di = 100 * minus_dm_smooth / atr
+
+        # Calculate DX
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 0.0001)
+
+        # Calculate ADX (smoothed DX)
+        adx = dx.ewm(alpha=1/period, min_periods=period).mean()
+
+        return adx, plus_di, minus_di
+
+    def check_entry_signal(self, symbol: str, df: pd.DataFrame) -> tuple:
+        """Check for entry signal using ADX + ATR + HTF confirmation.
+
+        Returns: (signal_direction, reason) where signal_direction is 'BUY', 'SELL', or None
+        """
+        dca = self.config.dca
+
+        if len(df) < 50:
+            return None, "Insufficient data"
+
+        # Calculate indicators
+        adx, plus_di, minus_di = self.calculate_adx(df, dca.adx_period)
+        atr = self.calculate_atr(df, dca.atr_period)
+        atr_avg = atr.rolling(window=20).mean()
+
+        # Get latest values
+        current_adx = adx.iloc[-1]
+        current_plus_di = plus_di.iloc[-1]
+        current_minus_di = minus_di.iloc[-1]
+        current_atr = atr.iloc[-1]
+        current_atr_avg = atr_avg.iloc[-1]
+
+        if pd.isna(current_adx) or pd.isna(current_atr) or pd.isna(current_atr_avg):
+            return None, "Indicators not ready"
+
+        # Condition 1: ADX above threshold (trending market)
+        if current_adx < dca.adx_threshold:
+            return None, f"ADX {current_adx:.1f} < {dca.adx_threshold} (ranging)"
+
+        # Condition 2: Volatility expansion (ATR > 1.5x average)
+        if current_atr < current_atr_avg * dca.atr_expansion_mult:
+            return None, f"ATR not expanding ({current_atr:.5f} < {current_atr_avg * dca.atr_expansion_mult:.5f})"
+
+        # Condition 3: Get H1 trend direction
+        htf_trend, htf_reason = self.get_h1_trend(symbol)
+
+        if htf_trend not in ['BUY', 'SELL']:
+            return None, f"No HTF trend ({htf_reason})"
+
+        # Condition 4: DI confirms direction matches HTF
+        if htf_trend == 'BUY' and current_plus_di > current_minus_di:
+            reason = f"SIGNAL: ADX={current_adx:.1f}, +DI>{'-'}DI, HTF=UP, ATR expanding"
+            return 'BUY', reason
+        elif htf_trend == 'SELL' and current_minus_di > current_plus_di:
+            reason = f"SIGNAL: ADX={current_adx:.1f}, -DI>{'+'}DI, HTF=DOWN, ATR expanding"
+            return 'SELL', reason
+
+        return None, f"DI direction ({'+' if current_plus_di > current_minus_di else '-'}) doesn't match HTF ({htf_trend})"
 
     def format_price(self, symbol: str, price: float) -> str:
         """Format price correctly for OANDA (3 decimals for JPY, 5 for others)."""
@@ -453,7 +565,7 @@ class SimpleTrendEngine:
     def run(self, interval: int = 60):
         """Run the trading loop."""
         print("\n" + "=" * 60)
-        print("MOMENTUM TREND TRADING - NO DCA")
+        print("SIGNAL-BASED TRADING - NO DCA")
         print("=" * 60)
 
         # Test connection
@@ -531,7 +643,8 @@ class SimpleTrendEngine:
 
         dca = self.config.dca
         print(f"\nSymbols: {', '.join(self.symbols)}")
-        print(f"Strategy: MOMENTUM (NO DCA)")
+        print(f"Strategy: SIGNAL-BASED (ADX + ATR + HTF)")
+        print(f"Entry: ADX > {dca.adx_threshold}, ATR > {dca.atr_expansion_mult}x avg")
         print(f"TP: {dca.take_profit_pips}p | SL: {dca.initial_sl_pips}p")
         print(f"Trailing: activates at +{dca.trailing_activation_pips}p, trails {dca.trailing_stop_pips}p behind")
         print(f"Interval: {interval}s")
@@ -554,16 +667,19 @@ class SimpleTrendEngine:
                         self.manage_position(symbol, trades_by_symbol[symbol])
                         continue
 
-                    # No position - get H1 trend and open
-                    trend_dir, trend_reason = self.get_h1_trend(symbol)
-                    print(f"  {symbol}: {trend_reason}")
+                    # No position - check for entry signal
+                    # Get M15 data for signal calculation
+                    df_m15 = self.data_loader.get_latest_bars(symbol, count=100, granularity='M15')
 
-                    if trend_dir in ['BUY', 'SELL']:
-                        self.open_position(symbol, trend_dir)
-                    elif trend_dir == 'NONE':
-                        print(f"  {symbol}: No trade - flat/ranging market")
-                    else:
-                        print(f"  {symbol}: Insufficient data")
+                    if df_m15 is None or len(df_m15) < 50:
+                        print(f"  {symbol}: Insufficient M15 data")
+                        continue
+
+                    signal_dir, signal_reason = self.check_entry_signal(symbol, df_m15)
+                    print(f"  {symbol}: {signal_reason}")
+
+                    if signal_dir in ['BUY', 'SELL']:
+                        self.open_position(symbol, signal_dir)
 
                 # Wait for next iteration
                 print(f"\nSleeping {interval}s...")
@@ -589,15 +705,19 @@ class SimpleTrendEngine:
 
 def main():
     print("\n" + "=" * 60)
-    print("MOMENTUM TREND TRADING SYSTEM")
-    print("NO DCA - H1 EMA50 vs EMA200 with Trailing Stop")
+    print("SIGNAL-BASED TRADING SYSTEM")
+    print("ADX + ATR + HTF Confirmation - NO DCA")
     print("=" * 60)
 
     config = load_config()
     dca = config.dca
 
     print(f"\nSymbols: {', '.join(config.symbols)}")
-    print(f"Strategy: MOMENTUM (NO DCA)")
+    print(f"Strategy: SIGNAL-BASED (NO DCA)")
+    print(f"Entry Conditions:")
+    print(f"  - ADX > {dca.adx_threshold} (trending market)")
+    print(f"  - ATR > {dca.atr_expansion_mult}x average (volatility spike)")
+    print(f"  - H1 EMA{dca.htf_ema_fast} vs EMA{dca.htf_ema_slow} confirms direction")
     print(f"Take Profit: {dca.take_profit_pips}p")
     print(f"Stop Loss: {dca.initial_sl_pips}p")
     print(f"Trailing: activates +{dca.trailing_activation_pips}p, trails {dca.trailing_stop_pips}p behind")
@@ -608,7 +728,7 @@ def main():
         print("Cancelled.")
         return
 
-    engine = SimpleTrendEngine(config)
+    engine = SignalTradingEngine(config)
     engine.run(interval=60)
 
 

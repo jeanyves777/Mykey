@@ -128,19 +128,20 @@ class DCAConfig:
     - DCA Level 3: 24 pips loss -> add 1.75x
     - DCA Level 4: 32 pips loss -> add 2.00x
     ================================================================
-    MOMENTUM STRATEGY - NO DCA
+    SIGNAL-BASED STRATEGY - NO DCA
     ================================================================
-    Simple trend-following with trailing stop:
+    Signal-based entries using ADX + Volatility + HTF confirmation:
+    - Wait for entry signal (ADX > threshold, ATR expansion)
+    - Higher timeframe (H1 EMA) confirms direction
     - 20 pips Take Profit
     - 15 pips Stop Loss
     - Trailing stop activates after +10 pips profit
-    - Trail 8 pips behind price
     - NO DCA - single entry only
     """
-    enabled: bool = False  # DCA DISABLED - using momentum strategy
+    enabled: bool = False  # DCA DISABLED - using signal strategy
 
     # ================================================================
-    # MOMENTUM STRATEGY SETTINGS
+    # SIGNAL-BASED STRATEGY SETTINGS
     # ================================================================
 
     # TAKE PROFIT & STOP LOSS (in pips)
@@ -151,6 +152,25 @@ class DCAConfig:
     use_trailing_stop: bool = True
     trailing_activation_pips: float = 10.0  # Activate trailing after +10 pips profit
     trailing_stop_pips: float = 8.0         # Trail 8 pips behind price
+
+    # ================================================================
+    # ADX SIGNAL SETTINGS
+    # ================================================================
+    adx_period: int = 14                # ADX calculation period
+    adx_threshold: float = 25.0         # ADX > 25 = trending market (entry allowed)
+    adx_strong_trend: float = 40.0      # ADX > 40 = strong trend
+
+    # ================================================================
+    # VOLATILITY SETTINGS (ATR)
+    # ================================================================
+    atr_period: int = 14                # ATR calculation period
+    atr_expansion_mult: float = 1.5     # ATR must be 1.5x its 20-period average
+
+    # ================================================================
+    # HIGHER TIMEFRAME CONFIRMATION
+    # ================================================================
+    htf_ema_fast: int = 50              # Fast EMA for H1 trend
+    htf_ema_slow: int = 200             # Slow EMA for H1 trend
 
     # NO DCA - Disabled
     max_dca_levels: int = 0             # NO DCA

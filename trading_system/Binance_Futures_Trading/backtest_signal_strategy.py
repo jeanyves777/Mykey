@@ -583,6 +583,32 @@ def run_signal_test():
 
     print(f"{'TOTAL':<12} ${total_start:>9.2f} ${total_end:>9.2f} ${total_pnl:>+9.2f} {total_return:>+9.1f}% {total_trades:>7} {avg_winrate:>7.1f}% {max_dd:>9.1f}%")
 
+    # Save full summary to file
+    with open("signal_backtest_summary.txt", "w") as f:
+        f.write("="*100 + "\n")
+        f.write(f"SIGNAL-BASED STRATEGY BACKTEST - {BACKTEST_DAYS} DAYS\n")
+        f.write("="*100 + "\n")
+        f.write("Strategy: ADX + Volatility signals with HTF confirmation\n")
+        f.write("  - Entry: ADX > 25, ATR expansion, HTF trend alignment\n")
+        f.write("  - Exit: 15% ROI TP | NO SL (Isolated Margin = auto liquidation)\n")
+        f.write("="*100 + "\n\n")
+
+        f.write(f"{'Symbol':<12} {'Start':>10} {'End':>10} {'P&L':>10} {'Return':>10} {'Trades':>8} {'Win%':>8} {'MaxDD':>10} {'Liqs':>6}\n")
+        f.write("-"*90 + "\n")
+
+        total_liqs = 0
+        for r in all_results:
+            pnl = r['balance'] - 100
+            liqs = r['losses']
+            total_liqs += liqs
+            f.write(f"{r['symbol']:<12} ${100:>9.2f} ${r['balance']:>9.2f} ${pnl:>+9.2f} {r['return_pct']:>+9.1f}% {r['total_trades']:>7} {r['win_rate']:>7.1f}% {r['max_drawdown']:>9.1f}% {liqs:>5}\n")
+
+        f.write("-"*90 + "\n")
+        f.write(f"{'TOTAL':<12} ${total_start:>9.2f} ${total_end:>9.2f} ${total_pnl:>+9.2f} {total_return:>+9.1f}% {total_trades:>7} {avg_winrate:>7.1f}% {max_dd:>9.1f}% {total_liqs:>5}\n")
+        f.write("="*100 + "\n")
+
+    print("\n>>> Summary saved to: signal_backtest_summary.txt")
+
     return all_results
 
 
