@@ -1,8 +1,11 @@
 """
-Backtest Momentum Strategy - NO DCA
-====================================
+Backtest Signal-Based Strategy - NO DCA
+========================================
 
-Simple H1 trend following with:
+Signal-based entries using ADX + Volatility + HTF confirmation:
+- ADX > 25 (trending market)
+- ATR expansion (volatility spike)
+- H1 EMA50 vs EMA200 confirms direction
 - 20 pips Take Profit
 - 15 pips Stop Loss
 - Trailing stop: activates at +10 pips, trails 8 pips behind
@@ -21,8 +24,8 @@ import pandas as pd
 import numpy as np
 
 
-class MomentumBacktester:
-    """Backtest the momentum strategy with trailing stop."""
+class SignalBacktester:
+    """Backtest the signal-based strategy with ADX + ATR + HTF."""
 
     def __init__(self, symbol: str, start_balance: float = 10000.0):
         self.symbol = symbol
@@ -35,11 +38,17 @@ class MomentumBacktester:
         self.trailing_activation = 10.0  # Activate trailing at +10 pips
         self.trailing_distance = 8.0     # Trail 8 pips behind
 
+        # Signal params
+        self.adx_period = 14
+        self.adx_threshold = 25.0     # ADX > 25 = trending
+        self.atr_period = 14
+        self.atr_expansion_mult = 1.5  # ATR > 1.5x avg
+
         # Pip value
         self.pip_value = 0.01 if 'JPY' in symbol else 0.0001
 
-        # Position sizing
-        self.risk_pct = 0.02  # 2% risk per trade
+        # Position sizing - fixed $1 per pip
+        self.dollars_per_pip = 1.0  # $1 per pip
 
         # Stats
         self.trades = []
@@ -47,23 +56,71 @@ class MomentumBacktester:
         self.peak_balance = start_balance
         self.max_drawdown = 0
 
+        # Signal stats
+        self.signals_checked = 0
+        self.signals_triggered = 0
+
     def calculate_ema(self, prices: pd.Series, period: int) -> pd.Series:
         """Calculate EMA."""
         return prices.ewm(span=period, adjust=False).mean()
+
+    def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Calculate Average True Range."""
+        high = df['high']
+        low = df['low']
+        close = df['close']
+
+        tr1 = high - low
+        tr2 = abs(high - close.shift(1))
+        tr3 = abs(low - close.shift(1))
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+        atr = tr.rolling(window=period).mean()
+        return atr
+
+    def calculate_adx(self, df: pd.DataFrame, period: int = 14) -> tuple:
+        """Calculate ADX. Returns (adx, plus_di, minus_di)."""
+        high = df['high']
+        low = df['low']
+        close = df['close']
+
+        tr1 = high - low
+        tr2 = abs(high - close.shift(1))
+        tr3 = abs(low - close.shift(1))
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+        plus_dm = high.diff()
+        minus_dm = -low.diff()
+
+        plus_dm = plus_dm.where(plus_dm > 0, 0)
+        minus_dm = minus_dm.where(minus_dm > 0, 0)
+
+        plus_dm = plus_dm.where(plus_dm > minus_dm, 0)
+        minus_dm = minus_dm.where(minus_dm > plus_dm, 0)
+
+        atr = tr.ewm(alpha=1/period, min_periods=period).mean()
+        plus_dm_smooth = plus_dm.ewm(alpha=1/period, min_periods=period).mean()
+        minus_dm_smooth = minus_dm.ewm(alpha=1/period, min_periods=period).mean()
+
+        plus_di = 100 * plus_dm_smooth / atr
+        minus_di = 100 * minus_dm_smooth / atr
+
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 0.0001)
+        adx = dx.ewm(alpha=1/period, min_periods=period).mean()
+
+        return adx, plus_di, minus_di
 
     def get_h1_trend(self, df: pd.DataFrame, idx: int) -> str:
         """Get H1 trend direction using EMA50 vs EMA200."""
         if idx < 200:
             return 'NONE'
 
-        # Calculate EMAs on close prices up to current bar
         closes = df['close'].iloc[:idx+1]
         ema50 = self.calculate_ema(closes, 50).iloc[-1]
         ema200 = self.calculate_ema(closes, 200).iloc[-1]
 
         current_price = df['close'].iloc[idx]
 
-        # Trend logic
         if ema50 > ema200 and current_price > ema50:
             return 'BUY'
         elif ema50 < ema200 and current_price < ema50:
@@ -71,16 +128,53 @@ class MomentumBacktester:
         else:
             return 'NONE'
 
+    def check_entry_signal(self, df: pd.DataFrame, idx: int, adx: float,
+                           plus_di: float, minus_di: float,
+                           atr: float, atr_avg: float) -> str:
+        """Check for entry signal using ADX + ATR + HTF.
+        Returns 'BUY', 'SELL', or None.
+        """
+        self.signals_checked += 1
+
+        # Condition 1: ADX above threshold
+        if adx < self.adx_threshold:
+            return None
+
+        # Condition 2: Volatility expansion
+        if atr < atr_avg * self.atr_expansion_mult:
+            return None
+
+        # Condition 3: HTF trend direction
+        htf_trend = self.get_h1_trend(df, idx)
+        if htf_trend not in ['BUY', 'SELL']:
+            return None
+
+        # Condition 4: DI confirms direction
+        if htf_trend == 'BUY' and plus_di > minus_di:
+            self.signals_triggered += 1
+            return 'BUY'
+        elif htf_trend == 'SELL' and minus_di > plus_di:
+            self.signals_triggered += 1
+            return 'SELL'
+
+        return None
+
     def run_backtest(self, df: pd.DataFrame):
         """Run the backtest."""
         print(f"\n{'='*70}")
-        print(f"MOMENTUM BACKTEST - {self.symbol}")
+        print(f"SIGNAL BACKTEST - {self.symbol}")
         print(f"{'='*70}")
-        print(f"Strategy: NO DCA | TP: {self.tp_pips}p | SL: {self.sl_pips}p")
+        print(f"Strategy: ADX > {self.adx_threshold} | ATR > {self.atr_expansion_mult}x avg | HTF confirm")
+        print(f"TP: {self.tp_pips}p | SL: {self.sl_pips}p")
         print(f"Trailing: activates +{self.trailing_activation}p, trails {self.trailing_distance}p")
         print(f"Data: {len(df):,} bars from {df.index[0]} to {df.index[-1]}")
         print(f"Starting Balance: ${self.start_balance:,.2f}")
         print("-" * 70)
+
+        # Pre-calculate indicators
+        adx_series, plus_di_series, minus_di_series = self.calculate_adx(df, self.adx_period)
+        atr_series = self.calculate_atr(df, self.atr_period)
+        atr_avg_series = atr_series.rolling(window=20).mean()
 
         position = None
         trailing_active = False
@@ -109,6 +203,16 @@ class MomentumBacktester:
             high = current_bar['high']
             low = current_bar['low']
             close = current_bar['close']
+
+            # Get indicator values
+            adx = adx_series.iloc[i]
+            plus_di = plus_di_series.iloc[i]
+            minus_di = minus_di_series.iloc[i]
+            atr = atr_series.iloc[i]
+            atr_avg = atr_avg_series.iloc[i]
+
+            if pd.isna(adx) or pd.isna(atr) or pd.isna(atr_avg):
+                continue
 
             # If in position, check exits
             if position is not None:
@@ -236,18 +340,19 @@ class MomentumBacktester:
                     peak_profit_pips = 0.0
                     trailing_sl = None
 
-            # If no position, check for entry
+            # If no position, check for entry signal
             if position is None:
-                trend = self.get_h1_trend(df, i)
+                signal = self.check_entry_signal(df, i, adx, plus_di, minus_di, atr, atr_avg)
 
-                if trend in ['BUY', 'SELL']:
-                    # Calculate position size
-                    risk_amount = self.balance * self.risk_pct
-                    units = risk_amount / (self.sl_pips * self.pip_value)
+                if signal in ['BUY', 'SELL']:
+                    # Calculate position size for $1 per pip
+                    # For EUR_USD: 1 pip = 0.0001, so 10,000 units = $1/pip
+                    # For USD_JPY: 1 pip = 0.01, so 100 units = $1/pip (approx)
+                    units = self.dollars_per_pip / self.pip_value
 
                     position = {
                         'entry_time': current_bar.name,
-                        'direction': trend,
+                        'direction': signal,
                         'entry_price': close,
                         'units': units
                     }
@@ -348,6 +453,12 @@ class MomentumBacktester:
         print(f"  Stop Loss:         {sl_exits}")
         print(f"  Trailing Stop:     {trailing_exits}")
 
+        print(f"\nSignal Statistics:")
+        print(f"  Bars Checked:      {self.signals_checked:,}")
+        print(f"  Signals Triggered: {self.signals_triggered}")
+        signal_rate = self.signals_triggered / self.signals_checked * 100 if self.signals_checked > 0 else 0
+        print(f"  Signal Rate:       {signal_rate:.2f}%")
+
         print(f"{'='*70}")
 
 
@@ -357,6 +468,16 @@ def load_historical_data(symbol: str, days: int = 30) -> pd.DataFrame:
         'EUR_USD': 'EURUSD',
         'GBP_USD': 'GBPUSD',
         'USD_JPY': 'USDJPY',
+        'USD_CHF': 'USDCHF',
+        'USD_CAD': 'USDCAD',
+        'AUD_USD': 'AUDUSD',
+        'NZD_USD': 'NZDUSD',
+        'EUR_GBP': 'EURGBP',
+        'EUR_JPY': 'EURJPY',
+        'GBP_JPY': 'GBPJPY',
+        'AUD_JPY': 'AUDJPY',
+        'EUR_CAD': 'EURCAD',
+        'AUD_CHF': 'AUDCHF',
     }
 
     histdata_symbol = symbol_map.get(symbol, symbol.replace('_', ''))
@@ -409,14 +530,17 @@ def load_historical_data(symbol: str, days: int = 30) -> pd.DataFrame:
 def main():
     """Run backtest on multiple symbols."""
     print("=" * 70)
-    print("MOMENTUM STRATEGY BACKTEST - NO DCA")
+    print("SIGNAL-BASED STRATEGY BACKTEST - NO DCA")
     print("=" * 70)
-    print("Strategy: H1 EMA50 vs EMA200 trend following")
+    print("Entry: ADX > 25 | ATR > 1.5x avg | H1 EMA50/200 confirms")
     print("TP: 20 pips | SL: 15 pips")
     print("Trailing: activates +10 pips, trails 8 pips behind")
     print("=" * 70)
 
-    symbols = ['EUR_USD', 'GBP_USD', 'USD_JPY']
+    # Profitable pairs only
+    symbols = [
+        'EUR_USD', 'USD_JPY', 'USD_CHF', 'USD_CAD'
+    ]
     days = 90  # 3 months backtest
 
     all_results = []
@@ -427,10 +551,10 @@ def main():
         df = load_historical_data(symbol, days=days)
 
         if df is not None and len(df) > 200:
-            backtester = MomentumBacktester(symbol, start_balance=10000.0)
+            backtester = SignalBacktester(symbol, start_balance=500.0)
             result = backtester.run_backtest(df)
             all_results.append(result)
-            total_starting += 10000
+            total_starting += 500
             total_ending += result['balance']
         else:
             print(f"Skipping {symbol} - insufficient data")

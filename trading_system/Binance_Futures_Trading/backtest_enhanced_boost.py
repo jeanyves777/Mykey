@@ -1241,8 +1241,8 @@ class EnhancedBoostBacktester:
 def run_90_day_test():
     """Test Enhanced Boost over specified days with selected pairs"""
     # Configuration
-    BACKTEST_DAYS = 365  # 12 months
-    symbols = ["BTCUSDT", "DOTUSDT", "BNBUSDT", "AVAXUSDT", "SOLUSDT"]
+    BACKTEST_DAYS = 90  # 90 days (same as signal strategy)
+    symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]  # Same as signal strategy
 
     print("="*80)
     print(f"ENHANCED BOOST MODE - {BACKTEST_DAYS} DAY BACKTEST")
