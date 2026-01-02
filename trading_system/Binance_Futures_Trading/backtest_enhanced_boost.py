@@ -54,9 +54,9 @@ class EnhancedBoostBacktester:
             DCA_CONFIG.get("dca4_pct", 0.30),           # 30%
         ]
 
-        # ENHANCED BOOST PARAMETERS - BOOST AT DCA 3
+        # ENHANCED BOOST PARAMETERS - BOOST AT DCA 2 (only 2 DCA levels now)
         self.boost_multiplier = 1.5  # 1.5x boost
-        self.boost_trigger_dca_level = 3  # DCA 3 trigger
+        self.boost_trigger_dca_level = 2  # DCA 2 trigger (limited from 3)
         self.boost_tp_multiplier = 1.5  # Increase TP by 50% during boost mode
         self.trailing_activation_roi = 0.02  # Start trailing after 2% ROI profit
         self.trailing_distance_roi = 0.03    # Trail 3% behind peak

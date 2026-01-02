@@ -99,12 +99,10 @@ SYMBOL_SETTINGS = {
         "dca_volatility_mult": 1.0,   # Default - BTC is stable
         # ENHANCED BOOST - Tighter settings for BTC
         "tp_roi": 0.05,               # 5% TP (vs 8% default) - faster exits
-        "boost_trigger_dca": 2,       # Trigger boost at DCA 2 (vs 3 default) - earlier
-        "dca_levels": [               # Tighter DCA triggers for BTC
+        "boost_trigger_dca": 2,       # Trigger boost at DCA 2
+        "dca_levels": [               # LIMITED TO 2 LEVELS - BTC
             {"trigger_roi": -0.03, "multiplier": 1.50, "tp_roi": 0.04},   # L1: -3% ROI
             {"trigger_roi": -0.10, "multiplier": 1.75, "tp_roi": 0.04},   # L2: -10% ROI
-            {"trigger_roi": -0.18, "multiplier": 2.00, "tp_roi": 0.03},   # L3: -18% ROI
-            {"trigger_roi": -0.25, "multiplier": 2.25, "tp_roi": 0.03},   # L4: -25% ROI
         ],
     },
     "ETHUSDT": {
@@ -125,12 +123,10 @@ SYMBOL_SETTINGS = {
         "qty_precision": 2,
         "tick_size": 0.01,
         "dca_volatility_mult": 1.0,   # No extra multiplier - custom levels below
-        # BNB - wider DCA levels with strict trend/reversal validation
+        # BNB - LIMITED TO 2 LEVELS
         "dca_levels": [
             {"trigger_roi": -0.15, "multiplier": 1.50, "tp_roi": 0.06, "require_trend_filter": True},   # DCA1: -15% ROI
-            {"trigger_roi": -0.25, "multiplier": 1.75, "tp_roi": 0.06, "require_trend_filter": True},   # DCA2: -25% ROI
-            {"trigger_roi": -0.35, "multiplier": 2.00, "tp_roi": 0.05, "require_trend_filter": True},   # DCA3: -35% ROI
-            {"trigger_roi": -0.45, "multiplier": 2.25, "tp_roi": 0.04, "require_trend_filter": True},   # DCA4: -45% ROI
+            {"trigger_roi": -0.30, "multiplier": 1.75, "tp_roi": 0.06, "require_trend_filter": True},   # DCA2: -30% ROI
         ],
     },
     "SOLUSDT": {
@@ -170,7 +166,7 @@ SYMBOL_SETTINGS = {
         "dca_volatility_mult": 1.6,   # 60% wider - AVAX is volatile
         # ENHANCED BOOST - 8% TP optimal (tested 2.5%, 8%, 10% - 8% best)
         "tp_roi": 0.08,               # 8% TP - optimal for AVAX volatility
-        "boost_trigger_dca": 3,       # Trigger boost at DCA 3 (default)
+        "boost_trigger_dca": 2,       # Trigger boost at DCA 2 (only 2 levels now)
         # Uses default DCA levels from DCA_CONFIG
     },
     "LINKUSDT": {
@@ -195,13 +191,11 @@ SYMBOL_SETTINGS = {
         "dca_volatility_mult": 1.0,   # No extra multiplier - custom levels below
         # ENHANCED BOOST - Default settings (DOT is volatile, works well)
         "tp_roi": 0.08,               # 8% TP (default) - works well for DOT
-        "boost_trigger_dca": 3,       # Trigger boost at DCA 3 (default)
-        # CUSTOM WIDER DCA LEVELS FOR DOT - with ADX/trend filter like DCA4
+        "boost_trigger_dca": 2,       # Trigger boost at DCA 2 (only 2 levels now)
+        # DOT - LIMITED TO 2 LEVELS
         "dca_levels": [
-            {"trigger_roi": -0.25, "multiplier": 1.50, "tp_roi": 0.06, "require_trend_filter": True},   # DCA1: -25% ROI - WIDER, requires trend check
-            {"trigger_roi": -0.35, "multiplier": 1.75, "tp_roi": 0.06, "require_trend_filter": True},   # DCA2: -35% ROI - WIDER
-            {"trigger_roi": -0.45, "multiplier": 2.00, "tp_roi": 0.05, "require_trend_filter": True},   # DCA3: -45% ROI - WIDER
-            {"trigger_roi": -0.55, "multiplier": 2.25, "tp_roi": 0.04, "require_trend_filter": True},   # DCA4: -55% ROI - WIDER
+            {"trigger_roi": -0.25, "multiplier": 1.50, "tp_roi": 0.06, "require_trend_filter": True},   # DCA1: -25% ROI
+            {"trigger_roi": -0.40, "multiplier": 1.75, "tp_roi": 0.06, "require_trend_filter": True},   # DCA2: -40% ROI
         ],
     },
     "LTCUSDT": {
@@ -288,13 +282,10 @@ DCA_CONFIG = {
     "position_divisor": 4,          # Initial size = 25% of normal
 
     # DCA Levels: ROI-BASED triggers (for 20x leverage)
-    # L1: Reduced trigger (-5% ROI instead of -10%) for faster averaging
-    # L2-L4: Keep original triggers
+    # LIMITED TO 2 LEVELS ONLY - DCA 3-4 caused liquidations in backtest
     "levels": [
-        {"trigger_roi": -0.30, "multiplier": 1.50, "tp_roi": 0.06},   # Level 1: -30% ROI - SAFE DEFAULT
-        {"trigger_roi": -0.40, "multiplier": 1.75, "tp_roi": 0.06},   # Level 2: -40% ROI - SAFE DEFAULT
-        {"trigger_roi": -0.50, "multiplier": 2.00, "tp_roi": 0.05},   # Level 3: -50% ROI - SAFE DEFAULT
-        {"trigger_roi": -0.60, "multiplier": 2.25, "tp_roi": 0.04},   # Level 4: -60% ROI - SAFE DEFAULT
+        {"trigger_roi": -0.30, "multiplier": 1.50, "tp_roi": 0.06},   # Level 1: -30% ROI
+        {"trigger_roi": -0.45, "multiplier": 1.75, "tp_roi": 0.06},   # Level 2: -45% ROI (wider gap)
     ],
     # Note: L1 triggers faster at -5% ROI, all DCA TPs also smaller
 
@@ -340,7 +331,7 @@ DCA_CONFIG = {
         "reenter_on_tp": True,              # Re-enter same side after TP hit
         "independent_dca": True,            # Each side has independent DCA levels
         "independent_trailing": True,       # Each side has independent trailing TP
-        "max_dca_per_side": 4,              # Max 4 DCA levels per side (8 total possible)
+        "max_dca_per_side": 2,              # Max 2 DCA levels per side (limited from 4)
     },
 
     # ==========================================================================
