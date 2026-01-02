@@ -73,12 +73,11 @@ class BinanceLiveTradingEngine:
         self.client = BinanceClient(testnet=testnet)
         self.testnet = testnet
 
-        # Select symbols based on mode (LIVE = DOTUSDT only, DEMO = all symbols)
-        if testnet:
-            self.symbols = FUTURES_SYMBOLS_DEMO
-        else:
-            self.symbols = FUTURES_SYMBOLS_LIVE
-            print(f"[LIVE MODE] Trading only: {', '.join(self.symbols)}")
+        # Select symbols - ALWAYS use LIVE symbols (BTC, ETH, BNB - proven 90-day winners)
+        # These performed best in backtests: BTC +6.9%, ETH +34.9%, BNB +54.3% (0 liquidations)
+        self.symbols = FUTURES_SYMBOLS_LIVE
+        mode_str = "DEMO" if testnet else "LIVE"
+        print(f"[{mode_str} MODE] Trading: {', '.join(self.symbols)}")
 
         # Initialize signal generator
         if use_mtf:

@@ -14,7 +14,10 @@ import argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from engine.live_trading_engine import BinanceLiveTradingEngine
-from config.trading_config import FUTURES_SYMBOLS, BINANCE_CONFIG
+from config.trading_config import FUTURES_SYMBOLS_LIVE, BINANCE_CONFIG
+
+# Use LIVE symbols (BTC, ETH, BNB) - the best performers
+FUTURES_SYMBOLS = FUTURES_SYMBOLS_LIVE
 
 
 def main():
