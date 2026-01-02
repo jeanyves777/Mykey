@@ -4311,13 +4311,58 @@ class BinanceLiveTradingEngine:
                 # ================================================================
                 # FIX: Cross-reference global boost_state with position
                 # If boost_state says this symbol+side should be boosted, apply it
+                # Also verify position size matches boosted amount (1.5x)
                 # ================================================================
+                boost_qty_added = False
                 if self.boost_mode_active.get(symbol, False):
                     boosted_side_for_symbol = self.boosted_side.get(symbol, None)
-                    if boosted_side_for_symbol == position_side and not is_boosted:
-                        is_boosted = True
-                        boost_multiplier = self.boost_multiplier
-                        self.log(f"  [BOOST FIX] {position_key}: Applied boost from global state (was missing)")
+                    if boosted_side_for_symbol == position_side:
+                        if not is_boosted:
+                            is_boosted = True
+                            boost_multiplier = self.boost_multiplier
+                            self.log(f"  [BOOST FIX] {position_key}: Applied boost flag from global state")
+
+                        # Check if position size is correct for boosted (should be ~1.5x base)
+                        # Base position margin should be around hedge_budget / 2 per side
+                        # If current margin is close to base (not 1.5x), we need to add 0.5x
+                        symbol_config = SYMBOL_SETTINGS.get(symbol, {})
+                        qty_precision = symbol_config.get("qty_precision", 2)
+
+                        # Calculate expected base qty (non-boosted)
+                        # Base margin = ~$5-6 for a $75 balance split across 2 symbols, 2 sides
+                        expected_base_margin = 5.0  # Approximate base margin
+                        current_qty = pos["quantity"]
+
+                        # Check saved state for original quantity before boost
+                        saved_qty = saved_pos.get("quantity", 0) if saved_pos else 0
+
+                        # If margin is close to base (not boosted size), add 0.5x
+                        if actual_margin < expected_base_margin * 1.3:  # Less than 1.3x base = not boosted
+                            try:
+                                boost_add_qty = current_qty * 0.5
+                                boost_add_qty = round(boost_add_qty, qty_precision)
+
+                                if boost_add_qty > 0:
+                                    boost_side = "SELL" if position_side == "SHORT" else "BUY"
+                                    self.log(f"  [BOOST FIX] {position_key}: Position size not boosted, adding {boost_add_qty} ({boost_side})")
+
+                                    boost_order = self.client.place_market_order(
+                                        symbol,
+                                        boost_side,
+                                        boost_add_qty,
+                                        position_side=position_side
+                                    )
+
+                                    if boost_order and "orderId" in boost_order:
+                                        # Update position quantity
+                                        pos["quantity"] = current_qty + boost_add_qty
+                                        actual_margin = actual_margin * 1.5  # Approximate new margin
+                                        boost_qty_added = True
+                                        self.log(f"  [BOOST FIX] {position_key}: SUCCESS - Now has {pos['quantity']} qty (1.5x boosted)")
+                                    else:
+                                        self.log(f"  [BOOST FIX] {position_key}: FAILED to add boost qty: {boost_order}", level="WARN")
+                            except Exception as e:
+                                self.log(f"  [BOOST FIX] {position_key}: ERROR adding boost qty: {e}", level="ERROR")
 
                 # Create local position object
                 self.positions[position_key] = LivePosition(
