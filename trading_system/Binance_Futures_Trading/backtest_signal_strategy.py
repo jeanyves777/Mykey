@@ -37,9 +37,10 @@ class SignalBacktester:
         # Position sizing - 10% per trade
         self.position_pct = 0.10  # 10% of balance per trade
 
-        # TP/SL settings (ATR-based) - SMALL TP, LARGE SL
-        self.tp_atr_mult = 1.0   # TP = 1x ATR (small, quick profits)
-        self.sl_atr_mult = 3.0   # SL = 3x ATR (wide, let trade breathe)
+        # TP settings - NO SL (isolated margin = margin is the SL)
+        # With 20x leverage: 15% ROI = 0.75% price move
+        self.tp_roi = 0.15  # 15% ROI target
+        self.use_sl = False  # NO SL - isolated margin handles it
 
         # ADX settings
         self.adx_period = 14
@@ -72,7 +73,7 @@ class SignalBacktester:
         self.long_signals = 0
         self.short_signals = 0
 
-        print(f"[{symbol}] Signal Strategy | ADX > {self.adx_threshold} | TP: {self.tp_atr_mult}x ATR | SL: {self.sl_atr_mult}x ATR")
+        print(f"[{symbol}] Signal Strategy | ADX > {self.adx_threshold} | TP: {self.tp_roi*100:.0f}% ROI | SL: NONE (isolated margin)")
 
     def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
         """Calculate Average True Range"""
@@ -198,17 +199,20 @@ class SignalBacktester:
         return None, None
 
     def open_position(self, side: str, price: float, atr: float, timestamp) -> dict:
-        """Open new position with ATR-based TP/SL"""
+        """Open new position with ROI-based TP, NO SL (isolated margin)"""
         margin = self.balance * self.position_pct
         quantity = (margin * self.leverage) / price
 
-        # Calculate TP/SL based on ATR
+        # Calculate TP based on ROI target (15% ROI = 0.75% price move with 20x)
+        price_move_pct = self.tp_roi / self.leverage  # 0.15 / 20 = 0.0075 = 0.75%
         if side == "LONG":
-            tp_price = price + (atr * self.tp_atr_mult)
-            sl_price = price - (atr * self.sl_atr_mult)
+            tp_price = price * (1 + price_move_pct)
+            # Liquidation at ~5% price drop (100% loss of margin)
+            liq_price = price * (1 - 1/self.leverage)  # ~95% of entry
         else:
-            tp_price = price - (atr * self.tp_atr_mult)
-            sl_price = price + (atr * self.sl_atr_mult)
+            tp_price = price * (1 - price_move_pct)
+            # Liquidation at ~5% price rise
+            liq_price = price * (1 + 1/self.leverage)  # ~105% of entry
 
         position = {
             "side": side,
@@ -216,7 +220,7 @@ class SignalBacktester:
             "quantity": quantity,
             "margin": margin,
             "tp_price": tp_price,
-            "sl_price": sl_price,
+            "liq_price": liq_price,  # Liquidation price (isolated margin SL)
             "atr_at_entry": atr,
             "entry_time": timestamp
         }
@@ -227,7 +231,7 @@ class SignalBacktester:
         else:
             self.short_signals += 1
 
-        print(f"[{timestamp}] OPEN {side} @ ${price:.4f} | TP: ${tp_price:.4f} | SL: ${sl_price:.4f} | ATR: ${atr:.4f}")
+        print(f"[{timestamp}] OPEN {side} @ ${price:.4f} | TP: ${tp_price:.4f} (+{self.tp_roi*100:.0f}% ROI) | LIQ: ${liq_price:.4f}")
 
         return position
 
@@ -352,7 +356,7 @@ class SignalBacktester:
         print(f"Position Size: {self.position_pct*100:.0f}% of balance")
         print(f"ADX Threshold: {self.adx_threshold}")
         print(f"ATR Expansion: {self.atr_expansion_mult}x average")
-        print(f"TP: {self.tp_atr_mult}x ATR | SL: {self.sl_atr_mult}x ATR")
+        print(f"TP: {self.tp_roi*100:.0f}% ROI | SL: NONE (Isolated Margin = Liquidation)")
         print("="*70)
 
         # Calculate indicators
@@ -390,20 +394,22 @@ class SignalBacktester:
 
             # Check existing position
             if self.position is not None:
-                # Check TP
+                # Check TP and Liquidation (NO SL - isolated margin handles it)
                 if self.position["side"] == "LONG":
                     if high >= self.position["tp_price"]:
                         self.close_position(self.position["tp_price"], "TP", timestamp)
                         continue
-                    elif low <= self.position["sl_price"]:
-                        self.close_position(self.position["sl_price"], "SL", timestamp)
+                    elif low <= self.position["liq_price"]:
+                        # Liquidation - lose entire margin
+                        self.close_position(self.position["liq_price"], "LIQUIDATION", timestamp)
                         continue
                 else:  # SHORT
                     if low <= self.position["tp_price"]:
                         self.close_position(self.position["tp_price"], "TP", timestamp)
                         continue
-                    elif high >= self.position["sl_price"]:
-                        self.close_position(self.position["sl_price"], "SL", timestamp)
+                    elif high >= self.position["liq_price"]:
+                        # Liquidation - lose entire margin
+                        self.close_position(self.position["liq_price"], "LIQUIDATION", timestamp)
                         continue
 
             # Check for entry signal (only if no position)
@@ -535,7 +541,7 @@ def run_signal_test():
     print("="*80)
     print("Strategy: ADX + Volatility signals with HTF confirmation")
     print("  - Entry: ADX > 25, ATR expansion, HTF trend alignment")
-    print("  - Exit: ATR-based TP (2x ATR) / SL (1x ATR)")
+    print("  - Exit: 15% ROI TP | NO SL (Isolated Margin = auto liquidation)")
     print("="*80)
 
     all_results = []
