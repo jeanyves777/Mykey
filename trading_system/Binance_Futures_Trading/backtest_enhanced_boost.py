@@ -42,9 +42,9 @@ class EnhancedBoostBacktester:
         # NO DCA - Empty list means no DCA levels at all
         self.dca_levels = []  # NO DCA - only initial entry
 
-        # Budget allocation - 100% for initial entry (no DCA)
+        # Budget allocation - 10% for initial entry (conservative sizing)
         self.dca_pcts = [
-            1.00,  # 100% for initial entry (no DCA levels)
+            0.10,  # 10% for initial entry (conservative - avoid liquidation)
         ]
 
         # BOOST MODE - Triggers at -20% ROI (even without DCA)
