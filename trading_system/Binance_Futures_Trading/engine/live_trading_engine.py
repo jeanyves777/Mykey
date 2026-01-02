@@ -4002,7 +4002,7 @@ class BinanceLiveTradingEngine:
                     # Extract actual symbol from key (handles both 'DOTUSDT' and 'DOTUSDT_LONG')
                     symbol = self.get_symbol_from_key(position_key)
                     side = pos.side
-                    dca_level = pos.dca_count
+                    dca_level = pos.dca_count  # Actual executed DCA count
 
                     # Get FRESH data from Binance API (in hedge mode, specify position side)
                     if self.hedge_mode:
@@ -4072,10 +4072,29 @@ class BinanceLiveTradingEngine:
                         tp_roi = DCA_CONFIG["take_profit_roi"] * 100
 
                     # DCA level already set from pos.dca_count above
-
-                    # Next DCA info (ROI-based with SYMBOL-SPECIFIC LEVELS)
+                    # Calculate VIRTUAL DCA level based on current ROI (for monitoring)
+                    # This shows what level the position HAS REACHED even if DCA was blocked
                     symbol_settings = SYMBOL_SETTINGS.get(symbol, {})
                     symbol_dca_levels = symbol_settings.get("dca_levels", None)
+
+                    current_roi_loss = abs(roi_pct) / 100  # e.g., -5% ROI = 0.05
+                    virtual_dca_level = 0
+                    if roi_pct < 0:  # Only calculate if position is in loss
+                        if symbol_dca_levels:
+                            for i, lvl in enumerate(symbol_dca_levels):
+                                if current_roi_loss >= abs(lvl["trigger_roi"]):
+                                    virtual_dca_level = i + 1
+                        else:
+                            # Use default levels with volatility multiplier
+                            volatility_mult = symbol_settings.get("dca_volatility_mult", 1.0)
+                            for i, lvl in enumerate(DCA_CONFIG["levels"]):
+                                if current_roi_loss >= abs(lvl["trigger_roi"]) * volatility_mult:
+                                    virtual_dca_level = i + 1
+
+                    # Use virtual level for display if it's higher than executed level
+                    display_dca_level = max(dca_level, virtual_dca_level)
+
+                    # Next DCA info (ROI-based with SYMBOL-SPECIFIC LEVELS)
                     
                     if symbol_dca_levels and dca_level < len(symbol_dca_levels):
                         # Use symbol-specific DCA levels (no volatility multiplier needed)
@@ -4132,17 +4151,20 @@ class BinanceLiveTradingEngine:
                     else:
                         boost_tag = ""
 
+                    # Show virtual level indicator if position reached deeper than executed DCAs
+                    dca_display = f"{display_dca_level}/4" if virtual_dca_level <= dca_level else f"{dca_level}({virtual_dca_level})/4"
+
                     if local_pos and local_pos.trailing_active:
                         trailing_config = DCA_CONFIG.get("trailing_tp", {})
                         trail_distance = trailing_config.get("trail_distance_roi", 0.15) * 100
                         trigger_roi = (local_pos.peak_roi - trailing_config.get("trail_distance_roi", 0.15)) * 100
-                        print(f"    DCA: {dca_level}/4{boost_tag} | Margin: ${margin_used:.2f} | TRAILING TP: Peak {local_pos.peak_roi*100:.1f}% (exit @ {trigger_roi:.1f}%)")
+                        print(f"    DCA: {dca_display}{boost_tag} | Margin: ${margin_used:.2f} | TRAILING TP: Peak {local_pos.peak_roi*100:.1f}% (exit @ {trigger_roi:.1f}%)")
                     elif local_pos and local_pos.peak_roi > 0:
                         trailing_config = DCA_CONFIG.get("trailing_tp", {})
                         activation = trailing_config.get("activation_roi", 0.20) * 100
-                        print(f"    DCA: {dca_level}/4{boost_tag} | Margin: ${margin_used:.2f} | Peak ROI: {local_pos.peak_roi*100:.1f}% (trail @ {activation:.0f}%)")
+                        print(f"    DCA: {dca_display}{boost_tag} | Margin: ${margin_used:.2f} | Peak ROI: {local_pos.peak_roi*100:.1f}% (trail @ {activation:.0f}%)")
                     else:
-                        print(f"    DCA: {dca_level}/4{boost_tag} | Margin: ${margin_used:.2f}")
+                        print(f"    DCA: {dca_display}{boost_tag} | Margin: ${margin_used:.2f}")
                     if next_dca_price > 0:
                         # BOOSTED positions don't DCA - skip showing next DCA
                         if is_boosted:
