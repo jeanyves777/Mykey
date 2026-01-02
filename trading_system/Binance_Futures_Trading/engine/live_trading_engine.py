@@ -19,7 +19,7 @@ from config.trading_config import (
     FUTURES_SYMBOLS, FUTURES_SYMBOLS_LIVE, FUTURES_SYMBOLS_DEMO,
     STRATEGY_CONFIG, RISK_CONFIG, DCA_CONFIG,
     LOGGING_CONFIG, MOMENTUM_CONFIG, BINANCE_CONFIG, SYMBOL_SETTINGS,
-    SMART_COMPOUNDING_CONFIG
+    SMART_COMPOUNDING_CONFIG, STRONG_TREND_CONFIG
 )
 from engine.binance_client import BinanceClient
 from engine.momentum_signal import MasterMomentumSignal, MultiTimeframeMomentumSignal, TradingSignal, SignalType
@@ -837,6 +837,10 @@ class BinanceLiveTradingEngine:
         - Block ALL DCA on loser side
         - BOOST winner side by 2x (add 1x to current position)
         """
+        # Check if strong trend mode is enabled in config
+        if not STRONG_TREND_CONFIG.get("enabled", False):
+            return False
+
         if self.boost_mode_active.get(symbol, False):
             self.log(f"[STRONG TREND] {symbol}: NOT activating - Boost Mode already active", level="INFO")
             return False
@@ -919,7 +923,11 @@ class BinanceLiveTradingEngine:
         ALL DCA is blocked on the LOSER side during strong trends (ADX > 40).
         Returns: (is_blocked, reason)
         """
-        # First check if strong trend mode is active
+        # Check if strong trend mode is enabled in config
+        if not STRONG_TREND_CONFIG.get("enabled", False):
+            return False, None
+
+        # Then check if strong trend mode is active for this symbol
         if not self.strong_trend_mode.get(symbol, False):
             return False, None
 
@@ -3321,23 +3329,25 @@ class BinanceLiveTradingEngine:
         # ================================================================
         # STRONG TREND MODE: Check and update for each symbol
         # When ADX > 40, activate Strong Trend Mode and block DCA 2+ on loser side
+        # DISABLED by default - only use boost_mode (ROI-based)
         # ================================================================
-        processed_symbols = set()
-        for pos_key in list(self.positions.keys()):
-            sym = self.get_symbol_from_key(pos_key)
-            if sym in processed_symbols:
-                continue
-            processed_symbols.add(sym)
+        if STRONG_TREND_CONFIG.get("enabled", False):
+            processed_symbols = set()
+            for pos_key in list(self.positions.keys()):
+                sym = self.get_symbol_from_key(pos_key)
+                if sym in processed_symbols:
+                    continue
+                processed_symbols.add(sym)
 
-            if self.boost_mode_active.get(sym, False):
-                continue
+                if self.boost_mode_active.get(sym, False):
+                    continue
 
-            is_strong, direction = self.check_strong_trend_mode(sym)
+                is_strong, direction = self.check_strong_trend_mode(sym)
 
-            if is_strong and not self.strong_trend_mode.get(sym, False):
-                self.activate_strong_trend_mode(sym, direction)
-            elif not is_strong and self.strong_trend_mode.get(sym, False):
-                self.deactivate_strong_trend_mode(sym, f"ADX dropped below {self.adx_threshold}")
+                if is_strong and not self.strong_trend_mode.get(sym, False):
+                    self.activate_strong_trend_mode(sym, direction)
+                elif not is_strong and self.strong_trend_mode.get(sym, False):
+                    self.deactivate_strong_trend_mode(sym, f"ADX dropped below {self.adx_threshold}")
 
 
         # Check each position

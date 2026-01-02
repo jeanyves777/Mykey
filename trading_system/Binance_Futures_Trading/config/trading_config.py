@@ -434,6 +434,7 @@ DCA_CONFIG = {
 # - Loser side: ALL DCA is BLOCKED (no adding to losing positions!)
 # This is MUTUALLY EXCLUSIVE with Boost Mode (Boost Mode takes priority)
 STRONG_TREND_CONFIG = {
+    "enabled": False,                 # DISABLED - Only use boost_mode (ROI-based)
     "adx_threshold": 40,              # ADX > 40 = strong trend (activates mode)
     "winner_boost": 2.0,              # 2x entry on winner side
     "block_loser_dca": True,          # Block ALL DCA on loser side
