@@ -2177,96 +2177,132 @@ class BinanceLiveTradingEngine:
             # Add to pending so next scan cycle can try again
             self.pending_reentry[symbol] = closed_side
 
-    def check_hybrid_dca_filter(self, symbol: str, position: LivePosition, dca_level: int, df: pd.DataFrame) -> tuple:
+    def check_hybrid_dca_filter(self, symbol: str, position: LivePosition, dca_level: int, df: pd.DataFrame, market_data: dict = None) -> tuple:
         """
-        Check DCA filter based on level (Easy for 1-2, Strict for 3-4).
+        Check DCA filter with STRICT rules + Higher Timeframe validation.
+
+        Validates:
+        1. 1m: RSI extreme, reversal candle, momentum weakening
+        2. 1H: RSI confirmation (not extreme opposite direction)
+        3. 4H: Trend alignment (EMA direction must match DCA side)
 
         Returns: (can_dca: bool, reason: str)
         """
         try:
             filter_config = DCA_CONFIG.get("hybrid_dca_filters", {})
-            easy_levels = []  # NO EASY LEVELS - ALL ARE STRICT
             strict_levels = [1, 2, 3, 4]  # ALL LEVELS ARE STRICT
 
-            # Calculate basic indicators
+            reasons = []
+            passed = True
+
+            # ================================================================
+            # 1M TIMEFRAME CHECKS (existing strict logic)
+            # ================================================================
+            # Calculate 1m RSI
             delta = df["close"].diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
             rs = gain / loss
             rsi = 100 - (100 / (1 + rs))
-            current_rsi = rsi.iloc[-1]
+            current_rsi_1m = rsi.iloc[-1]
 
-            # Calculate momentum (rate of change)
+            # Calculate 1m momentum
             momentum = df["close"].pct_change(periods=5).iloc[-1] * 100
             prev_momentum = df["close"].pct_change(periods=5).iloc[-2] * 100 if len(df) > 6 else momentum
-
-            # Momentum weakening check
             momentum_weakening = abs(momentum) < abs(prev_momentum)
-            momentum_reduction = 1 - (abs(momentum) / abs(prev_momentum)) if abs(prev_momentum) > 0 else 0
 
-            # EASY FILTER (DCA 1-2): Just check momentum weakening
-            if dca_level in easy_levels:
-                easy_threshold = filter_config.get("easy_momentum_threshold", 0.3)
+            # RSI thresholds
+            rsi_oversold = 30  # RSI must be below 30 for LONG DCA
+            rsi_overbought = 70  # RSI must be above 70 for SHORT DCA
 
-                if momentum_weakening or momentum_reduction >= easy_threshold:
-                    return True, f"L{dca_level} EASY: Mom weak {momentum_reduction*100:.0f}%"
-                else:
-                    return False, f"L{dca_level} BLOCKED: Conditions not met"
+            # Check 1m RSI extreme
+            if position.side == "LONG" and current_rsi_1m > rsi_oversold:
+                passed = False
+                reasons.append(f"1m RSI not oversold ({current_rsi_1m:.0f}>{rsi_oversold})")
+            elif position.side == "SHORT" and current_rsi_1m < rsi_overbought:
+                passed = False
+                reasons.append(f"1m RSI not overbought ({current_rsi_1m:.0f}<{rsi_overbought})")
 
-            # STRICT FILTER (DCA 3-4): Require multiple confirmations
-            if dca_level in strict_levels:
-                strict_threshold = filter_config.get("strict_momentum_threshold", 0.5)
-                require_reversal = filter_config.get("strict_require_reversal", True)
-                require_rsi_extreme = filter_config.get("strict_require_rsi_extreme", True)
-                rsi_oversold = 30  # RSI must be below 30 for LONG DCA
-                rsi_overbought = 70  # RSI must be above 70 for SHORT DCA
+            # Check reversal candle
+            last_candle = df.iloc[-1]
+            prev_candle = df.iloc[-2]
 
-                reasons = []
-                passed = True
+            if position.side == "LONG":
+                is_reversal = (last_candle["close"] > last_candle["open"] and
+                              prev_candle["close"] < prev_candle["open"])
+            else:
+                is_reversal = (last_candle["close"] < last_candle["open"] and
+                              prev_candle["close"] > prev_candle["open"])
 
-                # Check momentum
-                if momentum_reduction < strict_threshold and not momentum_weakening:
-                    passed = False
-                    reasons.append(f"Mom not weak ({momentum_reduction*100:.0f}%<{strict_threshold*100:.0f}%)")
+            if not is_reversal:
+                passed = False
+                reasons.append("No 1m reversal candle")
 
-                # Check RSI extreme (for LONG DCA, need oversold; for SHORT DCA, need overbought)
-                if require_rsi_extreme:
-                    if position.side == "LONG" and current_rsi > rsi_oversold:
+            # ================================================================
+            # HIGHER TIMEFRAME VALIDATION (NEW)
+            # ================================================================
+            if market_data:
+                # 1H RSI CONFIRMATION
+                df_1h = market_data.get("1h")
+                if df_1h is not None and len(df_1h) >= 14:
+                    delta_1h = df_1h["close"].diff()
+                    gain_1h = (delta_1h.where(delta_1h > 0, 0)).rolling(window=14).mean()
+                    loss_1h = (-delta_1h.where(delta_1h < 0, 0)).rolling(window=14).mean()
+                    rs_1h = gain_1h / loss_1h
+                    rsi_1h = 100 - (100 / (1 + rs_1h))
+                    current_rsi_1h = rsi_1h.iloc[-1]
+
+                    if not pd.isna(current_rsi_1h):
+                        # For LONG DCA: 1H RSI should NOT be overbought (< 75)
+                        # For SHORT DCA: 1H RSI should NOT be oversold (> 25)
+                        if position.side == "LONG" and current_rsi_1h > 75:
+                            passed = False
+                            reasons.append(f"1H RSI overbought ({current_rsi_1h:.0f}>75)")
+                        elif position.side == "SHORT" and current_rsi_1h < 25:
+                            passed = False
+                            reasons.append(f"1H RSI oversold ({current_rsi_1h:.0f}<25)")
+
+                # 4H TREND ALIGNMENT (EMA check)
+                df_4h = market_data.get("4h")
+                if df_4h is not None and len(df_4h) >= 26:
+                    # Calculate EMAs on 4H
+                    ema_fast = df_4h["close"].ewm(span=12, adjust=False).mean()
+                    ema_slow = df_4h["close"].ewm(span=26, adjust=False).mean()
+
+                    ema_fast_val = ema_fast.iloc[-1]
+                    ema_slow_val = ema_slow.iloc[-1]
+                    current_price = df_4h["close"].iloc[-1]
+
+                    # Determine 4H trend
+                    is_4h_bullish = ema_fast_val > ema_slow_val and current_price > ema_fast_val
+                    is_4h_bearish = ema_fast_val < ema_slow_val and current_price < ema_fast_val
+
+                    # For LONG DCA: 4H should NOT be strongly bearish
+                    # For SHORT DCA: 4H should NOT be strongly bullish
+                    if position.side == "LONG" and is_4h_bearish:
                         passed = False
-                        reasons.append(f"RSI not oversold ({current_rsi:.0f}>{rsi_oversold})")
-                    elif position.side == "SHORT" and current_rsi < rsi_overbought:
+                        reasons.append(f"4H trend bearish (EMA12<EMA26)")
+                    elif position.side == "SHORT" and is_4h_bullish:
                         passed = False
-                        reasons.append(f"RSI not overbought ({current_rsi:.0f}<{rsi_overbought})")
+                        reasons.append(f"4H trend bullish (EMA12>EMA26)")
 
-                # Check reversal candle
-                if require_reversal:
-                    last_candle = df.iloc[-1]
-                    prev_candle = df.iloc[-2]
-
-                    if position.side == "LONG":
-                        # Need bullish reversal (green candle after red)
-                        is_reversal = (last_candle["close"] > last_candle["open"] and
-                                      prev_candle["close"] < prev_candle["open"])
-                    else:
-                        # Need bearish reversal (red candle after green)
-                        is_reversal = (last_candle["close"] < last_candle["open"] and
-                                      prev_candle["close"] > prev_candle["open"])
-
-                    if not is_reversal:
-                        passed = False
-                        reasons.append("No reversal candle")
-
-                if passed:
-                    return True, f"L{dca_level} STRICT: All checks passed"
-                else:
-                    return False, f"L{dca_level} STRICT BLOCKED: {', '.join(reasons)}"
-
-            # Default: use existing signal generator
-            return self.signal_generator.can_dca(df, position.side, dca_level)
+            # ================================================================
+            # RESULT
+            # ================================================================
+            if passed:
+                htf_status = ""
+                if market_data:
+                    df_1h = market_data.get("1h")
+                    df_4h = market_data.get("4h")
+                    if df_1h is not None and df_4h is not None:
+                        htf_status = " | HTF aligned"
+                return True, f"L{dca_level} STRICT: All checks passed{htf_status}"
+            else:
+                return False, f"L{dca_level} STRICT BLOCKED: {', '.join(reasons)}"
 
         except Exception as e:
             self.log(f"Hybrid DCA filter error: {e}", level="WARN")
-            return True, "Filter error, allowing DCA"
+            return False, f"Filter error: {e}"
 
     def calculate_position_size(self, symbol: str, price: float, is_dca: bool = False, dca_level: int = 0) -> float:
         """
@@ -2895,13 +2931,14 @@ class BinanceLiveTradingEngine:
                 return
 
             # =================================================================
-            # HYBRID DCA FILTER: Easy for L1-2, Strict for L3-4
+            # HYBRID DCA FILTER: STRICT + Higher Timeframe Validation
             # =================================================================
             if symbol in self.data_buffer and self.data_buffer[symbol] is not None:
-                df = self.data_buffer[symbol].get("1m") if isinstance(self.data_buffer[symbol], dict) else self.data_buffer[symbol]
+                market_data = self.data_buffer[symbol] if isinstance(self.data_buffer[symbol], dict) else {"1m": self.data_buffer[symbol]}
+                df = market_data.get("1m")
                 if df is not None:
-                    # Use HYBRID filter (easy for L1-2, strict for L3-4)
-                    can_dca, reason = self.check_hybrid_dca_filter(symbol, position, dca_level, df)
+                    # Use STRICT filter with Higher Timeframe validation
+                    can_dca, reason = self.check_hybrid_dca_filter(symbol, position, dca_level, df, market_data)
 
                     if not can_dca:
                         # Filter blocked DCA

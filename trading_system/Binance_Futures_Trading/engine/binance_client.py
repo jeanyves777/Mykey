@@ -255,6 +255,7 @@ class BinanceClient:
         data["5m"] = self.get_klines(symbol, "5m", DATA_CONFIG["candles_5m"])
         data["15m"] = self.get_klines(symbol, "15m", DATA_CONFIG["candles_15m"])
         data["1h"] = self.get_klines(symbol, "1h", DATA_CONFIG["candles_1h"])
+        data["4h"] = self.get_klines(symbol, "4h", DATA_CONFIG.get("candles_4h", 30))
 
         return data
 

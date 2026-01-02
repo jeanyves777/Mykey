@@ -504,6 +504,7 @@ DATA_CONFIG = {
     "candles_5m": 100,       # 5-minute candles
     "candles_15m": 50,       # 15-minute candles
     "candles_1h": 50,        # 1-hour candles
+    "candles_4h": 30,        # 4-hour candles (for HTF trend validation)
 }
 
 # =============================================================================
