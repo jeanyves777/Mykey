@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Backtest Hedge + DCA + ENHANCED BOOST MODE Strategy v4
+Backtest Hedge + DCA + ENHANCED BOOST MODE Strategy v5
 =======================================================
+LIMITED DCA TEST - Only DCA 0 and DCA 1 (no DCA 2-4)
+Boost triggers at DCA 1 (-20% ROI)
+
 IMPROVEMENTS:
-1. Smart Boost at DCA 3 (trigger level)
+1. Smart Boost at DCA 1 (-20% ROI trigger)
 2. Increased TP levels ONLY during boost mode
 3. STOP FOR THE DAY after SL hit - restart next day
 4. STRONG TREND MODE - Block ALL DCA on loser side when ADX > 40
 5. CSV trade journal export
 
 Enhanced Boost Mode with:
-1. At DCA 3 trigger -> Boost opposite side 1.5x
+1. At DCA 1 trigger (-20% ROI) -> Boost opposite side 1.5x
 2. When boosted side hits TP: Close HALF, lock profit, add back 0.5x
 3. Trailing stop activates AFTER each half-close cycle
 4. Continue until losing side recovers (TP) or hits SL
@@ -42,21 +45,23 @@ class EnhancedBoostBacktester:
         # Strategy params - USE SYMBOL-SPECIFIC if available
         self.tp_roi = symbol_config.get("tp_roi", DCA_CONFIG["take_profit_roi"])
         self.sl_roi = DCA_CONFIG["stop_loss_roi"]    # 90% (same for all)
-        self.dca_levels = symbol_config.get("dca_levels", DCA_CONFIG["levels"])
         self.budget_split = DCA_CONFIG["hedge_mode"]["budget_split"]  # 50%
 
-        # DCA budget allocation percentages
-        self.dca_pcts = [
-            DCA_CONFIG.get("initial_entry_pct", 0.10),  # 10%
-            DCA_CONFIG.get("dca1_pct", 0.15),           # 15%
-            DCA_CONFIG.get("dca2_pct", 0.20),           # 20%
-            DCA_CONFIG.get("dca3_pct", 0.25),           # 25%
-            DCA_CONFIG.get("dca4_pct", 0.30),           # 30%
+        # DCA LEVELS - LIMITED TO 1 ONLY (no DCA 2-4)
+        # Override any symbol-specific settings
+        self.dca_levels = [
+            {"trigger_roi": -0.20, "multiplier": 1.50, "tp_roi": 0.06},   # DCA 1: -20% ROI trigger
         ]
 
-        # ENHANCED BOOST PARAMETERS - BOOST AT DCA 2 (only 2 DCA levels now)
+        # DCA budget allocation percentages (only 2 entries needed: initial + DCA1)
+        self.dca_pcts = [
+            0.40,  # 40% for initial entry (larger since fewer DCA levels)
+            0.60,  # 60% for DCA level 1
+        ]
+
+        # ENHANCED BOOST PARAMETERS - BOOST AT DCA 1 (only 1 DCA level now)
         self.boost_multiplier = 1.5  # 1.5x boost
-        self.boost_trigger_dca_level = 2  # DCA 2 trigger (limited from 3)
+        self.boost_trigger_dca_level = 1  # DCA 1 trigger (at -20% ROI)
         self.boost_tp_multiplier = 1.5  # Increase TP by 50% during boost mode
         self.trailing_activation_roi = 0.02  # Start trailing after 2% ROI profit
         self.trailing_distance_roi = 0.03    # Trail 3% behind peak
