@@ -2128,8 +2128,8 @@ class BinanceLiveTradingEngine:
         """
         try:
             filter_config = DCA_CONFIG.get("hybrid_dca_filters", {})
-            easy_levels = filter_config.get("easy_levels", [1, 2])
-            strict_levels = filter_config.get("strict_levels", [3, 4])
+            easy_levels = []  # NO EASY LEVELS - ALL ARE STRICT
+            strict_levels = [1, 2, 3, 4]  # ALL LEVELS ARE STRICT
 
             # Calculate basic indicators
             delta = df["close"].diff()
@@ -2154,15 +2154,15 @@ class BinanceLiveTradingEngine:
                 if momentum_weakening or momentum_reduction >= easy_threshold:
                     return True, f"L{dca_level} EASY: Mom weak {momentum_reduction*100:.0f}%"
                 else:
-                    return True, f"L{dca_level} EASY: Allowed (fast avg)"  # Easy levels always allowed
+                    return False, f"L{dca_level} BLOCKED: Conditions not met"
 
             # STRICT FILTER (DCA 3-4): Require multiple confirmations
             if dca_level in strict_levels:
                 strict_threshold = filter_config.get("strict_momentum_threshold", 0.5)
                 require_reversal = filter_config.get("strict_require_reversal", True)
                 require_rsi_extreme = filter_config.get("strict_require_rsi_extreme", True)
-                rsi_oversold = filter_config.get("strict_rsi_oversold", 25)
-                rsi_overbought = filter_config.get("strict_rsi_overbought", 75)
+                rsi_oversold = 30  # RSI must be below 30 for LONG DCA
+                rsi_overbought = 70  # RSI must be above 70 for SHORT DCA
 
                 reasons = []
                 passed = True
