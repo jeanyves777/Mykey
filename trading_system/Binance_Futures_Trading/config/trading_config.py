@@ -39,12 +39,12 @@ BINANCE_CONFIG = {
 # =============================================================================
 # 2. TRADING SYMBOLS - OPTIMIZED FOR SCALPING
 # =============================================================================
-# LIVE MODE: Top performers with Enhanced Boost Mode
-# NOTE: BTC removed - requires $100 min notional ($10 margin with 20x leverage), will add back when capital allows
+# LIVE MODE: Top performers with Enhanced Boost Mode (90-day backtest winners)
+# BTC: +6.9%, ETH: +34.9%, BNB: +54.3% - All with ZERO liquidations
 FUTURES_SYMBOLS_LIVE = [
-    "DOTUSDT",   # Polkadot - Best performer: +93.1% in 90-day backtest
-    "BNBUSDT",   # BNB - Binance native token
-    # "BTCUSDT",   # Bitcoin - Disabled: needs ~$10 margin for min $100 notional
+    "BTCUSDT",   # Bitcoin - +6.9% in 90-day backtest, 0 liquidations
+    "ETHUSDT",   # Ethereum - +34.9% in 90-day backtest, 0 liquidations
+    "BNBUSDT",   # BNB - +54.3% in 90-day backtest, 0 liquidations (BEST)
 ]
 
 # DEMO MODE: All symbols for testing
