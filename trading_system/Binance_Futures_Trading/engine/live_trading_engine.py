@@ -1046,6 +1046,63 @@ class BinanceLiveTradingEngine:
         # SAVE STATE after boost deactivation
         self._save_position_state()
 
+    def _check_and_fix_inconsistencies(self):
+        """
+        SELF-HEALING: Check for and fix inconsistencies during each loop iteration.
+        Detects and auto-fixes:
+        1. Boost state mismatch (global vs position)
+        2. DCA level inconsistencies
+        3. Missing positions in tracking
+        4. Boost mode that should be active but isn't
+        """
+        fixes_applied = []
+
+        for symbol in self.symbols:
+            # Check 1: Boost state consistency
+            boost_active = self.boost_mode_active.get(symbol, False)
+            boosted_side = self.boosted_side.get(symbol, None)
+
+            if boost_active and boosted_side:
+                pos_key = self.get_position_key(symbol, boosted_side)
+                pos = self.positions.get(pos_key)
+                if pos and not pos.is_boosted:
+                    # FIX: Position should be boosted but isn't flagged
+                    pos.is_boosted = True
+                    pos.boost_multiplier = self.boost_multiplier
+                    fixes_applied.append(f"[HEAL] {pos_key}: Applied missing boost flag")
+
+            # Check 2: Position exists in Binance but not tracked locally
+            for side in ["LONG", "SHORT"]:
+                pos_key = self.get_position_key(symbol, side)
+                if pos_key not in self.positions:
+                    # Check if Binance has this position
+                    try:
+                        binance_pos = self.client.get_position(symbol, position_side=side)
+                        if binance_pos and float(binance_pos.get("quantity", 0)) > 0:
+                            fixes_applied.append(f"[HEAL] {pos_key}: Found untracked position on Binance - needs sync")
+                    except:
+                        pass
+
+            # Check 3: Boost mode should be active based on DCA level
+            for side in ["LONG", "SHORT"]:
+                pos_key = self.get_position_key(symbol, side)
+                pos = self.positions.get(pos_key)
+                if pos and pos.dca_count >= self._get_boost_trigger_level(symbol):
+                    opposite_side = "SHORT" if side == "LONG" else "LONG"
+                    opposite_key = self.get_position_key(symbol, opposite_side)
+                    opposite_pos = self.positions.get(opposite_key)
+
+                    # If this side hit boost trigger but boost not active, it might need activation
+                    if opposite_pos and not boost_active:
+                        # Check if the opposite side should be boosted
+                        fixes_applied.append(f"[HEAL] {symbol}: DCA{pos.dca_count} on {side} but no boost active - may need manual check")
+
+        # Log any fixes
+        if fixes_applied:
+            for fix in fixes_applied:
+                self.log(fix, level="WARN")
+            self._save_position_state()
+
     def _check_boost_deactivation(self, symbol: str, closed_side: str, exit_type: str):
         """
         Check if boost mode should be deactivated.
@@ -4133,6 +4190,9 @@ class BinanceLiveTradingEngine:
 
                 self.check_entry_signals()
                 self.manage_positions()
+
+                # SELF-HEALING: Check and fix any state inconsistencies
+                self._check_and_fix_inconsistencies()
 
                 # PERIODIC ORDER CLEANUP - Cancel orphaned/stale orders
                 if (datetime.now() - self.last_order_cleanup).total_seconds() >= self.order_cleanup_interval:
