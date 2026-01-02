@@ -103,6 +103,10 @@ class EnhancedBoostBacktester:
         self.sl_hits_short = 0
         self.days_stopped = 0  # Count of days stopped due to SL
 
+        # Liquidation stats
+        self.liquidations_long = 0
+        self.liquidations_short = 0
+
         # Signal cooldown after SL (bars to wait before re-entering)
         self.cooldown_bars = 5  # Wait 5 candles after SL before re-entry
         self.cooldown_remaining = 0  # Current cooldown counter
@@ -414,8 +418,57 @@ class EnhancedBoostBacktester:
         position["dca_level"] = dca_level + 1
         position["tp_price"] = self.get_tp_price(new_entry, position["side"], dca_level + 1)
         position["sl_price"] = self.get_sl_price(new_entry, position["side"])
+        # Recalculate liquidation price after DCA
+        position["liq_price"] = self.calculate_liquidation_price(new_entry, position["side"], new_margin, new_qty)
 
         return position
+
+    def calculate_liquidation_price(self, entry_price: float, side: str, margin: float, quantity: float) -> float:
+        """
+        Calculate real liquidation price for isolated margin position.
+
+        Binance Futures Liquidation Formula (Isolated):
+        For LONG: Liq = Entry - (Margin - Maintenance Margin) / Quantity
+        For SHORT: Liq = Entry + (Margin - Maintenance Margin) / Quantity
+
+        Maintenance Margin = Position Value * MMR
+        Position Value = Entry * Quantity
+        MMR (Maintenance Margin Rate) = 0.4% for most pairs at <$50k position
+        """
+        mmr = 0.004  # 0.4% maintenance margin rate (Binance standard for most tiers)
+        position_value = entry_price * quantity
+        maintenance_margin = position_value * mmr
+
+        # Liquidation happens when remaining margin = maintenance margin
+        margin_buffer = margin - maintenance_margin
+
+        if side == "LONG":
+            # LONG liquidates when price drops enough to exhaust margin buffer
+            liq_price = entry_price - (margin_buffer / quantity)
+        else:
+            # SHORT liquidates when price rises enough to exhaust margin buffer
+            liq_price = entry_price + (margin_buffer / quantity)
+
+        return max(0, liq_price)  # Price can't be negative
+
+    def check_liquidation(self, position: dict, low: float, high: float) -> bool:
+        """
+        Check if position got liquidated based on price extremes.
+        Returns True if liquidated.
+        """
+        if position is None:
+            return False
+
+        liq_price = position.get("liq_price", 0)
+        if liq_price <= 0:
+            return False
+
+        if position["side"] == "LONG":
+            # LONG liquidates if low hits or passes liquidation price
+            return low <= liq_price
+        else:
+            # SHORT liquidates if high hits or passes liquidation price
+            return high >= liq_price
 
     def open_position(self, side: str, price: float, boost_multiplier: float = 1.0) -> dict:
         """Open new position with optional boost multiplier"""
@@ -428,6 +481,9 @@ class EnhancedBoostBacktester:
         quantity = (initial_margin * self.leverage) / price
         is_boosted = boost_multiplier > 1.0
 
+        # Calculate real liquidation price
+        liq_price = self.calculate_liquidation_price(price, side, initial_margin, quantity)
+
         position = {
             "side": side,
             "entry_price": price,
@@ -436,6 +492,7 @@ class EnhancedBoostBacktester:
             "dca_level": 0,
             "tp_price": self.get_tp_price(price, side, 0, is_boosted=is_boosted),  # Use boosted TP
             "sl_price": self.get_sl_price(price, side),
+            "liq_price": liq_price,  # Real liquidation price
             "is_boosted": is_boosted,
             "boost_multiplier": boost_multiplier
         }
@@ -698,6 +755,39 @@ class EnhancedBoostBacktester:
             if self.long_position:
                 is_boosted = self.long_position.get("is_boosted", False)
 
+                # LIQUIDATION CHECK - Check FIRST before any other exit conditions
+                if self.check_liquidation(self.long_position, low, high):
+                    liq_price = self.long_position["liq_price"]
+                    margin_lost = self.long_position["margin"]
+                    self.balance -= margin_lost  # Lose entire margin
+                    if self.balance < 0:
+                        self.balance = 0
+                    self.total_losses += 1
+                    self.total_pnl -= margin_lost
+                    self.liquidations_long += 1
+                    print(f"[{timestamp}] >>> LONG LIQUIDATED @ ${liq_price:.4f} | Lost: ${margin_lost:.2f} | DCA: {self.long_position['dca_level']}")
+                    self.trades.append({
+                        "timestamp": timestamp,
+                        "side": "LONG",
+                        "entry_price": self.long_position["entry_price"],
+                        "exit_price": liq_price,
+                        "quantity": self.long_position["quantity"],
+                        "margin": margin_lost,
+                        "dca_level": self.long_position["dca_level"],
+                        "pnl": -margin_lost,
+                        "exit_type": "LIQUIDATION",
+                        "balance": self.balance,
+                        "is_boosted": is_boosted,
+                        "close_pct": 1.0
+                    })
+                    self.long_position = None
+                    # Deactivate boost mode if this side was boosted
+                    if self.boost_mode_active and self.boosted_side == "LONG":
+                        self.deactivate_boost_mode(timestamp, "LONG liquidated")
+                    self.stopped_for_day = True
+                    self.sl_hit_date = timestamp.date() if hasattr(timestamp, 'date') else timestamp
+                    continue
+
                 # Check if this position is marked for trailing close (after SL on other side)
                 if self.long_position.get("trailing_for_close", False) and self.trailing_active:
                     should_trail_close, trail_price = self.check_trailing_stop(self.long_position, close)
@@ -829,6 +919,39 @@ class EnhancedBoostBacktester:
             # Check SHORT position
             if self.short_position:
                 is_boosted = self.short_position.get("is_boosted", False)
+
+                # LIQUIDATION CHECK - Check FIRST before any other exit conditions
+                if self.check_liquidation(self.short_position, low, high):
+                    liq_price = self.short_position["liq_price"]
+                    margin_lost = self.short_position["margin"]
+                    self.balance -= margin_lost  # Lose entire margin
+                    if self.balance < 0:
+                        self.balance = 0
+                    self.total_losses += 1
+                    self.total_pnl -= margin_lost
+                    self.liquidations_short += 1
+                    print(f"[{timestamp}] >>> SHORT LIQUIDATED @ ${liq_price:.4f} | Lost: ${margin_lost:.2f} | DCA: {self.short_position['dca_level']}")
+                    self.trades.append({
+                        "timestamp": timestamp,
+                        "side": "SHORT",
+                        "entry_price": self.short_position["entry_price"],
+                        "exit_price": liq_price,
+                        "quantity": self.short_position["quantity"],
+                        "margin": margin_lost,
+                        "dca_level": self.short_position["dca_level"],
+                        "pnl": -margin_lost,
+                        "exit_type": "LIQUIDATION",
+                        "balance": self.balance,
+                        "is_boosted": is_boosted,
+                        "close_pct": 1.0
+                    })
+                    self.short_position = None
+                    # Deactivate boost mode if this side was boosted
+                    if self.boost_mode_active and self.boosted_side == "SHORT":
+                        self.deactivate_boost_mode(timestamp, "SHORT liquidated")
+                    self.stopped_for_day = True
+                    self.sl_hit_date = timestamp.date() if hasattr(timestamp, 'date') else timestamp
+                    continue
 
                 # Check if this position is marked for trailing close (after SL on other side)
                 if self.short_position.get("trailing_for_close", False) and self.trailing_active:
@@ -1007,6 +1130,9 @@ class EnhancedBoostBacktester:
             "trailing_closes": self.trailing_closes,
             "strong_trend_activations": self.strong_trend_activations,
             "scale_in_count": self.scale_in_count,
+            "liquidations_long": self.liquidations_long,
+            "liquidations_short": self.liquidations_short,
+            "liquidations_total": self.liquidations_long + self.liquidations_short,
             "liquidated": self.balance <= 0
         }
 
@@ -1100,6 +1226,12 @@ class EnhancedBoostBacktester:
         print(f"  SL Hits (SHORT):     {self.sl_hits_short}")
         print(f"  Total SL Hits:       {self.sl_hits_long + self.sl_hits_short}")
         print(f"  Days Stopped:        {self.days_stopped}")
+
+        # Liquidation Analysis
+        print(f"\n>>> LIQUIDATION Analysis (Real Liq Prices):")
+        print(f"  LONG Liquidations:   {self.liquidations_long}")
+        print(f"  SHORT Liquidations:  {self.liquidations_short}")
+        print(f"  Total Liquidations:  {self.liquidations_long + self.liquidations_short}")
 
         # Strong Trend Mode Analysis
         print(f"\n>>> STRONG TREND MODE Analysis:")
