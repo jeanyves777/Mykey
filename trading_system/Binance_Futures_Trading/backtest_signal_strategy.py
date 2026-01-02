@@ -37,9 +37,9 @@ class SignalBacktester:
         # Position sizing - 10% per trade
         self.position_pct = 0.10  # 10% of balance per trade
 
-        # TP/SL settings (ATR-based)
-        self.tp_atr_mult = 2.0   # TP = 2x ATR
-        self.sl_atr_mult = 1.0   # SL = 1x ATR
+        # TP/SL settings (ATR-based) - SMALL TP, LARGE SL
+        self.tp_atr_mult = 1.0   # TP = 1x ATR (small, quick profits)
+        self.sl_atr_mult = 3.0   # SL = 3x ATR (wide, let trade breathe)
 
         # ADX settings
         self.adx_period = 14

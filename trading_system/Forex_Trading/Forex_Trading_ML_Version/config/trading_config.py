@@ -127,146 +127,44 @@ class DCAConfig:
     - DCA Level 2: 16 pips loss -> add 1.50x
     - DCA Level 3: 24 pips loss -> add 1.75x
     - DCA Level 4: 32 pips loss -> add 2.00x
-    - DCA Level 5: 40 pips loss -> add 2.25x
-    - DCA Level 6: 48 pips loss -> add 2.50x
-    - Initial SL: 55 pips (beyond all DCAs)
-    - After DCA: 58 pips SL from ORIGINAL entry
-
-    Trend Filter:
-    - Uses ADX to measure trend strength
-    - Uses EMA crossover to detect reversals
-    - Won't DCA into strong trends against us
-    - Waits for reversal confirmation before adding
+    ================================================================
+    MOMENTUM STRATEGY - NO DCA
+    ================================================================
+    Simple trend-following with trailing stop:
+    - 20 pips Take Profit
+    - 15 pips Stop Loss
+    - Trailing stop activates after +10 pips profit
+    - Trail 8 pips behind price
+    - NO DCA - single entry only
     """
-    enabled: bool = True
-
-    # Use pip-based triggers instead of percentage
-    use_pip_based_dca: bool = True
-
-    # DISABLE pre-placed limit orders - use market orders with trend check
-    use_pending_orders: bool = False
-
-    # PIP-BASED TP/SL - STOP LOSS FAR ENOUGH FOR ALL 6 DCAs
-    take_profit_pips: float = 5.0       # 5 pips take profit (FASTER WINS)
-    trailing_stop_pips: float = 4.0     # 4 pips trailing stop (after in profit)
-    initial_sl_pips: float = 40.0       # 40 pips initial SL (beyond DCA6 at 30p + buffer)
-
-    # DCA trigger levels in PIPS - 6 LEVELS (TIGHT for 4H recovery)
-    # L1-L4: Execute IMMEDIATELY when level reached (no confirmation)
-    # L5-L6: Require reversal confirmation before executing
-    dca_trigger_pips_1: float = 5.0     # 5 pips loss -> DCA 1 (IMMEDIATE)
-    dca_trigger_pips_2: float = 10.0    # 10 pips loss -> DCA 2 (IMMEDIATE)
-    dca_trigger_pips_3: float = 15.0    # 15 pips loss -> DCA 3 (IMMEDIATE)
-    dca_trigger_pips_4: float = 20.0    # 20 pips loss -> DCA 4 (IMMEDIATE)
-    dca_trigger_pips_5: float = 25.0    # 25 pips loss -> DCA 5 (REVERSAL REQUIRED)
-    dca_trigger_pips_6: float = 30.0    # 30 pips loss -> DCA 6 (REVERSAL REQUIRED)
-
-    # DCA size multipliers - 6 LEVELS for gradual recovery
-    # Entry = 1.0x, then each DCA progressively larger
-    # Total if all DCAs trigger: 1.0 + 1.25 + 1.5 + 1.75 + 2.0 + 2.25 + 2.5 = 12.25x
-    dca_multiplier_1: float = 1.25      # DCA1: 125% of initial
-    dca_multiplier_2: float = 1.50      # DCA2: 150% of initial
-    dca_multiplier_3: float = 1.75      # DCA3: 175% of initial
-    dca_multiplier_4: float = 2.00      # DCA4: 200% of initial
-    dca_multiplier_5: float = 2.25      # DCA5: 225% of initial
-    dca_multiplier_6: float = 2.50      # DCA6: 250% of initial
-
-    # After any DCA entry (in pips) - SL stays FAR to allow all DCAs
-    dca_profit_target_pips: float = 10.0  # 10 pips profit target after DCA (from avg)
-    sl_after_dca_pips: float = 45.0       # 45 pips stop loss after DCA (beyond DCA6 at 30p)
-
-    # TREND FILTER SETTINGS - ONLY FOR DCA L5-L6
-    # L1-L4: Execute IMMEDIATELY (no trend check)
-    # L5-L6: Require reversal confirmation
-    use_trend_filter: bool = True         # Enable trend-based DCA filtering for L5-L6
-    dca_immediate_levels: int = 4         # L1-L4 execute immediately, L5+ need reversal
-    adx_strong_trend: float = 30.0        # ADX above this = strong trend, don't DCA
-    adx_weak_trend: float = 20.0          # ADX below this = weak trend, safer to DCA
-    ema_fast_period: int = 8              # Fast EMA for reversal detection
-    ema_slow_period: int = 21             # Slow EMA for trend direction
-    require_reversal_candle: bool = True  # Require bullish/bearish reversal candle (for L5-L6)
-    min_reversal_strength: float = 0.3    # Minimum candle body ratio for reversal
-
-    # SMART DCA TRAILING - Dynamic TP for 6 DCA levels
-    # Take profit REDUCES as DCA level increases (exit faster with larger positions)
-    # OANDA minimum is 5 pips - for high DCA levels we use MANUAL monitoring
-    tp_pips_dca0: float = 5.0     # Initial entry: 5 pips TP (FASTER WINS)
-    tp_pips_dca1: float = 5.0     # After DCA1: 5 pips TP
-    tp_pips_dca2: float = 5.0     # After DCA2: 5 pips TP
-    tp_pips_dca3: float = 5.0     # After DCA3: 5 pips TP (OANDA minimum)
-    tp_pips_dca4: float = 5.0     # After DCA4: 5 pips (manual exit at 3p)
-    tp_pips_dca5: float = 5.0     # After DCA5: 5 pips (manual exit at 2p)
-    tp_pips_dca6: float = 5.0     # After DCA6: 5 pips (manual exit at 1p)
-
-    # MANUAL TP for DCA4-6 (below OANDA 5 pip minimum)
-    # We set 5 pips on OANDA as backup, but manually close at these levels
-    manual_tp_dca3_pips: float = 4.0   # Close DCA3 at +4 pips
-    manual_tp_dca4_pips: float = 3.0   # Close DCA4 at +3 pips
-    manual_tp_dca5_pips: float = 2.0   # Close DCA5 at +2 pips
-    manual_tp_dca6_pips: float = 1.0   # Close DCA6 at +1 pip (just cover spread)
-
-    # BREAKEVEN PROTECTION for DCA 3-4 (large positions)
-    use_breakeven_protection: bool = True
-    breakeven_activation_pips: float = 3.0   # Lock breakeven when +3 pips from avg entry
-    breakeven_buffer_pips: float = 1.0       # SL at breakeven + 1 pip buffer
-
-    # MANUAL TRAILING for DCA positions (moves ALL trades together)
-    use_manual_dca_trailing: bool = True
-    manual_trailing_activation_pips: float = 5.0  # Activate after 5 pips profit from avg
-    manual_trailing_distance_pips: float = 8.0    # Trail 8 pips behind price
-
-    # EMERGENCY EXIT for DCA 4 (maximum exposure - get out quick)
-    dca4_emergency_exit: bool = True
-    dca4_exit_profit_pips: float = 3.0  # Close ALL at +3 pips profit (don't wait for TP)
+    enabled: bool = False  # DCA DISABLED - using momentum strategy
 
     # ================================================================
-    # SMART RECOVERY EXIT - Exit after DCA recovers to breakeven
+    # MOMENTUM STRATEGY SETTINGS
     # ================================================================
-    # After DCA, if we recover to breakeven/small profit, EXIT immediately
-    # Don't wait for full TP - risk of another reversal is too high
-    use_smart_recovery_exit: bool = True
 
-    # DCA1-2: Exit at breakeven + small profit
-    recovery_exit_dca1_pips: float = 2.0   # Exit at +2 pips after DCA1 recovery
-    recovery_exit_dca2_pips: float = 1.5   # Exit at +1.5 pips after DCA2 recovery
+    # TAKE PROFIT & STOP LOSS (in pips)
+    take_profit_pips: float = 20.0      # 20 pips take profit
+    initial_sl_pips: float = 15.0       # 15 pips stop loss
 
-    # DCA3-4: Exit at breakeven + buffer
-    recovery_exit_dca3_pips: float = 1.0   # Exit at +1 pip after DCA3 recovery
-    recovery_exit_dca4_pips: float = 0.5   # Exit at +0.5 pip after DCA4 recovery
+    # TRAILING STOP SETTINGS
+    use_trailing_stop: bool = True
+    trailing_activation_pips: float = 10.0  # Activate trailing after +10 pips profit
+    trailing_stop_pips: float = 8.0         # Trail 8 pips behind price
 
-    # DCA5-6: Exit at breakeven (just cover fees, preserve capital)
-    recovery_exit_dca5_pips: float = 0.0   # Exit at breakeven after DCA5 recovery
-    recovery_exit_dca6_pips: float = 0.0   # Exit at breakeven after DCA6 recovery
+    # NO DCA - Disabled
+    max_dca_levels: int = 0             # NO DCA
+    use_pip_based_dca: bool = False     # DCA disabled
+    use_pending_orders: bool = False    # No pending DCA orders
 
-    # TIME-BASED RECOVERY EXIT - For positions held too long
-    # If held > 8 hours with DCA, exit at small loss to preserve capital
-    use_time_based_recovery: bool = True
-    max_hold_hours: float = 8.0            # Close if held > 8 hours - GIVE MORE TIME FOR RECOVERY
-    time_recovery_loss_pips: float = -5.0  # Accept up to -5 pips loss after 8h hold
+    # Position sizing - FULL SIZE (no DCA splitting)
+    initial_size_divisor: float = 1.0   # Use full position size (no DCA reserve)
 
-    # Minimum time with DCA before recovery exit (avoid premature exits)
-    min_dca_hold_minutes: float = 10.0     # Wait 10 min after DCA before recovery exit
-
-    # Legacy percentage-based (kept for compatibility, not used when use_pip_based_dca=True)
-    take_profit_pct: float = 0.03
-    trailing_stop_pct: float = 0.014
-    initial_sl_pct: float = 0.08
-    dca_level_1: DCALevel = field(default_factory=lambda: DCALevel(trigger_pct=0.008, multiplier=1.25))
-    dca_level_2: DCALevel = field(default_factory=lambda: DCALevel(trigger_pct=0.008, multiplier=1.50))
-    dca_level_3: DCALevel = field(default_factory=lambda: DCALevel(trigger_pct=0.008, multiplier=1.75))
-    dca_level_4: DCALevel = field(default_factory=lambda: DCALevel(trigger_pct=0.008, multiplier=2.00))
-    dca_level_5: DCALevel = field(default_factory=lambda: DCALevel(trigger_pct=0.008, multiplier=2.25))
-    dca_level_6: DCALevel = field(default_factory=lambda: DCALevel(trigger_pct=0.008, multiplier=2.50))
-    dca_profit_target_pct: float = 0.03
-    sl_after_dca_pct: float = 0.012
-
-    # Max DCA entries per position - NOW 6 LEVELS
-    max_dca_levels: int = 6
-
-    # Initial position size divisor for DCA
-    # Total exposure with all 6 DCAs = 1 + 1.25 + 1.5 + 1.75 + 2.0 + 2.25 + 2.5 = 12.25x
-    # Divisor of 5 means initial = 20%, max total = ~2.45x normal
-    initial_size_divisor: float = 5.0
+    # Legacy DCA settings (kept for compatibility but NOT USED)
+    dca_trigger_pips_1: float = 999.0   # Never triggers
+    dca_multiplier_1: float = 0.0
+    dca_profit_target_pips: float = 20.0
+    sl_after_dca_pips: float = 15.0
 
     def get_dca_levels(self) -> List[DCALevel]:
         """Get all DCA levels as a list."""

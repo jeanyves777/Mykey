@@ -1,14 +1,17 @@
 """
-Run Simple Trend Following Trading
-==================================
+Run Momentum Trend Trading - NO DCA
+====================================
 
-NO ML - Just follow H1 trend direction.
+Simple momentum strategy following H1 trend.
 
 Strategy:
-1. Check H1 EMA50 vs EMA200 for each pair
-2. Open position IMMEDIATELY in trend direction
-3. When closed (TP/SL/4H max), reopen in same trend direction
-4. DCA handles pullbacks (limit orders staged upfront)
+1. Check H1 EMA50 vs EMA200 for trend direction
+2. Open position in trend direction
+3. 20 pips Take Profit
+4. 15 pips Stop Loss
+5. Trailing stop: activates at +10 pips, trails 8 pips behind
+
+NO DCA - Single entry only!
 
 Usage:
     cd C:\Users\Jean-Yves\thevolumeainative
@@ -32,7 +35,7 @@ from .risk_management.trend_filter import TrendFilter
 
 
 class SimpleTrendEngine:
-    """Simple trend-following engine - NO ML needed."""
+    """Momentum trend-following engine - NO DCA."""
 
     def __init__(self, config):
         self.config = config
@@ -52,12 +55,9 @@ class SimpleTrendEngine:
 
         self.equity = 5000.0
 
-        # Track position open times for 4H max hold
+        # Track position info for trailing stop
         self.position_open_times = {}
-        self.max_hold_hours = 4
-
-        # Track pending DCA orders per symbol
-        self.pending_dca_orders = {}
+        self.trailing_data = {}  # {symbol: {'peak_profit_pips': x, 'trailing_active': bool}}
 
     def format_price(self, symbol: str, price: float) -> str:
         """Format price correctly for OANDA (3 decimals for JPY, 5 for others)."""
@@ -92,141 +92,8 @@ class SimpleTrendEngine:
             trades_by_symbol = self.get_open_trades()
         return symbol in trades_by_symbol
 
-    def calculate_smart_dca_units(self, existing_units: float, avg_entry: float,
-                                     dca_price: float, target_recovery_pips: float,
-                                     direction: str, pip_value: float) -> int:
-        """
-        Calculate DCA units needed to exit at target_recovery_pips profit.
-
-        Formula: We want the new average entry to be close enough to current price
-        so that a small recovery (target_recovery_pips) puts us in profit.
-
-        For BUY: new_avg = (old_cost + dca_cost) / (old_units + dca_units)
-                 We want: dca_price + target_pips = new_avg
-
-        Args:
-            existing_units: Total units already in position
-            avg_entry: Current weighted average entry price
-            dca_price: Price at which DCA will execute
-            target_recovery_pips: Pips of recovery needed to exit (e.g., 2 pips)
-            direction: 'BUY' or 'SELL'
-            pip_value: Pip value for the symbol (0.0001 or 0.01 for JPY)
-
-        Returns:
-            Units needed for DCA to achieve quick recovery
-        """
-        # Target average = DCA price + recovery pips (for BUY)
-        # This means when price recovers by target_recovery_pips, we're at breakeven+
-        if direction == 'BUY':
-            target_avg = dca_price + (target_recovery_pips * pip_value)
-        else:
-            target_avg = dca_price - (target_recovery_pips * pip_value)
-
-        # Formula derivation:
-        # new_avg = (existing_units * avg_entry + dca_units * dca_price) / (existing_units + dca_units)
-        # target_avg = (existing_units * avg_entry + dca_units * dca_price) / (existing_units + dca_units)
-        # target_avg * (existing_units + dca_units) = existing_units * avg_entry + dca_units * dca_price
-        # target_avg * existing_units + target_avg * dca_units = existing_units * avg_entry + dca_units * dca_price
-        # target_avg * dca_units - dca_units * dca_price = existing_units * avg_entry - target_avg * existing_units
-        # dca_units * (target_avg - dca_price) = existing_units * (avg_entry - target_avg)
-        # dca_units = existing_units * (avg_entry - target_avg) / (target_avg - dca_price)
-
-        denominator = target_avg - dca_price
-        if abs(denominator) < 0.000001:
-            # Avoid division by zero - use fallback multiplier
-            return int(existing_units * 2.0)
-
-        dca_units = existing_units * (avg_entry - target_avg) / denominator
-
-        # Ensure positive units and reasonable limits
-        dca_units = abs(dca_units)
-
-        # Cap at 5x existing to avoid excessive exposure
-        max_units = existing_units * 5.0
-        dca_units = min(dca_units, max_units)
-
-        # Minimum 1 unit
-        return max(1, int(dca_units))
-
-    def place_dca_limit_orders(self, symbol: str, direction: str, entry_price: float, initial_units: int) -> None:
-        """Place all DCA limit orders upfront after opening initial position.
-
-        NOW USES SMART SIZING: Calculates exact units needed to exit at +2 pips.
-        """
-        dca = self.config.dca
-        pip_value = self.config.get_pip_value(symbol)
-
-        self.pending_dca_orders[symbol] = []
-
-        # Track cumulative position for smart sizing
-        cumulative_units = initial_units
-        cumulative_cost = initial_units * entry_price
-
-        for level in range(1, dca.max_dca_levels + 1):
-            trigger_pips = dca.get_dca_trigger_pips(level)
-
-            # Calculate limit price
-            if direction == 'BUY':
-                limit_price = entry_price - (trigger_pips * pip_value)
-            else:
-                limit_price = entry_price + (trigger_pips * pip_value)
-
-            # Calculate current average entry
-            avg_entry = cumulative_cost / cumulative_units
-
-            # SMART DCA: Calculate units needed to exit at +2 pips from DCA price
-            target_recovery = 2.0  # Exit at +2 pips profit
-            dca_units = self.calculate_smart_dca_units(
-                existing_units=cumulative_units,
-                avg_entry=avg_entry,
-                dca_price=limit_price,
-                target_recovery_pips=target_recovery,
-                direction=direction,
-                pip_value=pip_value
-            )
-
-            # Update cumulative for next level calculation
-            cumulative_units += dca_units
-            cumulative_cost += dca_units * limit_price
-
-            # Place limit order
-            success, result = self.trade_executor.place_limit_order(
-                symbol=symbol,
-                units=dca_units,
-                direction=direction,
-                price=limit_price,
-                stop_loss=None,  # Will share main position SL
-                take_profit=None  # Will share main position TP
-            )
-
-            if success:
-                order_id = result.get('order_id', '')
-                self.pending_dca_orders[symbol].append({
-                    'order_id': order_id,
-                    'level': level,
-                    'price': limit_price,
-                    'units': dca_units
-                })
-                # Show smart sizing info
-                new_avg = cumulative_cost / cumulative_units
-                print(f"       [DCA L{level}] @ {self.format_price(symbol, limit_price)} | {dca_units:,} units | New Avg→{self.format_price(symbol, new_avg)} (+2p exit)")
-            else:
-                print(f"       [DCA L{level}] FAILED: {result.get('error', 'Unknown')}")
-
-    def cancel_pending_dca_orders(self, symbol: str) -> None:
-        """Cancel all pending DCA limit orders for a symbol."""
-        if symbol not in self.pending_dca_orders:
-            return
-
-        for order in self.pending_dca_orders[symbol]:
-            order_id = order.get('order_id', '')
-            if order_id:
-                self.trade_executor.cancel_order(order_id)
-
-        del self.pending_dca_orders[symbol]
-
     def open_position(self, symbol: str, direction: str) -> bool:
-        """Open a position in the given direction with DCA limit orders."""
+        """Open a momentum position - NO DCA, just single entry with trailing."""
         prices = self.client.get_pricing([symbol])
         if not prices or symbol not in prices:
             print(f"  {symbol}: Failed to get price")
@@ -235,10 +102,10 @@ class SimpleTrendEngine:
         entry_price = prices[symbol]['ask'] if direction == 'BUY' else prices[symbol]['bid']
         pip_value = self.config.get_pip_value(symbol)
 
-        # DCA sizing
+        # Momentum strategy settings
         dca = self.config.dca
-        sl_pips = dca.initial_sl_pips  # 40 pips
-        tp_pips = dca.take_profit_pips  # 10 pips
+        sl_pips = dca.initial_sl_pips    # 15 pips
+        tp_pips = dca.take_profit_pips   # 20 pips
 
         # Calculate SL/TP
         if direction == 'BUY':
@@ -248,9 +115,9 @@ class SimpleTrendEngine:
             stop_loss = entry_price + (sl_pips * pip_value)
             take_profit = entry_price - (tp_pips * pip_value)
 
-        # Position size (small for DCA)
+        # Position size - FULL SIZE (no DCA reserve)
         risk_pct = self.config.risk.position_size_pct
-        risk_amt = self.equity * risk_pct / dca.initial_size_divisor
+        risk_amt = self.equity * risk_pct
         units = int(risk_amt / (sl_pips * pip_value))
 
         # Minimum units check
@@ -258,7 +125,7 @@ class SimpleTrendEngine:
             units = 1
 
         print(f"  {symbol}: Opening {direction} @ {self.format_price(symbol, entry_price)}")
-        print(f"           Units: {units} | SL: {sl_pips:.0f}p | TP: {tp_pips:.0f}p")
+        print(f"           Units: {units:,} | SL: {sl_pips:.0f}p | TP: {tp_pips:.0f}p")
 
         success, result = self.trade_executor.place_market_order(
             symbol=symbol,
@@ -282,14 +149,19 @@ class SimpleTrendEngine:
                 trade_id=trade_id
             )
 
-            # Track open time for 4H max hold
+            # Track open time
             self.position_open_times[symbol] = datetime.now()
 
-            print(f"  {symbol}: >>> OPENED {direction} <<< (Trade ID: {trade_id})")
+            # Initialize trailing data
+            self.trailing_data[symbol] = {
+                'entry_price': fill_price,
+                'peak_profit_pips': 0.0,
+                'trailing_active': False,
+                'trailing_sl': None
+            }
 
-            # Place DCA limit orders
-            print(f"       Staging {dca.max_dca_levels} DCA limit orders...")
-            self.place_dca_limit_orders(symbol, direction, fill_price, units)
+            print(f"  {symbol}: >>> OPENED {direction} <<< (Trade ID: {trade_id})")
+            print(f"           Trailing activates at +10p, trails 8p behind")
 
             return True
         else:
@@ -297,10 +169,7 @@ class SimpleTrendEngine:
             return False
 
     def close_position(self, symbol: str, reason: str) -> bool:
-        """Close all trades for a symbol and cancel pending DCAs."""
-        # Cancel pending DCA orders
-        self.cancel_pending_dca_orders(symbol)
-
+        """Close position for a symbol."""
         # Close the position on OANDA
         success, result = self.trade_executor.close_position(symbol)
 
@@ -309,157 +178,126 @@ class SimpleTrendEngine:
             # Clean up tracking
             if symbol in self.position_open_times:
                 del self.position_open_times[symbol]
+            if symbol in self.trailing_data:
+                del self.trailing_data[symbol]
             self.position_manager.close_position(symbol)
             return True
         else:
             print(f"  {symbol}: Close FAILED - {result.get('error', 'Unknown')}")
             return False
 
-    def check_4h_max_hold(self, symbol: str) -> bool:
-        """Check if position has exceeded 4H max hold time."""
-        if symbol not in self.position_open_times:
-            return False
+    def manage_trailing_stop(self, symbol: str, trade: dict) -> None:
+        """Manage trailing stop for a position.
 
-        open_time = self.position_open_times[symbol]
-        elapsed = datetime.now() - open_time
-        max_hold = timedelta(hours=self.max_hold_hours)
-
-        return elapsed >= max_hold
-
-    def calculate_average_entry(self, trades: list) -> tuple:
-        """Calculate weighted average entry price for DCA positions.
-
-        Returns:
-            Tuple of (avg_entry_price, total_units, direction)
+        Trailing activates at +10 pips and trails 8 pips behind peak.
         """
-        total_cost = 0.0
-        total_units = 0.0
-
-        for t in trades:
-            units = abs(float(t.get('currentUnits', 0)))
-            price = float(t.get('price', 0))
-            total_cost += units * price
-            total_units += units
-
-        if total_units == 0:
-            return 0.0, 0.0, 'BUY'
-
-        avg_price = total_cost / total_units
-        direction = 'BUY' if float(trades[0].get('currentUnits', 0)) > 0 else 'SELL'
-
-        return avg_price, total_units, direction
-
-    def update_dca_tp_to_breakeven(self, symbol: str, trades: list) -> None:
-        """Update all DCA trades to have TP at breakeven + small profit.
-
-        When multiple DCAs are triggered, we want to exit at breakeven
-        rather than waiting for original TP which may never be reached.
-        """
-        if len(trades) < 2:
-            return  # Only for DCA positions (2+ trades)
-
-        avg_entry, total_units, direction = self.calculate_average_entry(trades)
+        dca = self.config.dca
         pip_value = self.config.get_pip_value(symbol)
 
-        # Set TP at average entry + 2 pips profit (just escape with small win)
-        breakeven_tp_pips = 2.0
+        # Get position info
+        entry_price = float(trade.get('price', 0))
+        current_units = float(trade.get('currentUnits', 0))
+        direction = 'BUY' if current_units > 0 else 'SELL'
+        trade_id = trade.get('id', '')
 
-        if direction == 'BUY':
-            new_tp = avg_entry + (breakeven_tp_pips * pip_value)
-        else:
-            new_tp = avg_entry - (breakeven_tp_pips * pip_value)
-
-        # Check if current price is close to our new TP
+        # Get current price
         prices = self.client.get_pricing([symbol])
-        if prices and symbol in prices:
-            current_price = prices[symbol]['bid'] if direction == 'BUY' else prices[symbol]['ask']
-
-            if direction == 'BUY':
-                pips_to_tp = (new_tp - current_price) / pip_value
-            else:
-                pips_to_tp = (current_price - new_tp) / pip_value
-
-            # If within 1 pip of breakeven, close NOW
-            if pips_to_tp <= 1.0:
-                print(f"  {symbol}: >>> BREAKEVEN REACHED ({pips_to_tp:.1f} pips to TP) - CLOSING <<<")
-                self.close_position(symbol, "BREAKEVEN EXIT")
-                return
-
-        # Update TP for all trades to breakeven level
-        print(f"  {symbol}: DCA Avg Entry={self.format_price(symbol, avg_entry)}, New TP={self.format_price(symbol, new_tp)} (+{breakeven_tp_pips}p)")
-
-        for t in trades:
-            trade_id = t.get('id', '')
-            current_tp = None
-            tp_order = t.get('takeProfitOrder', {})
-            if tp_order:
-                current_tp = float(tp_order.get('price', 0))
-
-            # Only update if TP is different (more than 1 pip away)
-            if current_tp is None or abs(current_tp - new_tp) / pip_value > 1.0:
-                success, result = self.trade_executor.modify_trade(
-                    trade_id=trade_id,
-                    take_profit=new_tp,
-                    symbol=symbol
-                )
-                if success:
-                    print(f"       Trade {trade_id}: TP updated to {self.format_price(symbol, new_tp)}")
-
-    def manage_position(self, symbol: str, trades: list) -> None:
-        """Manage an open position - check 4H timeout, update P&L, manage DCA."""
-        # Check 4H max hold
-        if self.check_4h_max_hold(symbol):
-            elapsed = datetime.now() - self.position_open_times[symbol]
-            print(f"  {symbol}: 4H MAX HOLD reached ({elapsed.total_seconds()/3600:.1f}h)")
-            self.close_position(symbol, "4H MAX HOLD")
+        if not prices or symbol not in prices:
             return
 
-        # Calculate current P&L from OANDA trades
+        current_price = prices[symbol]['bid'] if direction == 'BUY' else prices[symbol]['ask']
+
+        # Calculate current profit in pips
+        if direction == 'BUY':
+            current_profit_pips = (current_price - entry_price) / pip_value
+        else:
+            current_profit_pips = (entry_price - current_price) / pip_value
+
+        # Initialize trailing data if needed
+        if symbol not in self.trailing_data:
+            self.trailing_data[symbol] = {
+                'entry_price': entry_price,
+                'peak_profit_pips': 0.0,
+                'trailing_active': False,
+                'trailing_sl': None
+            }
+
+        trail_data = self.trailing_data[symbol]
+
+        # Update peak profit
+        if current_profit_pips > trail_data['peak_profit_pips']:
+            trail_data['peak_profit_pips'] = current_profit_pips
+
+        # Check if trailing should activate (at +10 pips)
+        activation_pips = dca.trailing_activation_pips  # 10 pips
+        trail_distance = dca.trailing_stop_pips         # 8 pips
+
+        if not trail_data['trailing_active'] and trail_data['peak_profit_pips'] >= activation_pips:
+            trail_data['trailing_active'] = True
+            print(f"  {symbol}: >>> TRAILING ACTIVATED at +{trail_data['peak_profit_pips']:.1f} pips <<<")
+
+        # If trailing is active, update the SL
+        if trail_data['trailing_active']:
+            # Calculate new trailing SL (peak - 8 pips)
+            if direction == 'BUY':
+                new_trailing_sl = entry_price + ((trail_data['peak_profit_pips'] - trail_distance) * pip_value)
+            else:
+                new_trailing_sl = entry_price - ((trail_data['peak_profit_pips'] - trail_distance) * pip_value)
+
+            # Only update if trailing SL has moved in our favor
+            current_sl = trail_data['trailing_sl']
+            should_update = False
+
+            if current_sl is None:
+                should_update = True
+            elif direction == 'BUY' and new_trailing_sl > current_sl:
+                should_update = True
+            elif direction == 'SELL' and new_trailing_sl < current_sl:
+                should_update = True
+
+            if should_update:
+                # Update SL on OANDA
+                success, result = self.trade_executor.modify_trade(
+                    trade_id=trade_id,
+                    stop_loss=new_trailing_sl,
+                    symbol=symbol
+                )
+
+                if success:
+                    trail_data['trailing_sl'] = new_trailing_sl
+                    locked_pips = trail_data['peak_profit_pips'] - trail_distance
+                    print(f"  {symbol}: Trailing SL → {self.format_price(symbol, new_trailing_sl)} (locks +{locked_pips:.1f}p)")
+
+        return current_profit_pips
+
+    def manage_position(self, symbol: str, trades: list) -> None:
+        """Manage an open position - check trailing stop, update P&L."""
+        if len(trades) == 0:
+            return
+
+        # Get the main trade (should only be 1 with no DCA)
+        trade = trades[0]
+
+        # Calculate current P&L
         total_pnl = sum(float(t.get('unrealizedPL', 0)) for t in trades)
         total_units = sum(abs(float(t.get('currentUnits', 0))) for t in trades)
-        num_trades = len(trades)
 
-        # Time remaining
-        if symbol in self.position_open_times:
-            elapsed = datetime.now() - self.position_open_times[symbol]
-            remaining = timedelta(hours=self.max_hold_hours) - elapsed
-            remaining_min = max(0, remaining.total_seconds() / 60)
+        # Manage trailing stop
+        current_profit_pips = self.manage_trailing_stop(symbol, trade)
+
+        # Get trailing status
+        trail_data = self.trailing_data.get(symbol, {})
+        trailing_active = trail_data.get('trailing_active', False)
+        peak_pips = trail_data.get('peak_profit_pips', 0)
+
+        # Build status string
+        if trailing_active:
+            status = f"TRAILING | Peak: +{peak_pips:.1f}p | Now: {current_profit_pips:+.1f}p"
         else:
-            remaining_min = 240
-
-        # Calculate average entry for DCA positions
-        if num_trades >= 2:
-            avg_entry, _, direction = self.calculate_average_entry(trades)
-            pip_value = self.config.get_pip_value(symbol)
-
-            # Get current price
-            prices = self.client.get_pricing([symbol])
-            if prices and symbol in prices:
-                current_price = prices[symbol]['bid'] if direction == 'BUY' else prices[symbol]['ask']
-
-                if direction == 'BUY':
-                    pips_from_avg = (current_price - avg_entry) / pip_value
-                else:
-                    pips_from_avg = (avg_entry - current_price) / pip_value
-
-                status = f"DCA x{num_trades} ({total_units:.0f} units) | Avg: {self.format_price(symbol, avg_entry)} | {pips_from_avg:+.1f}p"
-
-                # If in profit from average, close immediately
-                if pips_from_avg >= 2.0:
-                    print(f"  {symbol}: {status} | P&L: ${total_pnl:+.2f}")
-                    print(f"  {symbol}: >>> DCA RECOVERY +{pips_from_avg:.1f} pips - CLOSING <<<")
-                    self.close_position(symbol, "DCA RECOVERY")
-                    return
-
-                # Update TP to breakeven if we have 2+ DCAs
-                self.update_dca_tp_to_breakeven(symbol, trades)
-            else:
-                status = f"DCA x{num_trades} ({total_units:.0f} units)"
-        else:
-            status = f"Open ({num_trades} trades, {total_units:.0f} units)"
+            status = f"Open | {current_profit_pips:+.1f}p (trail at +10p)"
 
         pnl_str = f"${total_pnl:+.2f}" if total_pnl != 0 else "$0.00"
-        print(f"  {symbol}: {status} | P&L: {pnl_str} | Time left: {remaining_min:.0f}m")
+        print(f"  {symbol}: {status} | P&L: {pnl_str}")
 
     def check_and_fix_sl_tp(self, trades_by_symbol: dict) -> None:
         """Check and fix incorrect SL/TP on existing positions.
@@ -583,8 +421,9 @@ class SimpleTrendEngine:
         for symbol in list(self.position_open_times.keys()):
             if symbol not in trades_by_symbol:
                 print(f"  {symbol}: Position closed on OANDA - cleaning up")
-                self.cancel_pending_dca_orders(symbol)
                 del self.position_open_times[symbol]
+                if symbol in self.trailing_data:
+                    del self.trailing_data[symbol]
                 if symbol in self.position_manager.positions:
                     del self.position_manager.positions[symbol]
 
@@ -614,7 +453,7 @@ class SimpleTrendEngine:
     def run(self, interval: int = 60):
         """Run the trading loop."""
         print("\n" + "=" * 60)
-        print("SIMPLE TREND FOLLOWING - NO ML")
+        print("MOMENTUM TREND TRADING - NO DCA")
         print("=" * 60)
 
         # Test connection
@@ -690,9 +529,11 @@ class SimpleTrendEngine:
         else:
             print("  No existing positions found.")
 
+        dca = self.config.dca
         print(f"\nSymbols: {', '.join(self.symbols)}")
-        print(f"DCA Levels: {self.config.dca.max_dca_levels}")
-        print(f"Max Hold: {self.max_hold_hours}H")
+        print(f"Strategy: MOMENTUM (NO DCA)")
+        print(f"TP: {dca.take_profit_pips}p | SL: {dca.initial_sl_pips}p")
+        print(f"Trailing: activates at +{dca.trailing_activation_pips}p, trails {dca.trailing_stop_pips}p behind")
         print(f"Interval: {interval}s")
         print("-" * 60)
 
@@ -748,16 +589,18 @@ class SimpleTrendEngine:
 
 def main():
     print("\n" + "=" * 60)
-    print("SIMPLE TREND FOLLOWING SYSTEM")
-    print("NO ML - Just H1 EMA50 vs EMA200")
+    print("MOMENTUM TREND TRADING SYSTEM")
+    print("NO DCA - H1 EMA50 vs EMA200 with Trailing Stop")
     print("=" * 60)
 
     config = load_config()
+    dca = config.dca
 
     print(f"\nSymbols: {', '.join(config.symbols)}")
-    print(f"DCA Levels: {config.dca.max_dca_levels}")
-    print(f"Initial SL: {config.dca.initial_sl_pips}p")
-    print(f"Take Profit: {config.dca.take_profit_pips}p")
+    print(f"Strategy: MOMENTUM (NO DCA)")
+    print(f"Take Profit: {dca.take_profit_pips}p")
+    print(f"Stop Loss: {dca.initial_sl_pips}p")
+    print(f"Trailing: activates +{dca.trailing_activation_pips}p, trails {dca.trailing_stop_pips}p behind")
 
     print("\n" + "-" * 60)
     response = input("Start trading? [y/N]: ").strip().lower()
