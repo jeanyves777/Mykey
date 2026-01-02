@@ -281,13 +281,11 @@ DCA_CONFIG = {
     "trailing_stop_pct": 0.004,     # 0.4% price trailing (= 8% ROI with 20x)
     "position_divisor": 4,          # Initial size = 25% of normal
 
-    # DCA Levels: ROI-BASED triggers (for 20x leverage)
-    # LIMITED TO 2 LEVELS ONLY - DCA 3-4 caused liquidations in backtest
-    "levels": [
-        {"trigger_roi": -0.30, "multiplier": 1.50, "tp_roi": 0.06},   # Level 1: -30% ROI
-        {"trigger_roi": -0.45, "multiplier": 1.75, "tp_roi": 0.06},   # Level 2: -45% ROI (wider gap)
-    ],
-    # Note: L1 triggers faster at -5% ROI, all DCA TPs also smaller
+    # DCA Levels: DISABLED - NO DCA (proven best in 90-day backtest)
+    # Backtest results: +32% return with NO DCA vs losses with DCA
+    # Strategy: Initial entry only + Boost mode at -20% ROI
+    "levels": [],  # NO DCA - empty list
+    # Note: Boost mode triggers at -20% ROI instead of DCA level
 
     "max_exposure_multiplier": 4.00,  # Max 4x normal position with all DCAs
     "sl_after_dca_roi": 0.90,         # 90% ROI SL from avg entry after DCA (same as initial - WIDE)
@@ -329,9 +327,33 @@ DCA_CONFIG = {
         "enabled": True,                    # ENABLE HEDGE MODE (both LONG + SHORT)
         "budget_split": 0.5,                # 50% of symbol budget to each side
         "reenter_on_tp": True,              # Re-enter same side after TP hit
-        "independent_dca": True,            # Each side has independent DCA levels
+        "independent_dca": False,           # NO DCA - disabled
         "independent_trailing": True,       # Each side has independent trailing TP
-        "max_dca_per_side": 2,              # Max 2 DCA levels per side (limited from 4)
+        "max_dca_per_side": 0,              # NO DCA - disabled
+    },
+
+    # ==========================================================================
+    # BOOST MODE - Triggers at -20% ROI (NO DCA required)
+    # ==========================================================================
+    # When one side hits -20% ROI, boost the opposite side 1.5x
+    # This is the winning strategy from 90-day backtest (+32% return)
+    "boost_mode": {
+        "enabled": True,                    # Enable boost mode
+        "trigger_roi": -0.20,               # Trigger at -20% ROI
+        "boost_multiplier": 1.5,            # Boost opposite side 1.5x
+        "tp_multiplier": 1.5,               # Increase TP by 50% during boost
+        "half_close_at_tp": True,           # Close HALF at TP, lock profit
+        "trailing_after_half": True,        # Start trailing after half-close
+        "trailing_activation_roi": 0.02,    # Activate trailing at 2% ROI
+        "trailing_distance_roi": 0.03,      # Trail 3% behind peak
+    },
+
+    # ==========================================================================
+    # STOP FOR DAY - After SL hit, stop trading for the day
+    # ==========================================================================
+    "stop_for_day": {
+        "enabled": True,                    # Stop trading after SL hit
+        "restart_next_day": True,           # Restart next day
     },
 
     # ==========================================================================
