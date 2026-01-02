@@ -533,7 +533,7 @@ class SignalBacktester:
 def run_signal_test():
     """Test signal-based strategy"""
     # Configuration
-    BACKTEST_DAYS = 7  # 7 days of 1m data (good amount for testing)
+    BACKTEST_DAYS = 90  # 90 days backtest
     symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
 
     print("="*80)
