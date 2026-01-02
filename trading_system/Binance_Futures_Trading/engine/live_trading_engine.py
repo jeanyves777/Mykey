@@ -627,16 +627,25 @@ class BinanceLiveTradingEngine:
         return budget * entry_pct * hedge_split
 
     def get_entry_margin(self, symbol: str, side: str = None) -> float:
-        """Get margin for initial entry (20% of symbol budget, or 10% per side in hedge mode)."""
+        """Get margin for initial entry.
+
+        Fixed $5 minimum margin for ALL symbols to ensure equal position sizes.
+        This is simpler and more predictable than percentage-based allocation.
+        """
+        # Fixed $5 margin for ALL initial entries
+        # This ensures BTC, ETH, BNB all start with same $5 margin
+        # With 20x leverage: $5 margin = $100 position value
+        MIN_ENTRY_MARGIN = 5.0
+
         if symbol not in self.symbol_budgets:
             return 0.0
-        budget = self.symbol_budgets[symbol]
 
-        # In hedge mode, split the budget between LONG and SHORT
-        if self.hedge_mode:
-            budget = budget * self.hedge_budget_split
-        entry_pct = RISK_CONFIG.get("initial_entry_pct", 0.20)
-        return budget * entry_pct
+        # Check if we have enough budget for minimum margin
+        remaining = self.symbol_budgets.get(symbol, 0) - self.symbol_margin_used.get(symbol, 0)
+        if remaining < MIN_ENTRY_MARGIN:
+            return 0.0
+
+        return MIN_ENTRY_MARGIN
 
     def get_dca_margin(self, symbol: str, dca_level: int, side: str = None) -> float:
         """Get margin for DCA level (1-4). In hedge mode, split by side."""
@@ -3858,20 +3867,29 @@ class BinanceLiveTradingEngine:
 
                         # Calculate next DCA trigger (ROI-based)
                         dca_level = pos.dca_count
+                        num_dca_levels = len(DCA_CONFIG["levels"])
                         next_dca_roi = 0.0
-                        if dca_level < len(DCA_CONFIG["levels"]):
+                        if num_dca_levels > 0 and dca_level < num_dca_levels:
                             next_dca_roi = abs(DCA_CONFIG["levels"][dca_level]["trigger_roi"]) * 100
 
                         # Calculate current ROI (pnl_pct is already ROI for leveraged positions)
                         leverage = STRATEGY_CONFIG["leverage"]
                         current_roi = pnl_pct  # This is already the ROI %
 
+                        # DCA display - show "NO DCA" if no levels configured
+                        if num_dca_levels == 0:
+                            dca_display = "NO DCA"
+                            dca_info = ""
+                        else:
+                            dca_display = f"DCA: {dca_level}/{num_dca_levels}"
+                            dca_info = f" | Next DCA: -{next_dca_roi:.0f}% ROI"
+
                         # Print position line with ROI (show side for hedge mode)
                         if self.hedge_mode:
-                            print(f"  {symbol} [{pos.side}]: @ ${pos.avg_entry_price:,.2f} | P&L: ${pnl_dollar:+.2f} ({pnl_sign}{current_roi:.2f}% ROI) | DCA: {dca_level}/4")
+                            print(f"  {symbol} [{pos.side}]: @ ${pos.avg_entry_price:,.2f} | P&L: ${pnl_dollar:+.2f} ({pnl_sign}{current_roi:.2f}% ROI) | {dca_display}")
                         else:
-                            print(f"  {symbol}: {pos.side} @ ${pos.avg_entry_price:,.2f} | P&L: ${pnl_dollar:+.2f} ({pnl_sign}{current_roi:.2f}% ROI) | DCA: {dca_level}/4")
-                        print(f"    RSI: {rsi_val:.1f} | ADX: {adx_val:.1f} | Mom: {mom_sign}{momentum:.2f}% | Next DCA: -{next_dca_roi:.0f}% ROI")
+                            print(f"  {symbol}: {pos.side} @ ${pos.avg_entry_price:,.2f} | P&L: ${pnl_dollar:+.2f} ({pnl_sign}{current_roi:.2f}% ROI) | {dca_display}")
+                        print(f"    RSI: {rsi_val:.1f} | ADX: {adx_val:.1f} | Mom: {mom_sign}{momentum:.2f}%{dca_info}")
 
                     # In hedge mode, don't skip to next symbol - we may still need to check for missing sides
                     if not self.hedge_mode:
@@ -4151,7 +4169,12 @@ class BinanceLiveTradingEngine:
                         boost_tag = ""
 
                     # Show virtual level indicator if position reached deeper than executed DCAs
-                    dca_display = f"{display_dca_level}/4" if virtual_dca_level <= dca_level else f"{dca_level}({virtual_dca_level})/4"
+                    # Check if DCA is disabled (empty levels list)
+                    num_dca_levels = len(DCA_CONFIG.get("levels", []))
+                    if num_dca_levels == 0:
+                        dca_display = "NO DCA"
+                    else:
+                        dca_display = f"{display_dca_level}/{num_dca_levels}" if virtual_dca_level <= dca_level else f"{dca_level}({virtual_dca_level})/{num_dca_levels}"
 
                     if local_pos and local_pos.trailing_active:
                         trailing_config = DCA_CONFIG.get("trailing_tp", {})
@@ -4164,7 +4187,8 @@ class BinanceLiveTradingEngine:
                         print(f"    DCA: {dca_display}{boost_tag} | Margin: ${margin_used:.2f} | Peak ROI: {local_pos.peak_roi*100:.1f}% (trail @ {activation:.0f}%)")
                     else:
                         print(f"    DCA: {dca_display}{boost_tag} | Margin: ${margin_used:.2f}")
-                    if next_dca_price > 0:
+                    # Only show "Next DCA" if DCA is enabled (has levels configured)
+                    if next_dca_price > 0 and num_dca_levels > 0:
                         # BOOSTED positions don't DCA - skip showing next DCA
                         if is_boosted:
                             print(f"    Next DCA: BLOCKED (position is BOOSTED - no further DCA)")
@@ -4339,12 +4363,13 @@ class BinanceLiveTradingEngine:
                     effective_trigger = lvl.get('trigger_roi', 0) * vol_mult
                     self.log(f"      DCA {i}: Trigger={effective_trigger*100:.0f}% (base {lvl.get('trigger_roi', 0)*100:.0f}% x {vol_mult})")
 
-        # Boost Mode settings
+        # Boost Mode settings (ROI-based, not DCA-based)
+        boost_config = DCA_CONFIG.get("boost_mode", {})
         self.log("BOOST MODE:")
-        self.log("  Trigger at DCA: 3")
-        self.log("  Boost multiplier: 1.5x")
-        self.log("  Half-close at TP: Yes")
-        self.log("  Trailing after half-close: Yes")
+        self.log(f"  Trigger at ROI: {boost_config.get('trigger_roi', -0.20)*100:.0f}% (NO DCA required)")
+        self.log(f"  Boost multiplier: {boost_config.get('boost_multiplier', 1.5)}x")
+        self.log(f"  Half-close at TP: {'Yes' if boost_config.get('half_close_at_tp', True) else 'No'}")
+        self.log(f"  Trailing after half-close: {'Yes' if boost_config.get('trailing_after_half', True) else 'No'}")
 
         self.log("="*70)
 
