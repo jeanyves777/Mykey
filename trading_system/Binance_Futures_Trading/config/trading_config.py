@@ -89,45 +89,35 @@ FUTURES_SYMBOLS = FUTURES_SYMBOLS_DEMO
 #   - boost_trigger_dca: DCA level to trigger boost (earlier for less volatile)
 #   - dca_levels: Custom DCA trigger levels (tighter for less volatile)
 SYMBOL_SETTINGS = {
-    # Tier 1: BTC/ETH - Less volatile, need TIGHTER parameters
+    # Tier 1: BTC/ETH - NO DCA (proven best in 90-day backtest)
     "BTCUSDT": {
         "min_qty": 0.001,
         "min_notional": 100.0,        # Binance requires $100 min notional (=$5 margin with 20x)
         "price_precision": 2,
         "qty_precision": 3,
         "tick_size": 0.01,
-        "dca_volatility_mult": 1.0,   # Default - BTC is stable
-        # ENHANCED BOOST - Tighter settings for BTC
-        "tp_roi": 0.05,               # 5% TP (vs 8% default) - faster exits
-        "boost_trigger_dca": 2,       # Trigger boost at DCA 2
-        "dca_levels": [               # LIMITED TO 2 LEVELS - BTC
-            {"trigger_roi": -0.03, "multiplier": 1.50, "tp_roi": 0.04},   # L1: -3% ROI
-            {"trigger_roi": -0.10, "multiplier": 1.75, "tp_roi": 0.04},   # L2: -10% ROI
-        ],
+        "tp_roi": 0.08,               # 8% TP - same as backtest
+        # NO DCA - empty list
+        "dca_levels": [],
     },
     "ETHUSDT": {
         "min_qty": 0.01,
         "price_precision": 2,
         "qty_precision": 3,
         "tick_size": 0.01,
-        "dca_volatility_mult": 1.0,   # Default - ETH is stable
-        # ENHANCED BOOST - Same as DOT (which works well, 93% return)
-        "tp_roi": 0.08,               # 8% TP (same as DOT) - proven to work
-        "boost_trigger_dca": 3,       # Trigger boost at DCA 3 (same as DOT)
-        # Uses default DCA levels from DCA_CONFIG (same as DOT)
+        "tp_roi": 0.08,               # 8% TP - same as backtest
+        # NO DCA - empty list
+        "dca_levels": [],
     },
-    # Tier 2: Moderate volatility
+    # Tier 2: BNB - NO DCA (proven best in 90-day backtest)
     "BNBUSDT": {
         "min_qty": 0.01,
         "price_precision": 2,
         "qty_precision": 2,
         "tick_size": 0.01,
-        "dca_volatility_mult": 1.0,   # No extra multiplier - custom levels below
-        # BNB - LIMITED TO 2 LEVELS
-        "dca_levels": [
-            {"trigger_roi": -0.15, "multiplier": 1.50, "tp_roi": 0.06, "require_trend_filter": True},   # DCA1: -15% ROI
-            {"trigger_roi": -0.30, "multiplier": 1.75, "tp_roi": 0.06, "require_trend_filter": True},   # DCA2: -30% ROI
-        ],
+        "tp_roi": 0.08,               # 8% TP - same as backtest
+        # NO DCA - empty list
+        "dca_levels": [],
     },
     "SOLUSDT": {
         "min_qty": 0.1,
