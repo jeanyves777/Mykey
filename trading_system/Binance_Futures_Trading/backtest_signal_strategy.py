@@ -534,7 +534,7 @@ def run_signal_test():
     """Test signal-based strategy"""
     # Configuration
     BACKTEST_DAYS = 7  # 7 days of 1m data (good amount for testing)
-    symbols = ["BTCUSDT", "ETHUSDT"]
+    symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
 
     print("="*80)
     print(f"SIGNAL-BASED STRATEGY BACKTEST - {BACKTEST_DAYS} DAYS (1m candles)")

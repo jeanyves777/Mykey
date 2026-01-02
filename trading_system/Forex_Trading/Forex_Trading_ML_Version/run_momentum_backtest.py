@@ -8,7 +8,7 @@ Simple H1 trend following with:
 - Trailing stop: activates at +10 pips, trails 8 pips behind
 
 Usage:
-    cd C:\Users\Jean-Yves\thevolumeainative
+    cd C:/Users/Jean-Yves/thevolumeainative
     py -m trading_system.Forex_Trading.Forex_Trading_ML_Version.run_momentum_backtest
 """
 
