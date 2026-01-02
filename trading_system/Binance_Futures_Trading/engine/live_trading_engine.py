@@ -3013,11 +3013,17 @@ class BinanceLiveTradingEngine:
         if position.dca_count >= len(DCA_CONFIG["levels"]):
             return
 
-        # ENHANCED BOOST MODE: Skip DCA on boosted positions
-        # When a position is boosted (1.5x), it should NOT DCA
-        # It maintains its boosted size until TP (half-close) or losing side recovers
+        # ENHANCED BOOST MODE: Skip DCA on BOTH sides when boost is active
+        # - Boosted side (winner): maintains 1.5x size, no DCA
+        # - Trigger side (loser): already deep in loss, no more DCA to reduce exposure
         if position.is_boosted:
             return  # Boosted positions don't DCA
+
+        # Also block DCA on the TRIGGER SIDE (the losing position that activated boost)
+        if self.boost_mode_active.get(symbol, False):
+            trigger_side = self.boost_trigger_side.get(symbol)
+            if position.side == trigger_side:
+                return  # Trigger side positions don't DCA during boost mode
 
         dca_level = position.dca_count + 1  # Next DCA level (1-4)
 
@@ -4141,6 +4147,9 @@ class BinanceLiveTradingEngine:
                         # BOOSTED positions don't DCA - skip showing next DCA
                         if is_boosted:
                             print(f"    Next DCA: BLOCKED (position is BOOSTED - no further DCA)")
+                        # TRIGGER SIDE also blocked during boost mode
+                        elif self.boost_mode_active.get(symbol, False) and self.boost_trigger_side.get(symbol) == side:
+                            print(f"    Next DCA: BLOCKED (BOOST active - trigger side frozen)")
                         else:
                             # Check if DCA trigger is close and show reversal status
                             current_roi_loss = abs(roi_pct) / 100  # Convert to decimal
