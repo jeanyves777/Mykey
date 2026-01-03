@@ -185,6 +185,14 @@ class BinanceLiveTradingEngine:
             "position_state.json"
         )
 
+        # SESSION STATS PERSISTENCE - Preserve stats across restarts
+        self.session_stats_file = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "session_stats.json"
+        )
+        # Load saved session stats (if any)
+        self._load_session_stats()
+
         # Logging
         self.log_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -478,6 +486,83 @@ class BinanceLiveTradingEngine:
                     self.log("[STATE] Cleared all position state")
         except Exception as e:
             self.log(f"[STATE] Error clearing position state: {e}", level="WARN")
+
+    def _save_session_stats(self):
+        """
+        Save session statistics to file for restart recovery.
+        Preserves: daily_trades, daily_wins, daily_losses, daily_pnl, symbol_stats
+        """
+        try:
+            stats = {
+                "last_updated": datetime.now().isoformat(),
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "daily_trades": self.daily_trades,
+                "daily_wins": self.daily_wins,
+                "daily_losses": self.daily_losses,
+                "daily_pnl": self.daily_pnl,
+                "starting_balance": self.starting_balance,
+                "symbol_stats": self.symbol_stats,
+            }
+
+            with open(self.session_stats_file, 'w') as f:
+                json.dump(stats, f, indent=2)
+
+        except Exception as e:
+            self.log(f"[STATS] Error saving session stats: {e}", level="WARN")
+
+    def _load_session_stats(self):
+        """
+        Load saved session statistics from file.
+        Only loads if same day (resets on new day).
+        """
+        try:
+            if os.path.exists(self.session_stats_file):
+                with open(self.session_stats_file, 'r') as f:
+                    stats = json.load(f)
+
+                # Check if same day
+                saved_date = stats.get("date", "")
+                today = datetime.now().strftime("%Y-%m-%d")
+
+                if saved_date == today:
+                    # Restore stats from same day
+                    self.daily_trades = stats.get("daily_trades", 0)
+                    self.daily_wins = stats.get("daily_wins", 0)
+                    self.daily_losses = stats.get("daily_losses", 0)
+                    self.daily_pnl = stats.get("daily_pnl", 0.0)
+                    self.starting_balance = stats.get("starting_balance", 0.0)
+
+                    # Restore symbol stats
+                    saved_symbol_stats = stats.get("symbol_stats", {})
+                    for symbol in self.symbols:
+                        if symbol in saved_symbol_stats:
+                            self.symbol_stats[symbol] = saved_symbol_stats[symbol]
+
+                    self.log(f"[STATS] Restored session stats from {stats.get('last_updated', 'unknown')}")
+                    self.log(f"[STATS] Trades: {self.daily_trades} | W:{self.daily_wins} L:{self.daily_losses} | PnL: ${self.daily_pnl:.2f}")
+                else:
+                    self.log(f"[STATS] New day detected - starting fresh stats (was: {saved_date})")
+        except Exception as e:
+            self.log(f"[STATS] Error loading session stats: {e}", level="WARN")
+
+    def _reset_session_stats(self):
+        """Reset all session stats (for user-requested reset)."""
+        self.daily_trades = 0
+        self.daily_wins = 0
+        self.daily_losses = 0
+        self.daily_pnl = 0.0
+        for symbol in self.symbols:
+            self.symbol_stats[symbol] = {
+                "wins": 0,
+                "losses": 0,
+                "tp_count": 0,
+                "sl_count": 0,
+                "pnl": 0.0
+            }
+        # Delete saved stats file
+        if os.path.exists(self.session_stats_file):
+            os.remove(self.session_stats_file)
+        self.log("[STATS] Session stats reset")
 
     def setup_symbol(self, symbol: str):
         """Set up a symbol for trading (leverage, margin type)"""
@@ -2903,6 +2988,9 @@ class BinanceLiveTradingEngine:
                         exit_type=exit_type,
                         dca_level=local_pos.dca_count
                     )
+
+                    # Save session stats after each trade
+                    self._save_session_stats()
 
                     # ============================================
                     # CANCEL ALL REMAINING ORDERS FOR THIS SYMBOL
