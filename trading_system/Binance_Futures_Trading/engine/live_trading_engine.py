@@ -3009,7 +3009,9 @@ class BinanceLiveTradingEngine:
                         self.symbol_margin_used[binance_symbol] = margin_used
 
                     hedge_label = f" [{binance_side}]" if self.hedge_mode else ""
-                    self.log(f"Synced position: {binance_symbol}{hedge_label} | Margin: ${margin_used:.2f} | DCA Level: {dca_level}/4")
+                    num_levels = len(DCA_CONFIG.get("levels", []))
+                    dca_str = "NO DCA" if num_levels == 0 else f"DCA: {dca_level}/{num_levels}"
+                    self.log(f"Synced position: {binance_symbol}{hedge_label} | Margin: ${margin_used:.2f} | {dca_str}")
 
                     # Ensure SL/TP orders are placed for synced positions
                     self._ensure_sl_tp_orders(binance_symbol, pos, dca_level, position_key=pos_key)
@@ -4317,7 +4319,8 @@ class BinanceLiveTradingEngine:
 
                     # Build status string
                     boost_str = " [BOOSTED]" if is_boosted else ""
-                    dca_str = f" DCA:{dca_count}/4" if dca_count > 0 else ""
+                    num_levels = len(DCA_CONFIG.get("levels", []))
+                    dca_str = "" if num_levels == 0 else f" DCA:{dca_count}/{num_levels}"
 
                     print(f"  {symbol} {side}: "
                           f"Entry ${pos['entry_price']:,.2f} | "
@@ -4575,7 +4578,9 @@ class BinanceLiveTradingEngine:
                     half_close_count = saved_pos.get("half_close_count", 0)
                     peak_roi = saved_pos.get("peak_roi", 0.0)
                     trailing_active = saved_pos.get("trailing_active", False)
-                    self.log(f"  [STATE] {position_key}: Restored DCA={dca_level}/4, Boosted={is_boosted}")
+                    num_dca_levels = len(DCA_CONFIG.get("levels", []))
+                    dca_str = "NO DCA" if num_dca_levels == 0 else f"DCA={dca_level}/{num_dca_levels}"
+                    self.log(f"  [STATE] {position_key}: Restored {dca_str}, Boosted={is_boosted}")
                 else:
                     # Fallback: estimate DCA level from margin used
                     dca_level = self.detect_dca_level_from_margin(symbol, actual_margin)
@@ -4584,7 +4589,9 @@ class BinanceLiveTradingEngine:
                     half_close_count = 0
                     peak_roi = 0.0
                     trailing_active = False
-                    self.log(f"  [STATE] {position_key}: No saved state, estimated DCA={dca_level}/4")
+                    num_dca_levels = len(DCA_CONFIG.get("levels", []))
+                    dca_str = "NO DCA" if num_dca_levels == 0 else f"DCA={dca_level}/{num_dca_levels}"
+                    self.log(f"  [STATE] {position_key}: No saved state, {dca_str}")
 
                 # ================================================================
                 # FIX: Cross-reference global boost_state with position
@@ -4673,10 +4680,14 @@ class BinanceLiveTradingEngine:
                         pnl_pct = ((pos["entry_price"] - current_price) / pos["entry_price"]) * 100
 
                     boost_str = " [BOOSTED]" if is_boosted else ""
-                    self.log(f"  Synced {symbol} {pos['side']}: Entry ${pos['entry_price']:,.2f} | Qty: {pos['quantity']:.6f} | P&L: {pnl_pct:+.2f}% | DCA: {dca_level}/4{boost_str}")
+                    num_levels = len(DCA_CONFIG.get("levels", []))
+                    dca_str = "NO DCA" if num_levels == 0 else f"DCA: {dca_level}/{num_levels}"
+                    self.log(f"  Synced {symbol} {pos['side']}: Entry ${pos['entry_price']:,.2f} | Qty: {pos['quantity']:.6f} | P&L: {pnl_pct:+.2f}% | {dca_str}{boost_str}")
                 except:
                     boost_str = " [BOOSTED]" if is_boosted else ""
-                    self.log(f"  Synced {symbol} {pos['side']}: Entry ${pos['entry_price']:,.2f} | Qty: {pos['quantity']:.6f} | DCA: {dca_level}/4{boost_str}")
+                    num_levels = len(DCA_CONFIG.get("levels", []))
+                    dca_str = "NO DCA" if num_levels == 0 else f"DCA: {dca_level}/{num_levels}"
+                    self.log(f"  Synced {symbol} {pos['side']}: Entry ${pos['entry_price']:,.2f} | Qty: {pos['quantity']:.6f} | {dca_str}{boost_str}")
 
                 # Check if position has SL/TP orders - if DCA level > 0, update TP to reduced level
                 self._ensure_sl_tp_orders(symbol, pos, dca_level, position_key=position_key)
