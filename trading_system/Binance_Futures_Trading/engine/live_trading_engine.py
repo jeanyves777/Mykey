@@ -3114,6 +3114,14 @@ class BinanceLiveTradingEngine:
 
     def check_dca(self, symbol: str, position: LivePosition, current_price: float):
         """Check and execute DCA with margin-based allocation and pair-specific volatility"""
+        # ============================================
+        # NO DCA - COMPLETELY DISABLED
+        # If DCA levels list is empty, DCA is disabled
+        # This check is FIRST to ensure NO DCA ever executes
+        # ============================================
+        if len(DCA_CONFIG.get("levels", [])) == 0:
+            return  # NO DCA - levels list is empty
+
         if not DCA_CONFIG["enabled"]:
             return
 
