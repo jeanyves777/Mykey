@@ -1289,15 +1289,50 @@ class BinanceLiveTradingEngine:
             self.log(f"    [BOOST] ERROR adding boost position: {e}", level="ERROR")
 
     def _deactivate_boost_mode(self, symbol: str, reason: str):
-        """Deactivate boost mode for a symbol."""
+        """Deactivate boost mode for a symbol and reduce boosted position back to normal."""
         if not self.boost_mode_active.get(symbol, False):
             return
 
         locked = self.boost_locked_profit.get(symbol, 0)
         cycles = self.boost_cycle_count.get(symbol, 0)
+        boosted_side = self.boosted_side.get(symbol)
 
         self.log(f">>> [BOOST] {symbol}: ENDED - {reason}")
         self.log(f"    [BOOST] Summary: {cycles} half-close cycles | Locked profit: ${locked:+.2f}")
+
+        # IMPORTANT: Reduce boosted position back to normal size (1.5x -> 1x)
+        if boosted_side:
+            pos_key = self.get_position_key(symbol, boosted_side)
+            pos = self.positions.get(pos_key)
+            if pos and pos.is_boosted and pos.quantity > 0:
+                # Calculate how much to reduce (from 1.5x to 1x = remove 0.33x of current)
+                reduce_qty = pos.quantity * (1 - 1/1.5)  # 0.33 of current qty
+
+                # Round quantity to symbol precision
+                symbol_config = SYMBOL_SETTINGS.get(symbol, {})
+                qty_precision = symbol_config.get("qty_precision", 1)
+                reduce_qty = round(reduce_qty, qty_precision)
+
+                if reduce_qty > 0:
+                    try:
+                        # Close the extra qty to reduce position
+                        close_side = "BUY" if boosted_side == "SHORT" else "SELL"
+                        self.log(f"    [BOOST] Reducing {boosted_side} position by {reduce_qty} (1.5x -> 1x)")
+
+                        reduce_order = self.client.place_market_order(
+                            symbol,
+                            close_side,
+                            reduce_qty,
+                            position_side=boosted_side
+                        )
+
+                        if "orderId" in reduce_order:
+                            pos.quantity -= reduce_qty
+                            self.log(f"    [BOOST] SUCCESS: {boosted_side} reduced to {pos.quantity} qty (1x)")
+                        else:
+                            self.log(f"    [BOOST] WARNING: Failed to reduce position: {reduce_order}", level="WARN")
+                    except Exception as e:
+                        self.log(f"    [BOOST] ERROR reducing position: {e}", level="ERROR")
 
         # Reset boost state
         self.boost_mode_active[symbol] = False
