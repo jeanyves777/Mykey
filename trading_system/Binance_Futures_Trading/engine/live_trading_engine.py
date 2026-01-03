@@ -416,6 +416,8 @@ class BinanceLiveTradingEngine:
             }
 
             # Save each position's state
+            # NO DCA = always save dca_count as 0
+            num_dca_levels = len(DCA_CONFIG.get("levels", []))
             for pos_key, pos in self.positions.items():
                 state["positions"][pos_key] = {
                     "symbol": pos.symbol,
@@ -423,7 +425,7 @@ class BinanceLiveTradingEngine:
                     "entry_price": pos.entry_price,
                     "avg_entry_price": pos.avg_entry_price,
                     "quantity": pos.quantity,
-                    "dca_count": pos.dca_count,
+                    "dca_count": 0 if num_dca_levels == 0 else pos.dca_count,
                     "margin_used": pos.margin_used,
                     "is_boosted": pos.is_boosted,
                     "boost_multiplier": pos.boost_multiplier,
@@ -3080,8 +3082,11 @@ class BinanceLiveTradingEngine:
                     # Get actual margin from Binance
                     margin_used = float(pos.get("isolated_wallet", 0)) or float(pos.get("isolatedWallet", 0))
 
-                    # Auto-detect DCA level from margin used
-                    dca_level = self.detect_dca_level_from_margin(binance_symbol, margin_used)
+                    # NO DCA - always set dca_level to 0 when DCA is disabled
+                    if len(DCA_CONFIG.get("levels", [])) == 0:
+                        dca_level = 0  # NO DCA mode
+                    else:
+                        dca_level = self.detect_dca_level_from_margin(binance_symbol, margin_used)
 
                     self.positions[pos_key] = LivePosition(
                         symbol=binance_symbol,
@@ -4651,26 +4656,28 @@ class BinanceLiveTradingEngine:
                 # ================================================================
                 saved_pos = saved_positions.get(position_key, {})
 
+                # Check if DCA is disabled
+                num_dca_levels = len(DCA_CONFIG.get("levels", []))
+
                 if saved_pos:
-                    # Use saved DCA level and boost state
-                    dca_level = saved_pos.get("dca_count", 0)
+                    # Use saved boost state (but NOT dca_count if DCA is disabled)
+                    # NO DCA = always dca_level 0, ignore saved dca_count
+                    dca_level = 0 if num_dca_levels == 0 else saved_pos.get("dca_count", 0)
                     is_boosted = saved_pos.get("is_boosted", False)
                     boost_multiplier = saved_pos.get("boost_multiplier", 1.0)
                     half_close_count = saved_pos.get("half_close_count", 0)
                     peak_roi = saved_pos.get("peak_roi", 0.0)
                     trailing_active = saved_pos.get("trailing_active", False)
-                    num_dca_levels = len(DCA_CONFIG.get("levels", []))
                     dca_str = "NO DCA" if num_dca_levels == 0 else f"DCA={dca_level}/{num_dca_levels}"
                     self.log(f"  [STATE] {position_key}: Restored {dca_str}, Boosted={is_boosted}")
                 else:
-                    # Fallback: estimate DCA level from margin used
-                    dca_level = self.detect_dca_level_from_margin(symbol, actual_margin)
+                    # Fallback: NO DCA = always 0, otherwise estimate from margin
+                    dca_level = 0 if num_dca_levels == 0 else self.detect_dca_level_from_margin(symbol, actual_margin)
                     is_boosted = False
                     boost_multiplier = 1.0
                     half_close_count = 0
                     peak_roi = 0.0
                     trailing_active = False
-                    num_dca_levels = len(DCA_CONFIG.get("levels", []))
                     dca_str = "NO DCA" if num_dca_levels == 0 else f"DCA={dca_level}/{num_dca_levels}"
                     self.log(f"  [STATE] {position_key}: No saved state, {dca_str}")
 
