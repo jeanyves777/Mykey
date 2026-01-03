@@ -7,7 +7,8 @@ Find the most profitable settings per asset using backtesting.
 Features:
 - Grid search over parameter combinations
 - Per-asset optimization (BTC, ETH, BNB each get optimal settings)
-- Parallel testing of parameter combinations
+- TRADING SESSION ANALYSIS (Asian, Tokyo, London, New York)
+- Per-session profitability tracking
 - Results tracking and export
 - Best parameters auto-save to config
 
@@ -16,6 +17,7 @@ Usage:
     python optimize_parameters.py --symbol BTCUSDT   # Single symbol
     python optimize_parameters.py --days 60          # Custom period
     python optimize_parameters.py --quick            # Quick mode (fewer combos)
+    python optimize_parameters.py --sessions         # Analyze by trading session
 """
 
 import os
@@ -77,6 +79,106 @@ PARAMETER_SPACE_QUICK = {
     "half_close_enabled": [True],
 }
 
+# =============================================================================
+# TRADING SESSIONS (UTC times)
+# =============================================================================
+# Each session has different volatility and market dynamics
+# Crypto trades 24/7 but follows traditional forex session patterns
+
+TRADING_SESSIONS = {
+    "ASIAN": {
+        "name": "Asian Session",
+        "start_hour": 0,   # 00:00 UTC (Tokyo 09:00, Sydney 11:00)
+        "end_hour": 8,     # 08:00 UTC
+        "description": "Lower volatility, range-bound trading",
+        "characteristics": ["consolidation", "low_volume", "range_trading"],
+    },
+    "TOKYO": {
+        "name": "Tokyo Session",
+        "start_hour": 0,   # 00:00 UTC (Tokyo 09:00)
+        "end_hour": 6,     # 06:00 UTC (Tokyo 15:00)
+        "description": "JPY pairs active, moderate volatility",
+        "characteristics": ["yen_pairs", "moderate_volume"],
+    },
+    "LONDON": {
+        "name": "London Session",
+        "start_hour": 7,   # 07:00 UTC (London 08:00 summer)
+        "end_hour": 16,    # 16:00 UTC (London 17:00 summer)
+        "description": "Highest volume, breakouts common",
+        "characteristics": ["high_volume", "breakouts", "trend_start"],
+    },
+    "NEW_YORK": {
+        "name": "New York Session",
+        "start_hour": 13,  # 13:00 UTC (NY 08:00 EST)
+        "end_hour": 22,    # 22:00 UTC (NY 17:00 EST)
+        "description": "High volatility, especially during London overlap",
+        "characteristics": ["high_volume", "news_events", "reversals"],
+    },
+    "LONDON_NY_OVERLAP": {
+        "name": "London/NY Overlap",
+        "start_hour": 13,  # 13:00 UTC
+        "end_hour": 16,    # 16:00 UTC
+        "description": "HIGHEST volatility period of the day",
+        "characteristics": ["extreme_volume", "major_moves", "best_opportunities"],
+    },
+    "WEEKEND": {
+        "name": "Weekend (Low Liquidity)",
+        "start_hour": 0,
+        "end_hour": 24,
+        "days": [5, 6],    # Saturday=5, Sunday=6
+        "description": "Low liquidity, avoid trading",
+        "characteristics": ["low_liquidity", "erratic_moves", "gaps"],
+    },
+}
+
+# Session-specific parameter adjustments
+SESSION_PARAM_ADJUSTMENTS = {
+    "ASIAN": {
+        "tp_roi_mult": 0.8,       # Lower TP target (less volatility)
+        "leverage_mult": 1.0,     # Same leverage
+        "description": "Tighter targets for range-bound market"
+    },
+    "TOKYO": {
+        "tp_roi_mult": 0.8,
+        "leverage_mult": 1.0,
+        "description": "Conservative during Tokyo"
+    },
+    "LONDON": {
+        "tp_roi_mult": 1.2,       # Higher TP target (more volatility)
+        "leverage_mult": 1.0,
+        "description": "Wider targets for breakout moves"
+    },
+    "NEW_YORK": {
+        "tp_roi_mult": 1.0,
+        "leverage_mult": 1.0,
+        "description": "Standard parameters"
+    },
+    "LONDON_NY_OVERLAP": {
+        "tp_roi_mult": 1.5,       # Much higher TP (extreme volatility)
+        "leverage_mult": 0.8,     # Slightly lower leverage (higher risk)
+        "description": "Wide targets but careful sizing"
+    },
+}
+
+
+@dataclass
+class SessionResult:
+    """Result for a specific trading session"""
+    session_name: str
+    total_trades: int
+    winning_trades: int
+    losing_trades: int
+    total_pnl: float
+    win_rate: float
+    profit_factor: float
+    avg_trade_pnl: float
+    best_hour: int
+    worst_hour: int
+    hourly_pnl: Dict[int, float] = field(default_factory=dict)
+
+    def is_profitable(self) -> bool:
+        return self.total_pnl > 0 and self.win_rate > 0.5
+
 
 @dataclass
 class OptimizationResult:
@@ -92,6 +194,7 @@ class OptimizationResult:
     liquidations: int
     avg_trade_pnl: float
     final_balance: float
+    session_results: Dict[str, SessionResult] = field(default_factory=dict)
 
     def score(self) -> float:
         """
@@ -122,6 +225,56 @@ class OptimizationResult:
         return score
 
 
+def get_trading_session(bar_time: datetime) -> str:
+    """
+    Determine which trading session a bar belongs to.
+
+    Args:
+        bar_time: The timestamp of the bar (should be UTC)
+
+    Returns:
+        Session name (ASIAN, TOKYO, LONDON, NEW_YORK, LONDON_NY_OVERLAP, WEEKEND)
+    """
+    # Check if weekend first
+    day_of_week = bar_time.weekday()  # Monday=0, Sunday=6
+    if day_of_week in [5, 6]:  # Saturday or Sunday
+        return "WEEKEND"
+
+    hour = bar_time.hour
+
+    # Check overlapping sessions (priority order)
+    if 13 <= hour < 16:
+        return "LONDON_NY_OVERLAP"  # Highest priority - most volatile
+    elif 13 <= hour < 22:
+        return "NEW_YORK"
+    elif 7 <= hour < 16:
+        return "LONDON"
+    elif 0 <= hour < 6:
+        return "TOKYO"
+    elif 0 <= hour < 8:
+        return "ASIAN"
+    else:
+        return "NEW_YORK"  # Default fallback
+
+
+def get_session_for_hour(hour: int) -> List[str]:
+    """Get all sessions active during a specific hour."""
+    sessions = []
+
+    if 0 <= hour < 8:
+        sessions.append("ASIAN")
+    if 0 <= hour < 6:
+        sessions.append("TOKYO")
+    if 7 <= hour < 16:
+        sessions.append("LONDON")
+    if 13 <= hour < 22:
+        sessions.append("NEW_YORK")
+    if 13 <= hour < 16:
+        sessions.append("LONDON_NY_OVERLAP")
+
+    return sessions if sessions else ["OFF_HOURS"]
+
+
 @dataclass
 class BacktestPosition:
     """Position during backtest"""
@@ -141,6 +294,7 @@ class BacktestPosition:
     margin_used: float = 0.0
     is_boosted: bool = False
     half_closed: bool = False
+    entry_session: str = ""  # Track which session the trade was entered in
 
 
 class ParameterOptimizer:
@@ -264,9 +418,26 @@ class ParameterOptimizer:
         # Process each bar
         entry_bars = {}
 
+        # Session tracking
+        session_trades: Dict[str, List[Dict]] = {
+            "ASIAN": [], "TOKYO": [], "LONDON": [],
+            "NEW_YORK": [], "LONDON_NY_OVERLAP": [], "WEEKEND": []
+        }
+        hourly_pnl: Dict[int, float] = {h: 0.0 for h in range(24)}
+
         for bar_idx in range(100, len(df)):  # Start after warmup period
             current_bar = df.iloc[bar_idx]
             bar_time = df.index[bar_idx]
+
+            # Convert to datetime if needed
+            if hasattr(bar_time, 'to_pydatetime'):
+                bar_time_dt = bar_time.to_pydatetime()
+            else:
+                bar_time_dt = bar_time
+
+            current_session = get_trading_session(bar_time_dt)
+            current_hour = bar_time_dt.hour
+
             current_price = current_bar["close"]
             high = current_bar["high"]
             low = current_bar["low"]
@@ -288,12 +459,20 @@ class ParameterOptimizer:
                     # Liquidated
                     liquidations += 1
                     balance += 0  # Lose entire margin
-                    trades.append({
+                    trade_record = {
                         "side": side,
                         "pnl": -pos.margin_used,
                         "pnl_pct": -1.0,
-                        "exit_reason": "LIQUIDATION"
-                    })
+                        "exit_reason": "LIQUIDATION",
+                        "entry_session": pos.entry_session,
+                        "exit_session": current_session,
+                        "exit_hour": current_hour
+                    }
+                    trades.append(trade_record)
+                    # Track by session
+                    if pos.entry_session in session_trades:
+                        session_trades[pos.entry_session].append(trade_record)
+                    hourly_pnl[current_hour] += trade_record["pnl"]
                     del positions[side]
                     continue
 
@@ -380,12 +559,19 @@ class ParameterOptimizer:
                         else:
                             pos.take_profit = pos.avg_entry_price * (1 - tp_price_pct)
 
-                        trades.append({
+                        trade_record = {
                             "side": side,
                             "pnl": pnl,
                             "pnl_pct": pnl / half_margin if half_margin > 0 else 0,
-                            "exit_reason": "HALF_CLOSE"
-                        })
+                            "exit_reason": "HALF_CLOSE",
+                            "entry_session": pos.entry_session,
+                            "exit_session": current_session,
+                            "exit_hour": current_hour
+                        }
+                        trades.append(trade_record)
+                        if pos.entry_session in session_trades:
+                            session_trades[pos.entry_session].append(trade_record)
+                        hourly_pnl[current_hour] += pnl
                     else:
                         # Full close
                         if side == "LONG":
@@ -399,12 +585,19 @@ class ParameterOptimizer:
                         # Return margin + PnL
                         balance += pos.margin_used + pnl
 
-                        trades.append({
+                        trade_record = {
                             "side": side,
                             "pnl": pnl,
                             "pnl_pct": pnl / pos.margin_used if pos.margin_used > 0 else 0,
-                            "exit_reason": exit_reason
-                        })
+                            "exit_reason": exit_reason,
+                            "entry_session": pos.entry_session,
+                            "exit_session": current_session,
+                            "exit_hour": current_hour
+                        }
+                        trades.append(trade_record)
+                        if pos.entry_session in session_trades:
+                            session_trades[pos.entry_session].append(trade_record)
+                        hourly_pnl[current_hour] += pnl
 
                         del positions[side]
 
@@ -459,7 +652,8 @@ class ParameterOptimizer:
                             lowest_price=entry_price,
                             avg_entry_price=entry_price,
                             total_cost=position_value,
-                            margin_used=margin_per_side
+                            margin_used=margin_per_side,
+                            entry_session=current_session  # Track entry session
                         )
 
             # Update equity curve
@@ -482,12 +676,18 @@ class ParameterOptimizer:
             pnl -= current_price * pos.quantity * commission_rate
             balance += pos.margin_used + pnl
 
-            trades.append({
+            trade_record = {
                 "side": side,
                 "pnl": pnl,
                 "pnl_pct": pnl / pos.margin_used if pos.margin_used > 0 else 0,
-                "exit_reason": "END_OF_BACKTEST"
-            })
+                "exit_reason": "END_OF_BACKTEST",
+                "entry_session": pos.entry_session,
+                "exit_session": "END",
+                "exit_hour": 0
+            }
+            trades.append(trade_record)
+            if pos.entry_session in session_trades:
+                session_trades[pos.entry_session].append(trade_record)
 
         # Calculate metrics
         total_trades = len(trades)
@@ -513,6 +713,46 @@ class ParameterOptimizer:
         else:
             sharpe = 0
 
+        # Calculate session-specific results
+        session_results = {}
+        for session_name, session_trade_list in session_trades.items():
+            if not session_trade_list:
+                continue
+
+            s_total = len(session_trade_list)
+            s_winners = [t for t in session_trade_list if t["pnl"] > 0]
+            s_losers = [t for t in session_trade_list if t["pnl"] <= 0]
+            s_win_rate = len(s_winners) / s_total if s_total > 0 else 0
+            s_total_pnl = sum(t["pnl"] for t in session_trade_list)
+            s_avg_pnl = s_total_pnl / s_total if s_total > 0 else 0
+
+            s_gross_profit = sum(t["pnl"] for t in s_winners)
+            s_gross_loss = abs(sum(t["pnl"] for t in s_losers))
+            s_pf = s_gross_profit / s_gross_loss if s_gross_loss > 0 else 10.0
+
+            # Find best/worst hours for this session
+            session_hourly = {}
+            for t in session_trade_list:
+                h = t.get("exit_hour", 0)
+                session_hourly[h] = session_hourly.get(h, 0) + t["pnl"]
+
+            best_hour = max(session_hourly.keys(), key=lambda h: session_hourly[h]) if session_hourly else 0
+            worst_hour = min(session_hourly.keys(), key=lambda h: session_hourly[h]) if session_hourly else 0
+
+            session_results[session_name] = SessionResult(
+                session_name=session_name,
+                total_trades=s_total,
+                winning_trades=len(s_winners),
+                losing_trades=len(s_losers),
+                total_pnl=s_total_pnl,
+                win_rate=s_win_rate,
+                profit_factor=min(s_pf, 10),
+                avg_trade_pnl=s_avg_pnl,
+                best_hour=best_hour,
+                worst_hour=worst_hour,
+                hourly_pnl=session_hourly
+            )
+
         return OptimizationResult(
             symbol=symbol,
             params=params,
@@ -524,7 +764,8 @@ class ParameterOptimizer:
             sharpe_ratio=sharpe,
             liquidations=liquidations,
             avg_trade_pnl=avg_trade_pnl,
-            final_balance=balance
+            final_balance=balance,
+            session_results=session_results
         )
 
     def optimize_symbol(self, symbol: str) -> Optional[OptimizationResult]:
@@ -639,6 +880,19 @@ class ParameterOptimizer:
                         break
 
                 if best:
+                    # Session results
+                    session_data = {}
+                    for session_name, sr in best.session_results.items():
+                        session_data[session_name] = {
+                            "total_trades": sr.total_trades,
+                            "win_rate": sr.win_rate,
+                            "total_pnl": sr.total_pnl,
+                            "profit_factor": sr.profit_factor,
+                            "is_profitable": sr.is_profitable(),
+                            "best_hour": sr.best_hour,
+                            "worst_hour": sr.worst_hour,
+                        }
+
                     data["symbols"][symbol] = {
                         "best_params": best.params,
                         "performance": {
@@ -650,7 +904,8 @@ class ParameterOptimizer:
                             "sharpe_ratio": best.sharpe_ratio,
                             "liquidations": best.liquidations,
                             "score": best.score()
-                        }
+                        },
+                        "sessions": session_data
                     }
 
         with open(filepath, "w") as f:
@@ -696,6 +951,25 @@ class ParameterOptimizer:
                 lines.append(f'        "trailing_activation_roi": {params["trailing_activation_roi"]},')
                 lines.append(f'        "trailing_distance_roi": {params["trailing_distance_roi"]},')
                 lines.append(f'        "half_close_enabled": {params["half_close_enabled"]},')
+
+                # Add session recommendations
+                if best.session_results:
+                    profitable = [s for s in best.session_results.values() if s.is_profitable()]
+                    losing = [s for s in best.session_results.values() if not s.is_profitable()]
+                    if profitable:
+                        lines.append(f'        # BEST SESSIONS: {", ".join([s.session_name for s in profitable])}')
+                    if losing:
+                        lines.append(f'        # AVOID SESSIONS: {", ".join([s.session_name for s in losing])}')
+                    # Find best overall hour
+                    all_hours = {}
+                    for sr in best.session_results.values():
+                        for h, pnl in sr.hourly_pnl.items():
+                            all_hours[h] = all_hours.get(h, 0) + pnl
+                    if all_hours:
+                        best_hour = max(all_hours.keys(), key=lambda h: all_hours[h])
+                        worst_hour = min(all_hours.keys(), key=lambda h: all_hours[h])
+                        lines.append(f'        # BEST HOUR: {best_hour}:00 UTC | WORST: {worst_hour}:00 UTC')
+
                 lines.append('    },')
 
         lines.append('}')
@@ -707,7 +981,40 @@ class ParameterOptimizer:
         print(f"Config exported to: {filepath}")
         return filepath
 
-    def print_summary(self):
+    def print_session_analysis(self, result: OptimizationResult):
+        """Print detailed session analysis for a result."""
+        if not result.session_results:
+            return
+
+        print(f"\n  SESSION ANALYSIS:")
+        print(f"  {'-'*60}")
+
+        # Sort sessions by profitability
+        sorted_sessions = sorted(
+            result.session_results.values(),
+            key=lambda s: s.total_pnl,
+            reverse=True
+        )
+
+        for sr in sorted_sessions:
+            status = "PROFITABLE" if sr.is_profitable() else "LOSING"
+            print(f"    {sr.session_name}:")
+            print(f"      Status: {status}")
+            print(f"      Trades: {sr.total_trades} | Win Rate: {sr.win_rate*100:.1f}%")
+            print(f"      PnL: ${sr.total_pnl:+.2f} | PF: {sr.profit_factor:.2f}x")
+            print(f"      Best Hour: {sr.best_hour}:00 UTC | Worst: {sr.worst_hour}:00 UTC")
+
+        # Recommend which sessions to trade
+        profitable_sessions = [s for s in sorted_sessions if s.is_profitable()]
+        losing_sessions = [s for s in sorted_sessions if not s.is_profitable()]
+
+        print(f"\n  RECOMMENDATIONS:")
+        if profitable_sessions:
+            print(f"    TRADE: {', '.join([s.session_name for s in profitable_sessions])}")
+        if losing_sessions:
+            print(f"    AVOID: {', '.join([s.session_name for s in losing_sessions])}")
+
+    def print_summary(self, show_sessions: bool = True):
         """Print optimization summary."""
         print("\n" + "="*70)
         print("OPTIMIZATION SUMMARY")
@@ -740,6 +1047,10 @@ class ParameterOptimizer:
                 print(f"    Trailing Activation: {params['trailing_activation_roi']*100:.0f}% ROI")
                 print(f"    Trailing Distance: {params['trailing_distance_roi']*100:.0f}% ROI")
                 print(f"    Half-Close: {params['half_close_enabled']}")
+
+                # Show session analysis
+                if show_sessions and best.session_results:
+                    self.print_session_analysis(best)
 
         print("\n" + "="*70)
 
@@ -784,6 +1095,12 @@ def main():
         help="Export best config as Python file"
     )
 
+    parser.add_argument(
+        "--sessions",
+        action="store_true",
+        help="Show detailed session analysis (Asian, Tokyo, London, NY)"
+    )
+
     args = parser.parse_args()
 
     # Determine symbols
@@ -801,8 +1118,8 @@ def main():
     best_results = optimizer.optimize_all()
     elapsed = time.time() - start_time
 
-    # Print summary
-    optimizer.print_summary()
+    # Print summary (always show sessions now - it's important!)
+    optimizer.print_summary(show_sessions=True)
 
     print(f"\nOptimization completed in {elapsed/60:.1f} minutes")
 
