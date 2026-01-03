@@ -1101,18 +1101,58 @@ class BinanceLiveTradingEngine:
         symbol_config = SYMBOL_SETTINGS.get(symbol, {})
         return symbol_config.get("boost_trigger_roi", 0.20)  # Default: 20% loss = -20% ROI
 
+    def _boost_position(self, symbol: str, pos: 'LivePosition', side: str):
+        """
+        Boost a single position by adding 0.5x to make it 1.5x total.
+        Used for both initial boost and dual boost scenarios.
+        """
+        if pos.is_boosted:
+            return  # Already boosted
+
+        # Mark position as boosted
+        pos.is_boosted = True
+        pos.boost_multiplier = self.boost_multiplier
+
+        # Add 0.5x more to make it 1.5x total
+        try:
+            boost_add_qty = pos.quantity * 0.5
+
+            # Round quantity to symbol precision
+            symbol_config = SYMBOL_SETTINGS.get(symbol, {})
+            qty_precision = symbol_config.get("qty_precision", 1)
+            boost_add_qty = round(boost_add_qty, qty_precision)
+
+            if boost_add_qty > 0:
+                order_side = "SELL" if side == "SHORT" else "BUY"
+                self.log(f"    [BOOST] Adding {boost_add_qty} to {side} position (0.5x boost)")
+
+                boost_order = self.client.place_market_order(
+                    symbol,
+                    order_side,
+                    boost_add_qty,
+                    position_side=side
+                )
+
+                if "orderId" in boost_order:
+                    pos.quantity += boost_add_qty
+                    self.log(f"    [BOOST] SUCCESS: {side} now has {pos.quantity} qty (1.5x)")
+                    self._save_position_state()
+                else:
+                    self.log(f"    [BOOST] WARNING: Failed to add boost qty: {boost_order}", level="WARN")
+        except Exception as e:
+            self.log(f"    [BOOST] ERROR adding boost position: {e}", level="ERROR")
+
     def _check_roi_boost_activation(self, symbol: str, current_price: float):
         """
         ROI-BASED BOOST ACTIVATION (replaces DCA level-based)
         When one side's ROI drops below -20%, boost the opposite side.
         This triggers EARLIER than waiting for DCA 3 (-45%).
+
+        DUAL BOOST: If one side is already boosted and hits -15% ROI,
+        ALSO boost the other side. Both sides can be boosted simultaneously.
         """
         if not self.hedge_mode:
             return  # Boost only works in hedge mode
-
-        # Already in boost mode for this symbol?
-        if self.boost_mode_active.get(symbol, False):
-            return
 
         # Get both positions
         long_key = self.get_position_key(symbol, "LONG")
@@ -1126,6 +1166,7 @@ class BinanceLiveTradingEngine:
 
         # Get ROI trigger threshold
         roi_trigger = self._get_boost_trigger_roi(symbol)  # Default 0.20 = -20%
+        dual_boost_trigger = 0.15  # -15% ROI to trigger boost on already-boosted side's opposite
 
         # Calculate ROI for both positions
         leverage = STRATEGY_CONFIG.get("leverage", 20)
@@ -1142,6 +1183,30 @@ class BinanceLiveTradingEngine:
             short_pnl = (short_pos.avg_entry_price - current_price) * short_pos.quantity
             short_roi = short_pnl / short_pos.margin_used
 
+        # =========================================================
+        # DUAL BOOST CHECK: If one side already boosted and losing
+        # =========================================================
+        if self.boost_mode_active.get(symbol, False):
+            current_boosted = self.boosted_side.get(symbol)
+
+            # Check if the BOOSTED side is now losing and other side not boosted
+            if current_boosted == "SHORT" and short_pos.is_boosted and not long_pos.is_boosted:
+                if short_roi <= -dual_boost_trigger:  # Boosted SHORT at -15% or worse
+                    self.log(f">>> [DUAL BOOST] {symbol}: SHORT (boosted) at {short_roi*100:.1f}% ROI - ALSO boosting LONG!")
+                    self._boost_position(symbol, long_pos, "LONG")
+                    return
+
+            elif current_boosted == "LONG" and long_pos.is_boosted and not short_pos.is_boosted:
+                if long_roi <= -dual_boost_trigger:  # Boosted LONG at -15% or worse
+                    self.log(f">>> [DUAL BOOST] {symbol}: LONG (boosted) at {long_roi*100:.1f}% ROI - ALSO boosting SHORT!")
+                    self._boost_position(symbol, short_pos, "SHORT")
+                    return
+
+            return  # Already in boost mode, dual check done
+
+        # =========================================================
+        # INITIAL BOOST: First time activation
+        # =========================================================
         # Check if either side hit the trigger (ROI below -20%)
         trigger_side = None
         boost_side = None
@@ -1172,44 +1237,11 @@ class BinanceLiveTradingEngine:
         self.boost_locked_profit[symbol] = 0.0
         self.boost_cycle_count[symbol] = 0
 
-        # Mark the boosted position
-        boost_pos.is_boosted = True
-        boost_pos.boost_multiplier = self.boost_multiplier
-
         self.log(f">>> [BOOST] {symbol}: ACTIVATED! {trigger_side} hit -{roi_trigger*100:.0f}% ROI -> {boost_side} now BOOSTED 1.5x")
         self.log(f"    [BOOST] Logic: At TP -> Close HALF, lock profit, add 0.5x, trailing starts")
 
-        # ACTUALLY BOOST THE POSITION: Add 0.5x more to make it 1.5x total
-        try:
-            boost_add_qty = boost_pos.quantity * 0.5  # Add 50% to make 1.5x
-
-            # Round quantity to symbol precision
-            symbol_config = SYMBOL_SETTINGS.get(symbol, {})
-            qty_precision = symbol_config.get("qty_precision", 1)
-            boost_add_qty = round(boost_add_qty, qty_precision)
-
-            if boost_add_qty > 0:
-                # Place market order to add to the boosted position
-                order_side = "SELL" if boost_side == "SHORT" else "BUY"
-                self.log(f"    [BOOST] Adding {boost_add_qty} to {boost_side} position (0.5x boost)")
-
-                boost_order = self.client.place_market_order(
-                    symbol,
-                    order_side,
-                    boost_add_qty,
-                    position_side=boost_side
-                )
-
-                if "orderId" in boost_order:
-                    # Update position quantity
-                    boost_pos.quantity += boost_add_qty
-                    self.log(f"    [BOOST] SUCCESS: {boost_side} now has {boost_pos.quantity} qty (1.5x)")
-                    # SAVE STATE after boost activation
-                    self._save_position_state()
-                else:
-                    self.log(f"    [BOOST] WARNING: Failed to add boost qty: {boost_order}", level="WARN")
-        except Exception as e:
-            self.log(f"    [BOOST] ERROR adding boost position: {e}", level="ERROR")
+        # Use helper function to boost the position
+        self._boost_position(symbol, boost_pos, boost_side)
 
     def _check_boost_activation(self, symbol: str, position: LivePosition, dca_level: int):
         """
