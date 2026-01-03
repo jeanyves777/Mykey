@@ -488,7 +488,7 @@ SMART_COMPOUNDING_CONFIG = {
     "enabled": True,                  # Enable smart compounding with reserve fund
     "compound_pct": 0.50,             # 50% of profits go to trading capital
     "reserve_pct": 0.50,              # 50% of profits go to reserve fund
-    "initial_capital": 74.61,         # Starting capital (baseline for calculations)
+    "initial_capital": None,          # None = auto-detect from actual balance on first run
     "reserve_file": "reserve_fund.json",  # File to persist reserve fund state
 }
 

@@ -164,10 +164,12 @@ class BinanceLiveTradingEngine:
         self.smart_compounding_enabled = SMART_COMPOUNDING_CONFIG.get("enabled", True)
         self.compound_pct = SMART_COMPOUNDING_CONFIG.get("compound_pct", 0.50)
         self.reserve_pct = SMART_COMPOUNDING_CONFIG.get("reserve_pct", 0.50)
-        self.initial_capital = SMART_COMPOUNDING_CONFIG.get("initial_capital", 125.0)
+        # initial_capital: None = auto-detect from actual balance
+        config_initial = SMART_COMPOUNDING_CONFIG.get("initial_capital", None)
+        self.initial_capital = config_initial if config_initial else 0.0  # Will be set from actual balance
         self.reserve_fund = 0.0           # Protected profits (never traded)
         self.total_realized_profit = 0.0  # Total lifetime realized profit
-        self.trading_capital = self.initial_capital  # Capital available for trading
+        self.trading_capital = self.initial_capital  # Capital available for trading (updated from saved state or balance)
         self.reserve_file = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "Binance_Futures_Trading",
@@ -1267,18 +1269,21 @@ class BinanceLiveTradingEngine:
                         pass
 
             # Check 3: Boost mode should be active based on DCA level
-            for side in ["LONG", "SHORT"]:
-                pos_key = self.get_position_key(symbol, side)
-                pos = self.positions.get(pos_key)
-                if pos and pos.dca_count >= self._get_boost_trigger_level(symbol):
-                    opposite_side = "SHORT" if side == "LONG" else "LONG"
-                    opposite_key = self.get_position_key(symbol, opposite_side)
-                    opposite_pos = self.positions.get(opposite_key)
+            # SKIP this check if NO DCA (using ROI-based boost instead)
+            num_dca_levels = len(DCA_CONFIG.get("levels", []))
+            if num_dca_levels > 0:
+                for side in ["LONG", "SHORT"]:
+                    pos_key = self.get_position_key(symbol, side)
+                    pos = self.positions.get(pos_key)
+                    if pos and pos.dca_count >= self._get_boost_trigger_level(symbol):
+                        opposite_side = "SHORT" if side == "LONG" else "LONG"
+                        opposite_key = self.get_position_key(symbol, opposite_side)
+                        opposite_pos = self.positions.get(opposite_key)
 
-                    # If this side hit boost trigger but boost not active, it might need activation
-                    if opposite_pos and not boost_active:
-                        # Check if the opposite side should be boosted
-                        fixes_applied.append(f"[HEAL] {symbol}: DCA{pos.dca_count} on {side} but no boost active - may need manual check")
+                        # If this side hit boost trigger but boost not active, it might need activation
+                        if opposite_pos and not boost_active:
+                            # Check if the opposite side should be boosted
+                            fixes_applied.append(f"[HEAL] {symbol}: DCA{pos.dca_count} on {side} but no boost active - may need manual check")
 
         # Log any fixes
         if fixes_applied:
@@ -4344,37 +4349,17 @@ class BinanceLiveTradingEngine:
 
         # General settings
         self.log(f"Leverage: {STRATEGY_CONFIG.get('leverage', 20)}x")
-        self.log(f"ADX Threshold (Strong Trend): {self.adx_threshold}")
-        self.log(f"Strong Trend DCA Block: ALL DCA on loser side")
+        self.log(f"TP ROI: {DCA_CONFIG.get('take_profit_roi', 0.08)*100:.0f}%")
+        self.log(f"SL ROI: {DCA_CONFIG.get('stop_loss_roi', 0.90)*100:.0f}%")
 
-        # Default DCA Levels
-        self.log("DEFAULT DCA LEVELS:")
-        self.log(f"  TP ROI: {DCA_CONFIG.get('take_profit_roi', 0.08)*100:.0f}%")
-        self.log(f"  SL ROI: {DCA_CONFIG.get('stop_loss_roi', 0.90)*100:.0f}%")
-        for i, lvl in enumerate(DCA_CONFIG.get('levels', []), 1):
-            self.log(f"  DCA {i}: Trigger={lvl.get('trigger_roi', 0)*100:.0f}% | Mult={lvl.get('multiplier', 1.0)}x | TP={lvl.get('tp_roi', 0.08)*100:.0f}%")
-
-        # Per-symbol settings
-        self.log("PER-SYMBOL DCA SETTINGS:")
-        for symbol in self.symbols:
-            settings = SYMBOL_SETTINGS.get(symbol, {})
-            symbol_dca = settings.get('dca_levels', None)
-            vol_mult = settings.get('dca_volatility_mult', 1.0)
-            tp_roi = settings.get('tp_roi', DCA_CONFIG.get('take_profit_roi', 0.08))
-
-            self.log(f"  {symbol}:")
-            self.log(f"    TP ROI: {tp_roi*100:.0f}%")
-
-            if symbol_dca:
-                self.log(f"    Custom DCA Levels (no volatility multiplier):")
-                for i, lvl in enumerate(symbol_dca, 1):
-                    trend_filter = "+ Trend Filter" if lvl.get('require_trend_filter', False) else ""
-                    self.log(f"      DCA {i}: Trigger={lvl.get('trigger_roi', 0)*100:.0f}% | Mult={lvl.get('multiplier', 1.0)}x {trend_filter}")
-            else:
-                self.log(f"    Using default levels with volatility_mult={vol_mult}x")
-                for i, lvl in enumerate(DCA_CONFIG.get('levels', []), 1):
-                    effective_trigger = lvl.get('trigger_roi', 0) * vol_mult
-                    self.log(f"      DCA {i}: Trigger={effective_trigger*100:.0f}% (base {lvl.get('trigger_roi', 0)*100:.0f}% x {vol_mult})")
+        # DCA Settings - only show if DCA is enabled
+        num_dca_levels = len(DCA_CONFIG.get('levels', []))
+        if num_dca_levels == 0:
+            self.log("DCA: DISABLED (NO DCA)")
+        else:
+            self.log(f"DCA LEVELS: {num_dca_levels}")
+            for i, lvl in enumerate(DCA_CONFIG.get('levels', []), 1):
+                self.log(f"  DCA {i}: Trigger={lvl.get('trigger_roi', 0)*100:.0f}% | Mult={lvl.get('multiplier', 1.0)}x | TP={lvl.get('tp_roi', 0.08)*100:.0f}%")
 
         # Boost Mode settings (ROI-based, not DCA-based)
         boost_config = DCA_CONFIG.get("boost_mode", {})
