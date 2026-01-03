@@ -305,6 +305,16 @@ def load_historical_data(symbol: str, days: int = 30) -> pd.DataFrame:
         'USD_JPY': 'USDJPY',
         'USD_CHF': 'USDCHF',
         'USD_CAD': 'USDCAD',
+        'AUD_USD': 'AUDUSD',
+        'NZD_USD': 'NZDUSD',
+        'EUR_GBP': 'EURGBP',
+        'EUR_JPY': 'EURJPY',
+        'EUR_CHF': 'EURCHF',
+        'EUR_AUD': 'EURAUD',
+        'EUR_CAD': 'EURCAD',
+        'GBP_JPY': 'GBPJPY',
+        'GBP_CHF': 'GBPCHF',
+        'GBP_AUD': 'GBPAUD',
     }
 
     histdata_symbol = symbol_map.get(symbol, symbol.replace('_', ''))
@@ -374,9 +384,14 @@ def main():
     print(f"Fixed: $5/pip | STRONGER signals (ADX 25-40, ATR 1.5-2.5x)")
     print("-" * 80)
 
-    # Test on TOP 4 PROFITABLE PAIRS only
-    symbols = ['EUR_USD', 'GBP_USD', 'USD_JPY', 'USD_CAD']
-    days = 7  # 1 week of M1 data = ~10,000 candles per pair
+    # Test ALL 15 major pairs
+    symbols = [
+        'EUR_USD', 'GBP_USD', 'USD_JPY', 'USD_CHF', 'USD_CAD',  # USD majors
+        'AUD_USD', 'NZD_USD',                                    # Commodity pairs
+        'EUR_GBP', 'EUR_JPY', 'EUR_CHF', 'EUR_AUD', 'EUR_CAD',  # EUR crosses
+        'GBP_JPY', 'GBP_CHF', 'GBP_AUD',                         # GBP crosses
+    ]
+    days = 30  # 1 month of M1 data for better sample size
 
     # SCALPING parameters for M1 timeframe
     best_params = {
@@ -390,13 +405,24 @@ def main():
         'max_losses_per_day': 999,
     }
 
-    print(f"\nTesting M1 SCALPING parameters on 4 PAIRS (7 days)...")
+    print(f"\nFINDING BEST SESSION FOR EACH PAIR...")
     print(f"Parameters: TP:{best_params['tp_pips']}p SL:{best_params['sl_pips']}p ADX>{best_params['adx_threshold']} ATR>{best_params['atr_expansion_mult']}x DI>5")
     print("-" * 90)
+
+    # All sessions to test
+    all_sessions = {
+        'ASIAN': (0, 8),       # 00:00-08:00 UTC (Tokyo)
+        'LONDON': (8, 16),     # 08:00-16:00 UTC (London)
+        'NY': (13, 21),        # 13:00-21:00 UTC (New York)
+        'OVERLAP': (13, 16),   # 13:00-16:00 UTC (London/NY overlap)
+    }
 
     all_results = []
     total_starting = 0
     total_ending = 0
+
+    print(f"\n{'Pair':<10} {'ASIAN':>12} {'LONDON':>12} {'NY':>12} {'OVERLAP':>12} {'BEST':>10}")
+    print("-" * 70)
 
     for symbol in symbols:
         df = load_historical_data(symbol, days=days)
@@ -406,19 +432,37 @@ def main():
             continue
 
         optimizer = ParameterOptimizer(symbol, start_balance=500.0)
-        result = optimizer.run_backtest(df, best_params, (0, 24))  # ALL_DAY
+
+        # Test each session
+        session_results = {}
+        for session_name, session_hours in all_sessions.items():
+            result = optimizer.run_backtest(df, best_params, session_hours)
+            session_results[session_name] = result['return_pct']
+
+        # Find best session
+        best_session = max(session_results, key=session_results.get)
+        best_return = session_results[best_session]
+
+        # Print comparison
+        print(f"{symbol:<10} {session_results['ASIAN']:>+11.1f}% {session_results['LONDON']:>+11.1f}% "
+              f"{session_results['NY']:>+11.1f}% {session_results['OVERLAP']:>+11.1f}% -> {best_session}")
+
+        # Run final backtest with best session
+        best_session_hours = all_sessions[best_session]
+        result = optimizer.run_backtest(df, best_params, best_session_hours)
         result['symbol'] = symbol
+        result['session'] = best_session
 
         all_results.append(result)
         total_starting += 500
         total_ending += result['balance']
 
     # Display results by pair
-    print(f"\n{'='*90}")
-    print("STRONG SIGNAL RESULTS - ALL 8 PAIRS ($5/pip)")
-    print(f"{'='*90}")
-    print(f"{'Pair':<10} {'End Bal':>10} {'Return':>10} {'MaxDD':>8} {'Trades':>7} {'W/L':>8} {'Win%':>7}")
-    print("-" * 90)
+    print(f"\n{'='*100}")
+    print("EACH PAIR IN THEIR BEST SESSION ($5/pip)")
+    print(f"{'='*100}")
+    print(f"{'Pair':<10} {'Session':<8} {'End Bal':>10} {'Return':>10} {'MaxDD':>8} {'Trades':>7} {'W/L':>8} {'Win%':>7}")
+    print("-" * 100)
 
     # Sort by return
     all_results.sort(key=lambda x: x['return_pct'], reverse=True)
@@ -431,7 +475,8 @@ def main():
 
     for r in all_results:
         status = "PROFIT" if r['return_pct'] > 0 else "LOSS"
-        print(f"{r['symbol']:<10} ${r['balance']:>9.2f} {r['return_pct']:>+9.1f}% {r['max_drawdown']:>7.1f}% "
+        session = r.get('session', 'ALL_DAY')
+        print(f"{r['symbol']:<10} {session:<8} ${r['balance']:>9.2f} {r['return_pct']:>+9.1f}% {r['max_drawdown']:>7.1f}% "
               f"{r['total_trades']:>7} {r['wins']:>3}/{r['losses']:<3} {r['win_rate']:>6.1f}% {status}")
 
         if r['return_pct'] > 0:

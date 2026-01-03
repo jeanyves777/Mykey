@@ -1621,14 +1621,22 @@ class BinanceLiveTradingEngine:
 
                     # Update position with new average entry
                     total_qty = remaining_qty + new_entry_qty
+
+                    # SAFETY: If avg_entry_price is invalid, use entry_price
+                    old_avg = position.avg_entry_price
+                    if old_avg <= 0 or old_avg < reentry_price * 0.1:  # Sanity check
+                        old_avg = position.entry_price
+                        self.log(f"    [BOOST] WARNING: avg_entry_price was invalid, using entry_price ${old_avg:,.2f}", level="WARN")
+
                     # Weighted average entry price
                     new_avg_entry = (
-                        (position.avg_entry_price * remaining_qty) +
+                        (old_avg * remaining_qty) +
                         (reentry_price * new_entry_qty)
                     ) / total_qty
 
                     position.quantity = total_qty
                     position.avg_entry_price = new_avg_entry
+                    position.entry_price = new_avg_entry  # Keep entry_price in sync
 
                     self.log(f"    [BOOST] SUCCESS: New total qty {total_qty} @ avg ${new_avg_entry:,.4f}", level="TRADE")
                     self.log(f"    [BOOST] Cycle #{position.half_close_count} complete | Total locked: ${self.boost_locked_profit.get(symbol, 0):+.2f}", level="TRADE")
