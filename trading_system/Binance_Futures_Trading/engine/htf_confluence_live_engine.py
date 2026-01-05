@@ -605,26 +605,43 @@ class HTFConfluenceLiveEngine:
                     if exit_type:
                         logger.info(f"[{symbol}] Position exit: {exit_type}")
                     else:
-                        # Position still open - show status with current price
+                        # Position still open - show detailed status
                         pos = self.positions[symbol]
                         try:
                             price_data = self.client.get_current_price(symbol)
                             current_price = price_data["price"]
                             entry = pos["entry_price"]
+                            qty = pos["quantity"]
 
-                            # Calculate unrealized ROI
+                            # Calculate price move %
                             if pos["side"] == "LONG":
-                                roi = (current_price - entry) / entry * self.leverage * 100
-                                distance_to_tp = (pos["tp_price"] - current_price) / current_price * 100
-                                distance_to_sl = (current_price - pos["sl_price"]) / current_price * 100
+                                price_move = (current_price - entry) / entry * 100
+                                roi = price_move * self.leverage
+                                to_tp_price = (pos["tp_price"] - current_price) / current_price * 100
+                                to_sl_price = (current_price - pos["sl_price"]) / current_price * 100
                             else:
-                                roi = (entry - current_price) / entry * self.leverage * 100
-                                distance_to_tp = (current_price - pos["tp_price"]) / current_price * 100
-                                distance_to_sl = (pos["sl_price"] - current_price) / current_price * 100
+                                price_move = (entry - current_price) / entry * 100
+                                roi = price_move * self.leverage
+                                to_tp_price = (current_price - pos["tp_price"]) / current_price * 100
+                                to_sl_price = (pos["sl_price"] - current_price) / current_price * 100
 
-                            logger.info(f"[{symbol}] {pos['side']} @ ${entry:,.4f} | Now: ${current_price:,.4f} | ROI: {roi:+.1f}% | TP: {distance_to_tp:.2f}% away | SL: {distance_to_sl:.2f}% away")
-                        except:
-                            logger.info(f"[{symbol}] {pos['side']} @ ${pos['entry_price']:,.4f} (monitoring)")
+                            # Calculate margin and unrealized PnL
+                            position_value = qty * entry
+                            margin = position_value / self.leverage
+                            unrealized_pnl = margin * (roi / 100)
+
+                            # ROI to TP/SL
+                            to_tp_roi = to_tp_price * self.leverage
+                            to_sl_roi = to_sl_price * self.leverage
+
+                            logger.info(f"┌─ {symbol} {pos['side']} ─────────────────────────────────")
+                            logger.info(f"│ Entry: ${entry:,.4f} | Now: ${current_price:,.4f} | Qty: {qty}")
+                            logger.info(f"│ Price Move: {price_move:+.3f}% | ROI: {roi:+.1f}% | PnL: ${unrealized_pnl:+.2f}")
+                            logger.info(f"│ Margin: ${margin:.2f} | Position: ${position_value:.2f}")
+                            logger.info(f"│ To TP: {to_tp_price:.3f}% ({to_tp_roi:+.1f}% ROI) | To SL: {to_sl_price:.3f}% ({to_sl_roi:.1f}% ROI)")
+                            logger.info(f"└────────────────────────────────────────────────")
+                        except Exception as e:
+                            logger.info(f"[{symbol}] {pos['side']} @ ${pos['entry_price']:,.4f} (monitoring) - {e}")
                     continue
 
                 # Check cooldown
