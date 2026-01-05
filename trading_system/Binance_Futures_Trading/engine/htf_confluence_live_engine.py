@@ -282,12 +282,14 @@ class HTFConfluenceLiveEngine:
             logger.info(f"Account Balance: ${balance:,.2f} USDT")
             logger.info(f"Available Balance: ${available:,.2f} USDT")
 
+            # Store initial capital for reference (if specified)
             if self.total_capital is None:
                 self.total_capital = available
 
-            # Calculate per-symbol capital
-            self.per_symbol_capital = self.total_capital / len(self.symbols)
-            logger.info(f"Trading Capital: ${self.total_capital:,.2f} (${self.per_symbol_capital:,.2f} per symbol)")
+            # Dynamic allocation: margin is calculated per-trade based on available balance
+            # Each symbol gets equal share of available margin when opening
+            logger.info(f"Margin Mode: DYNAMIC (Available balance split equally among symbols)")
+            logger.info(f"Initial per-symbol margin: ~${available / len(self.symbols):.2f} (will adjust based on availability)")
 
         except Exception as e:
             logger.error(f"Failed to get account balance: {e}")
@@ -469,7 +471,10 @@ class HTFConfluenceLiveEngine:
 
     def calculate_position_size(self, symbol: str, entry_price: float) -> float:
         """
-        Calculate position size using FULL capital per symbol as margin.
+        Calculate position size using dynamic available margin split equally among symbols.
+
+        Uses CURRENT available balance divided by number of symbols without positions.
+        This ensures each symbol gets equal margin based on what's actually available.
 
         Args:
             symbol: Trading symbol
@@ -478,8 +483,24 @@ class HTFConfluenceLiveEngine:
         Returns:
             Position quantity
         """
-        # Use full per-symbol capital as margin
-        margin = self.per_symbol_capital
+        # Get CURRENT available balance (dynamic, not fixed)
+        available_balance = self.client.get_available_balance()
+
+        # Count how many symbols DON'T have positions (need margin)
+        symbols_needing_margin = [s for s in self.symbols if s not in self.positions]
+        num_symbols_needing_margin = len(symbols_needing_margin)
+
+        if num_symbols_needing_margin == 0:
+            logger.warning(f"[{symbol}] All symbols have positions, cannot calculate margin")
+            return 0.0
+
+        # Split available balance equally among symbols needing margin
+        margin_per_symbol = available_balance / num_symbols_needing_margin
+
+        # Apply a small buffer (95%) to avoid "insufficient margin" errors
+        margin = margin_per_symbol * 0.95
+
+        logger.info(f"[{symbol}] Dynamic margin: ${margin:.2f} (${available_balance:.2f} available / {num_symbols_needing_margin} symbols * 0.95)")
 
         # Position value = margin * leverage
         position_value = margin * self.leverage
@@ -494,7 +515,7 @@ class HTFConfluenceLiveEngine:
 
         quantity = round(quantity, qty_precision)
 
-        logger.debug(f"[{symbol}] Position size: {quantity} (margin ${margin:.2f} x {self.leverage}x leverage)")
+        logger.info(f"[{symbol}] Position size: {quantity} (margin ${margin:.2f} x {self.leverage}x leverage = ${position_value:.2f})")
 
         return quantity
 
