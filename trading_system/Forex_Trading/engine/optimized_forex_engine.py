@@ -174,7 +174,7 @@ class OptimizedForexEngine:
                     print(f"[SCAN] {instrument}: {reason}")
 
     def enter_position(self, instrument: str, signal: Dict):
-        """Enter a new position"""
+        """Enter a new position - PLACES REAL ORDER ON OANDA"""
         # Get current price
         price_data = self.oanda.get_current_price(instrument)
 
@@ -188,6 +188,10 @@ class OptimizedForexEngine:
         # Calculate position size ($1 per pip)
         units = self.strategy.calculate_position_size(instrument, entry_price)
 
+        # Make units negative for SELL orders
+        if signal["action"] == "SELL":
+            units = -units
+
         # Get TP/SL from optimized settings
         settings = signal['settings']
         tp_sl = self.strategy.calculate_tp_sl_prices(
@@ -197,38 +201,49 @@ class OptimizedForexEngine:
             settings
         )
 
-        # Apply slippage
-        pip_value = 0.0001 if "JPY" not in instrument else 0.01
-        slippage = PAPER_TRADING_CONFIG["slippage_pips"] * pip_value
+        # PLACE REAL ORDER ON OANDA
+        print(f"\n[ORDER] Placing {signal['action']} order on OANDA...")
+        order_result = self.oanda.place_market_order(
+            instrument=instrument,
+            units=units,
+            stop_loss=tp_sl['sl_price'],
+            take_profit=tp_sl['tp_price']
+        )
 
-        if signal["action"] == "BUY":
-            entry_price += slippage
-        else:
-            entry_price -= slippage
+        if not order_result.get("success"):
+            print(f"[ORDER] FAILED: {order_result.get('error', 'Unknown error')}")
+            return
 
-        # Store position
+        # Order successful - get actual fill price
+        actual_entry = order_result.get("filled_price", entry_price)
+        trade_id = order_result.get("trade_id")
+
+        # Store position with trade_id for tracking
         position = {
             "instrument": instrument,
             "direction": direction,
-            "entry_price": entry_price,
-            "units": units,
+            "entry_price": actual_entry,
+            "units": abs(units),
             "stop_loss": tp_sl['sl_price'],
             "take_profit": tp_sl['tp_price'],
             "entry_time": datetime.now(pytz.UTC),
             "signal": signal,
             "strategy": settings['strategy'],
             "tp_pips": tp_sl['tp_pips'],
-            "sl_pips": tp_sl['sl_pips']
+            "sl_pips": tp_sl['sl_pips'],
+            "trade_id": trade_id,
+            "order_id": order_result.get("order_id")
         }
 
         self.positions[instrument] = position
         self.daily_trades += 1
 
         print(f"\n{'='*70}")
-        print(f"[TRADE] ENTERED {direction} on {instrument}")
+        print(f"[TRADE] ORDER FILLED - {direction} on {instrument}")
+        print(f"[TRADE] Trade ID: {trade_id}")
         print(f"[TRADE] Strategy: {settings['strategy']}")
-        print(f"[TRADE] Entry: {entry_price:.5f}")
-        print(f"[TRADE] Units: {units:,} (~$1/pip)")
+        print(f"[TRADE] Entry: {actual_entry:.5f}")
+        print(f"[TRADE] Units: {abs(units):,} (~$1/pip)")
         print(f"[TRADE] TP: {tp_sl['tp_price']:.5f} (+{tp_sl['tp_pips']} pips)")
         print(f"[TRADE] SL: {tp_sl['sl_price']:.5f} (-{tp_sl['sl_pips']} pips)")
         if 'analysis' in signal:
