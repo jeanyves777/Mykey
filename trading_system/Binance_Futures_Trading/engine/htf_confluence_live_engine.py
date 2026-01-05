@@ -684,7 +684,8 @@ class HTFConfluenceLiveEngine:
             total_unrealized_pnl = 0.0
             positions_data = self.client.get_positions()
             for pos in positions_data:
-                unrealized = float(pos.get('unRealizedProfit', 0))
+                # get_positions() returns 'unrealized_pnl' (processed field name)
+                unrealized = float(pos.get('unrealized_pnl', 0))
                 total_unrealized_pnl += unrealized
 
             logger.info(f"┌─ ACCOUNT SUMMARY ──────────────────────────────")
