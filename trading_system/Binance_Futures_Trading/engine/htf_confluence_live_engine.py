@@ -110,6 +110,11 @@ class HTFConfluenceLiveEngine:
         self.losses_today = 0
         self.pnl_today = 0.0
 
+        # Per-symbol statistics
+        self.symbol_stats = {}  # symbol -> {wins, losses, pnl}
+        for symbol in self.symbols:
+            self.symbol_stats[symbol] = {"wins": 0, "losses": 0, "pnl": 0.0}
+
         # Running state
         self.running = False
         self.check_interval = 60  # Check every 60 seconds (on 15m TF, no need for faster)
@@ -536,12 +541,15 @@ class HTFConfluenceLiveEngine:
 
                 if exit_type == "TP":
                     self.wins_today += 1
+                    self.symbol_stats[symbol]["wins"] += 1
                     logger.info(f"[{symbol}] Position closed - TP HIT! ROI: +{roi:.1f}%")
                 else:
                     self.losses_today += 1
+                    self.symbol_stats[symbol]["losses"] += 1
                     logger.info(f"[{symbol}] Position closed - SL HIT. ROI: {roi:.1f}%")
 
                 self.pnl_today += pnl
+                self.symbol_stats[symbol]["pnl"] += pnl
 
                 # Clean up
                 del self.positions[symbol]
@@ -666,9 +674,37 @@ class HTFConfluenceLiveEngine:
                 import traceback
                 traceback.print_exc()
 
-        # Log daily stats
+        # Get account info for balance and realized PnL
+        try:
+            account = self.client.get_account_info()
+            total_balance = float(account.get('totalWalletBalance', 0))
+            available_balance = float(account.get('availableBalance', 0))
+
+            # Calculate total unrealized PnL across all positions
+            total_unrealized_pnl = 0.0
+            positions_data = self.client.get_positions()
+            for pos in positions_data:
+                unrealized = float(pos.get('unRealizedProfit', 0))
+                total_unrealized_pnl += unrealized
+
+            logger.info(f"┌─ ACCOUNT SUMMARY ──────────────────────────────")
+            logger.info(f"│ Balance: ${total_balance:,.2f} | Available: ${available_balance:,.2f}")
+            logger.info(f"│ Total Unrealized PnL: ${total_unrealized_pnl:+,.2f}")
+            logger.info(f"│ Session Realized PnL: ${self.pnl_today:+,.2f}")
+            logger.info(f"└────────────────────────────────────────────────")
+        except Exception as e:
+            logger.warning(f"Could not fetch account info: {e}")
+
+        # Log daily stats with per-symbol breakdown
         win_rate = (self.wins_today / self.trades_today * 100) if self.trades_today > 0 else 0
-        logger.info(f"Today: {self.trades_today} trades | {self.wins_today}W/{self.losses_today}L | WR: {win_rate:.0f}%")
+        logger.info(f"┌─ SESSION STATS ─────────────────────────────────")
+        logger.info(f"│ Total: {self.trades_today} trades | {self.wins_today}W/{self.losses_today}L | WR: {win_rate:.0f}%")
+        for symbol in self.symbols:
+            stats = self.symbol_stats[symbol]
+            sym_trades = stats["wins"] + stats["losses"]
+            sym_wr = (stats["wins"] / sym_trades * 100) if sym_trades > 0 else 0
+            logger.info(f"│ {symbol}: {stats['wins']}W/{stats['losses']}L | WR: {sym_wr:.0f}% | PnL: ${stats['pnl']:+,.2f}")
+        logger.info(f"└────────────────────────────────────────────────")
 
     def run(self):
         """Main trading loop."""
