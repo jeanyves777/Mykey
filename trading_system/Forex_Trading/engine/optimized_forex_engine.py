@@ -42,7 +42,7 @@ class OptimizedForexEngine:
 
         Args:
             account_type: 'practice' for demo, 'live' for real trading
-            initial_balance: Starting balance (only for paper trading)
+            initial_balance: Starting balance (only for paper trading - overrides OANDA)
         """
         self.account_type = account_type
         self.oanda = OandaClient(account_type=account_type)
@@ -52,8 +52,20 @@ class OptimizedForexEngine:
             max_trades_per_day=RISK_CONFIG["max_trades_per_day"]
         )
 
-        # Trading state
-        self.balance = initial_balance or PAPER_TRADING_CONFIG["initial_balance"]
+        # Get real balance from OANDA account
+        if initial_balance is None:
+            try:
+                account_info = self.oanda.get_account_info()
+                self.balance = float(account_info.get("balance", PAPER_TRADING_CONFIG["initial_balance"]))
+                print(f"[ENGINE] Retrieved balance from OANDA: ${self.balance:,.2f}")
+            except Exception as e:
+                print(f"[ENGINE] Error getting OANDA balance: {e}")
+                self.balance = PAPER_TRADING_CONFIG["initial_balance"]
+                print(f"[ENGINE] Using default balance: ${self.balance:,.2f}")
+        else:
+            self.balance = initial_balance
+            print(f"[ENGINE] Using override balance: ${self.balance:,.2f}")
+
         self.initial_balance = self.balance
         self.positions: Dict[str, Dict] = {}
         self.trades: List[Dict] = []
@@ -69,7 +81,6 @@ class OptimizedForexEngine:
         self.last_check_time = {}
 
         print(f"[ENGINE] Optimized Forex Engine initialized ({account_type})")
-        print(f"[ENGINE] Initial Balance: ${self.balance:,.2f}")
         print(f"[ENGINE] Trading {len(OPTIMIZED_INSTRUMENTS)} optimized pairs")
 
     def get_market_data(self, instrument: str) -> Optional[pd.DataFrame]:
