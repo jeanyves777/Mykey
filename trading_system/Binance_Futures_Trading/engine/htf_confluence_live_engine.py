@@ -223,7 +223,7 @@ class HTFConfluenceLiveEngine:
             entry_price = position["entry_price"]
 
             # Get open orders for this symbol
-            open_orders = self.client.client.futures_get_open_orders(symbol=symbol)
+            open_orders = self.client.get_open_orders(symbol=symbol)
 
             # Check for TP and SL orders
             has_tp = False
