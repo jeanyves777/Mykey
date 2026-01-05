@@ -469,13 +469,13 @@ class OptimizedForexStrategy:
 
         if direction == 'BUY':
             return {
-                'tp': entry_price + (tp_pips * pip_value),
-                'sl': entry_price - (sl_pips * pip_value)
+                'tp_price': entry_price + (tp_pips * pip_value),
+                'sl_price': entry_price - (sl_pips * pip_value)
             }
         else:
             return {
-                'tp': entry_price - (tp_pips * pip_value),
-                'sl': entry_price + (sl_pips * pip_value)
+                'tp_price': entry_price - (tp_pips * pip_value),
+                'sl_price': entry_price + (sl_pips * pip_value)
             }
 
     def should_enter_trade(self, instrument, df_5min, current_positions=0, trades_today=0, daily_pl_pct=0.0, now=None):
