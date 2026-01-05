@@ -104,16 +104,12 @@ class HTFConfluenceLiveEngine:
         self.last_trade_time = {}  # symbol -> datetime
         self.cooldown_minutes = 60  # 1 hour cooldown between trades per symbol
 
-        # Statistics
-        self.trades_today = 0
-        self.wins_today = 0
-        self.losses_today = 0
-        self.pnl_today = 0.0
+        # Statistics - load from file if exists (persist across restarts)
+        self.stats_file = os.path.join(os.path.dirname(__file__), "session_stats.json")
+        self._load_stats()
 
-        # Per-symbol statistics
-        self.symbol_stats = {}  # symbol -> {wins, losses, pnl}
-        for symbol in self.symbols:
-            self.symbol_stats[symbol] = {"wins": 0, "losses": 0, "pnl": 0.0}
+        # Tracked positions file (for detecting closed positions after restart)
+        self.positions_file = os.path.join(os.path.dirname(__file__), "tracked_positions.json")
 
         # Running state
         self.running = False
@@ -130,6 +126,138 @@ class HTFConfluenceLiveEngine:
         logger.info(f"Risk per trade: {self.risk_per_trade * 100:.0f}%")
         logger.info("=" * 60)
 
+    def _load_stats(self):
+        """Load session stats from file (persist across restarts)."""
+        self.trades_today = 0
+        self.wins_today = 0
+        self.losses_today = 0
+        self.pnl_today = 0.0
+        self.symbol_stats = {}
+        for symbol in self.symbols:
+            self.symbol_stats[symbol] = {"wins": 0, "losses": 0, "pnl": 0.0}
+
+        try:
+            if os.path.exists(self.stats_file):
+                with open(self.stats_file, 'r') as f:
+                    data = json.load(f)
+                    # Check if stats are from today
+                    if data.get("date") == datetime.now().strftime("%Y-%m-%d"):
+                        self.trades_today = data.get("trades_today", 0)
+                        self.wins_today = data.get("wins_today", 0)
+                        self.losses_today = data.get("losses_today", 0)
+                        self.pnl_today = data.get("pnl_today", 0.0)
+                        saved_stats = data.get("symbol_stats", {})
+                        for symbol in self.symbols:
+                            if symbol in saved_stats:
+                                self.symbol_stats[symbol] = saved_stats[symbol]
+                        logger.info(f"Loaded session stats: {self.wins_today}W/{self.losses_today}L, PnL: ${self.pnl_today:+.2f}")
+                    else:
+                        logger.info("Stats file is from a previous day, starting fresh")
+        except Exception as e:
+            logger.warning(f"Could not load stats: {e}")
+
+    def _save_stats(self):
+        """Save session stats to file."""
+        try:
+            data = {
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "trades_today": self.trades_today,
+                "wins_today": self.wins_today,
+                "losses_today": self.losses_today,
+                "pnl_today": self.pnl_today,
+                "symbol_stats": self.symbol_stats
+            }
+            with open(self.stats_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not save stats: {e}")
+
+    def _save_tracked_positions(self):
+        """Save tracked positions to file for resume after restart."""
+        try:
+            data = {}
+            for symbol, pos in self.positions.items():
+                data[symbol] = {
+                    "side": pos["side"],
+                    "entry_price": pos["entry_price"],
+                    "quantity": pos["quantity"],
+                    "tp_price": pos["tp_price"],
+                    "sl_price": pos["sl_price"],
+                    "entry_time": pos["entry_time"].isoformat() if isinstance(pos["entry_time"], datetime) else str(pos["entry_time"])
+                }
+            with open(self.positions_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not save positions: {e}")
+
+    def _load_tracked_positions(self) -> Dict:
+        """Load tracked positions from file."""
+        try:
+            if os.path.exists(self.positions_file):
+                with open(self.positions_file, 'r') as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.warning(f"Could not load positions: {e}")
+        return {}
+
+    def _check_closed_positions_on_startup(self):
+        """Check if any tracked positions were closed while engine was down."""
+        saved_positions = self._load_tracked_positions()
+        if not saved_positions:
+            return
+
+        for symbol, saved_pos in saved_positions.items():
+            # Check if position still exists on Binance
+            position = self.client.get_position(symbol, saved_pos["side"])
+
+            if not position or position["quantity"] == 0:
+                # Position was closed while engine was down
+                entry_price = saved_pos["entry_price"]
+                tp_price = saved_pos["tp_price"]
+                sl_price = saved_pos["sl_price"]
+                quantity = saved_pos["quantity"]
+
+                # Get current price to estimate exit type
+                try:
+                    price_data = self.client.get_current_price(symbol)
+                    current_price = price_data["price"]
+
+                    # Determine exit type
+                    if saved_pos["side"] == "LONG":
+                        if current_price >= tp_price * 0.995:
+                            exit_type = "TP"
+                            pnl = quantity * (tp_price - entry_price)
+                        else:
+                            exit_type = "SL"
+                            pnl = quantity * (sl_price - entry_price)
+                    else:
+                        if current_price <= tp_price * 1.005:
+                            exit_type = "TP"
+                            pnl = quantity * (entry_price - tp_price)
+                        else:
+                            exit_type = "SL"
+                            pnl = quantity * (entry_price - sl_price)
+
+                    roi = (pnl / (quantity * entry_price)) * self.leverage * 100
+
+                    # Update stats
+                    if exit_type == "TP":
+                        self.wins_today += 1
+                        self.symbol_stats[symbol]["wins"] += 1
+                        logger.info(f"[{symbol}] Position closed while offline - TP HIT! ROI: +{roi:.1f}%")
+                    else:
+                        self.losses_today += 1
+                        self.symbol_stats[symbol]["losses"] += 1
+                        logger.info(f"[{symbol}] Position closed while offline - SL HIT. ROI: {roi:.1f}%")
+
+                    self.trades_today += 1
+                    self.pnl_today += pnl
+                    self.symbol_stats[symbol]["pnl"] += pnl
+                    self._save_stats()
+
+                except Exception as e:
+                    logger.error(f"[{symbol}] Failed to detect closed position: {e}")
+
     def initialize(self) -> bool:
         """
         Initialize the trading engine.
@@ -138,6 +266,9 @@ class HTFConfluenceLiveEngine:
             True if initialization successful
         """
         logger.info("Initializing trading engine...")
+
+        # Check for positions that closed while offline
+        self._check_closed_positions_on_startup()
 
         # Test API connection
         if not self.client.test_connection():
@@ -210,6 +341,9 @@ class HTFConfluenceLiveEngine:
             except Exception as e:
                 logger.error(f"[{symbol}] Setup failed: {e}")
                 return False
+
+        # Save tracked positions for restart detection
+        self._save_tracked_positions()
 
         logger.info("Initialization complete!")
         return True
@@ -477,10 +611,11 @@ class HTFConfluenceLiveEngine:
                 "confluence_score": signal.confluence_score
             }
 
+            # Save tracked positions for restart detection
+            self._save_tracked_positions()
+
             # Set cooldown
             self.last_trade_time[symbol] = datetime.now()
-
-            self.trades_today += 1
 
             return True
 
@@ -550,9 +685,14 @@ class HTFConfluenceLiveEngine:
 
                 self.pnl_today += pnl
                 self.symbol_stats[symbol]["pnl"] += pnl
+                self.trades_today += 1
+
+                # Save stats and update tracked positions
+                self._save_stats()
 
                 # Clean up
                 del self.positions[symbol]
+                self._save_tracked_positions()
 
                 # Cancel any remaining orders
                 self.client.cancel_orders_for_side(symbol, position_side)
