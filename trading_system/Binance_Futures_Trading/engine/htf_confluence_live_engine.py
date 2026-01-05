@@ -330,7 +330,7 @@ class HTFConfluenceLiveEngine:
 
     def calculate_position_size(self, symbol: str, entry_price: float) -> float:
         """
-        Calculate position size based on risk management.
+        Calculate position size using FULL capital per symbol as margin.
 
         Args:
             symbol: Trading symbol
@@ -339,14 +339,11 @@ class HTFConfluenceLiveEngine:
         Returns:
             Position quantity
         """
-        # Risk amount = capital * risk_per_trade
-        risk_amount = self.per_symbol_capital * self.risk_per_trade
+        # Use full per-symbol capital as margin
+        margin = self.per_symbol_capital
 
-        # SL distance as price move
-        sl_pct = self.sl_roi / self.leverage
-
-        # Position value = risk_amount / sl_pct
-        position_value = risk_amount / sl_pct
+        # Position value = margin * leverage
+        position_value = margin * self.leverage
 
         # Quantity = position_value / price
         quantity = position_value / entry_price
