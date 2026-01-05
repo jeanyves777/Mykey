@@ -1,0 +1,50 @@
+FIX FOR FAKE PROFIT BUG - URGENT
+================================
+
+PROBLEM FOUND:
+Lines 3023-3041 in live_trading_engine.py
+
+When Binance doesn't report realized PNL (or returns $0):
+- System counts trade as WIN
+- But adds $0 to daily_pnl
+- Result: "3 wins, +$1.82" but balance unchanged!
+
+THE BUG:
+```python
+else:
+    # Breakeven or no PNL found - count as win  ← WRONG!
+    exit_type = "BE"
+    self.daily_wins += 1  ← Counts win when PNL=$0!
+```
+
+ROOT CAUSE:
+1. Binance income API timing issue (60 second window too short)
+2. Half-close logic might not be reported in income history
+3. System defaults to counting as win when unsure
+
+IMMEDIATE ACTIONS NEEDED:
+1. Check actual Binance trade history (running now)
+2. Fix the sync_positions logic to:
+   - NOT count as win if PNL = $0
+   - Extend income history window to 120 seconds
+   - Better half-close PNL tracking
+3. Add validation: If trade recorded but balance unchanged, LOG ERROR
+
+QUICK FIX:
+Replace lines 3030-3041 with:
+```python
+# Determine win/loss based on BINANCE reported PNL
+if realized_pnl > 0.01:  # At least 1 cent profit
+    exit_type = "TP"
+    self.daily_wins += 1
+elif realized_pnl < -0.01:  # At least 1 cent loss
+    exit_type = "SL"
+    self.daily_losses += 1
+else:
+    # NO PNL found or breakeven - DON'T COUNT
+    exit_type = "UNKNOWN"
+    self.log(f"  WARNING: No PNL found for {actual_symbol} close!", level="ERROR")
+    # Don't update wins/losses if we don't know the result
+```
+
+This prevents fake wins from being recorded!

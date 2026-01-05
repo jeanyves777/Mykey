@@ -10,7 +10,7 @@ import json
 import time
 import pandas as pd
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from dataclasses import dataclass
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -144,6 +144,11 @@ class BinanceLiveTradingEngine:
         self.boost_locked_profit: Dict[str, float] = {}   # symbol -> profit locked from half-closes
         self.boost_cycle_count: Dict[str, int] = {}       # symbol -> number of half-close cycles
         self.boost_multiplier = 1.5                       # 1.5x boost
+
+        # TP ORDER MANAGEMENT - Track cancelled orders to prevent duplicate cancel attempts
+        self.cancelled_tp_orders: Set[int] = set()        # Set of order IDs that were already cancelled
+        self.last_tp_cleanup_time = datetime.now()        # Last time we cleared old cancelled order IDs
+
         # STRONG TREND MODE - ADX-based trend detection for DCA blocking
         # When ADX > 40, block DCA 2+ on loser side and 2x boost winner side
         # MUTUALLY EXCLUSIVE with Boost Mode (Boost Mode takes priority)
@@ -1217,6 +1222,13 @@ class BinanceLiveTradingEngine:
         This ensures the half-close cycle works correctly at all times.
         """
         try:
+            # Clean up cancelled_orders cache every 5 minutes
+            # (old order IDs are no longer relevant after 5 mins)
+            now = datetime.now()
+            if (now - self.last_tp_cleanup_time).total_seconds() > 300:  # 5 minutes
+                self.cancelled_tp_orders.clear()
+                self.last_tp_cleanup_time = now
+
             issues_found = 0
             issues_fixed = 0
 
@@ -1299,13 +1311,23 @@ class BinanceLiveTradingEngine:
 
                     # CASE 1: Multiple TPs exist (correct + incorrect)
                     if len(tp_orders) > 1:
-                        # Cancel ALL incorrect TPs
+                        # Cancel ALL incorrect TPs (skip if already cancelled)
                         for tp_order, qty, pct in incorrect_tps:
+                            order_id = tp_order['orderId']
+
+                            # Skip if already cancelled
+                            if order_id in self.cancelled_tp_orders:
+                                continue
+
                             try:
-                                self.client.cancel_order(symbol, tp_order['orderId'])
+                                self.client.cancel_order(symbol, order_id)
+                                self.cancelled_tp_orders.add(order_id)  # Mark as cancelled
                                 self.log(f"[TP-CLEANUP] {symbol} {side}: Cancelled duplicate/incorrect TP ({qty} = {pct:.1f}%)", level="INFO")
                             except Exception as e:
-                                if "Unknown order" not in str(e):
+                                if "Unknown order" in str(e):
+                                    # Order was already cancelled, add to set to avoid future attempts
+                                    self.cancelled_tp_orders.add(order_id)
+                                else:
                                     self.log(f"[TP-CLEANUP] {symbol} {side}: Error: {e}", level="WARN")
 
                         # If NO correct TP exists after cleanup, create one
@@ -1336,11 +1358,19 @@ class BinanceLiveTradingEngine:
                     elif not correct_tp:
                         issues_found += 1
                         tp_order, qty, pct = incorrect_tps[0]
-                        self.log(f"[TP-CHECK] {symbol} {side}: Wrong TP qty {qty} ({pct:.1f}%)", level="WARN")
+                        order_id = tp_order['orderId']
+
+                        # Skip if already cancelled
+                        if order_id in self.cancelled_tp_orders:
+                            self.log(f"[TP-CHECK] {symbol} {side}: Wrong TP already cancelled, creating new one", level="INFO")
+                        else:
+                            self.log(f"[TP-CHECK] {symbol} {side}: Wrong TP qty {qty} ({pct:.1f}%)", level="WARN")
 
                         try:
-                            # Cancel wrong TP
-                            self.client.cancel_order(symbol, tp_order['orderId'])
+                            # Cancel wrong TP (skip if already cancelled)
+                            if order_id not in self.cancelled_tp_orders:
+                                self.client.cancel_order(symbol, order_id)
+                                self.cancelled_tp_orders.add(order_id)
 
                             # Create correct TP
                             tp_roi = symbol_config.get("tp_roi", 0.08)
