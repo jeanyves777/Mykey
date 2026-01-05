@@ -153,8 +153,10 @@ class OandaClient:
         }
 
         if from_time and to_time:
-            params["from"] = from_time.isoformat() + "Z"
-            params["to"] = to_time.isoformat() + "Z"
+            # OANDA expects RFC3339 format: either YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SS+00:00
+            # Remove timezone info and add Z for UTC
+            params["from"] = from_time.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+            params["to"] = to_time.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
         else:
             params["count"] = min(count, 5000)
 

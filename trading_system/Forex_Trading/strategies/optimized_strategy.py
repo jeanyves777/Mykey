@@ -436,3 +436,38 @@ def print_strategy_info(config=None):
         print("  Volume Filter:  Only enter when volume > 20% above average")
         print("  Trend Filter:   EMAs must be aligned for direction")
         print("=" * 80)
+
+
+# Wrapper class for compatibility with engines expecting a class-based interface
+class OptimizedForexStrategy:
+    """Wrapper class for functional optimized strategy"""
+
+    def __init__(self, instruments, max_trades_per_day=15, config=None):
+        self.instruments = instruments
+        self.max_trades_per_day = max_trades_per_day
+        self.config = config
+        self.daily_cooldowns = {}
+
+    def reset_daily_cooldowns(self):
+        """Reset daily cooldowns"""
+        self.daily_cooldowns = {}
+
+    def should_enter_trade(self, instrument, df_5min, current_positions=0, trades_today=0, daily_pl_pct=0.0, now=None):
+        """Check if should enter trade - wrapper for functional get_signal"""
+        # Calculate indicators
+        df = calculate_indicators(df_5min)
+
+        # Get signal using functional approach
+        signal, reason = get_signal(instrument, df, self.config)
+
+        if signal:
+            return {
+                "action": signal,
+                "reason": reason,
+                "confidence": 0.8  # Default confidence
+            }
+        else:
+            return {
+                "action": "SKIP",
+                "reason": reason
+            }
