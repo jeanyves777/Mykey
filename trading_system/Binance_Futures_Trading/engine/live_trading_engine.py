@@ -502,6 +502,54 @@ class BinanceLiveTradingEngine:
         except Exception as e:
             self.log(f"[STATE] Error clearing position state: {e}", level="WARN")
 
+    def _validate_and_add_pnl(self, pnl: float, margin_used: float, symbol: str = None, trade_type: str = "TRADE") -> float:
+        """
+        Validate P&L before adding to daily_pnl.
+        Prevents impossible P&L values from corrupted entry prices.
+
+        Args:
+            pnl: The calculated P&L
+            margin_used: The margin used for this position
+            symbol: Symbol for logging
+            trade_type: Type of trade for logging
+
+        Returns:
+            The validated P&L (may be clamped or zeroed if invalid)
+        """
+        # SANITY CHECK: P&L cannot exceed margin * leverage * 2 (200% gain/loss is max realistic)
+        # With 20x leverage, max P&L should be roughly margin * 20 * 2 = margin * 40
+        max_realistic_pnl = margin_used * 40 if margin_used > 0 else 100.0
+
+        if abs(pnl) > max_realistic_pnl:
+            self.log(f"[P&L SANITY] {symbol} {trade_type}: FAKE P&L ${pnl:+.2f} exceeds max ${max_realistic_pnl:.2f} (margin=${margin_used:.2f})", level="WARN")
+            self.log(f"[P&L SANITY] {symbol} {trade_type}: P&L IGNORED - likely from corrupted entry price", level="WARN")
+            return 0.0
+
+        # Add to daily P&L
+        self.daily_pnl += pnl
+
+        # Also update symbol stats if symbol provided
+        if symbol and symbol in self.symbol_stats:
+            self.symbol_stats[symbol]["pnl"] += pnl
+
+        return pnl
+
+    def _validate_daily_pnl(self, current_balance: float):
+        """
+        Validate daily P&L against current balance.
+        Reset if the values are impossible.
+        """
+        # Daily P&L cannot be more negative than we started with
+        if self.starting_balance > 0:
+            max_possible_loss = self.starting_balance
+            if self.daily_pnl < -max_possible_loss:
+                self.log(f"[P&L SANITY] Daily P&L ${self.daily_pnl:.2f} impossible (started with ${self.starting_balance:.2f})", level="WARN")
+                self.log(f"[P&L SANITY] Resetting daily P&L to $0.00", level="WARN")
+                self.daily_pnl = 0.0
+                # Also reset symbol stats
+                for symbol in self.symbol_stats:
+                    self.symbol_stats[symbol]["pnl"] = 0.0
+
     def _save_session_stats(self):
         """
         Save session statistics to file for restart recovery.
@@ -1311,27 +1359,29 @@ class BinanceLiveTradingEngine:
 
                     # CASE 1: Multiple TPs exist (correct + incorrect)
                     if len(tp_orders) > 1:
-                        # Cancel ALL incorrect TPs (skip if already cancelled)
-                        for tp_order, qty, pct in incorrect_tps:
-                            order_id = tp_order['orderId']
+                        # If a CORRECT TP exists, just cancel all incorrect ones
+                        # Do NOT create a new TP
+                        if correct_tp:
+                            # Cancel ALL incorrect TPs
+                            for tp_order, qty, pct in incorrect_tps:
+                                order_id = tp_order['orderId']
 
-                            # Skip if already cancelled
-                            if order_id in self.cancelled_tp_orders:
-                                continue
+                                # Skip if already in cancelled cache (already tried)
+                                if order_id in self.cancelled_tp_orders:
+                                    continue
 
-                            try:
-                                self.client.cancel_order(symbol, order_id)
-                                self.cancelled_tp_orders.add(order_id)  # Mark as cancelled
-                                self.log(f"[TP-CLEANUP] {symbol} {side}: Cancelled duplicate/incorrect TP ({qty} = {pct:.1f}%)", level="INFO")
-                            except Exception as e:
-                                if "Unknown order" in str(e):
-                                    # Order was already cancelled, add to set to avoid future attempts
+                                try:
+                                    self.client.cancel_order(symbol, order_id)
                                     self.cancelled_tp_orders.add(order_id)
-                                else:
-                                    self.log(f"[TP-CLEANUP] {symbol} {side}: Error: {e}", level="WARN")
+                                    self.log(f"[TP-CLEANUP] {symbol} {side}: Cancelled duplicate TP ({qty} = {pct:.1f}%)", level="INFO")
+                                except Exception as e:
+                                    if "Unknown order" in str(e):
+                                        self.cancelled_tp_orders.add(order_id)
+                                    else:
+                                        self.log(f"[TP-CLEANUP] {symbol} {side}: Cancel error: {e}", level="WARN")
 
                         # If NO correct TP exists after cleanup, create one
-                        if not correct_tp:
+                        elif not correct_tp:
                             issues_found += 1
                             self.log(f"[TP-CHECK] {symbol} {side}: No correct TP after cleanup", level="WARN")
 
@@ -1360,17 +1410,18 @@ class BinanceLiveTradingEngine:
                         tp_order, qty, pct = incorrect_tps[0]
                         order_id = tp_order['orderId']
 
-                        # Skip if already cancelled
+                        # IMPORTANT: Skip if this order is already in cancelled cache
+                        # (means we already tried to cancel it and create a new one)
                         if order_id in self.cancelled_tp_orders:
-                            self.log(f"[TP-CHECK] {symbol} {side}: Wrong TP already cancelled, creating new one", level="INFO")
-                        else:
-                            self.log(f"[TP-CHECK] {symbol} {side}: Wrong TP qty {qty} ({pct:.1f}%)", level="WARN")
+                            # Don't create another TP - we already created one before
+                            continue
+
+                        self.log(f"[TP-CHECK] {symbol} {side}: Wrong TP qty {qty} ({pct:.1f}%)", level="WARN")
 
                         try:
-                            # Cancel wrong TP (skip if already cancelled)
-                            if order_id not in self.cancelled_tp_orders:
-                                self.client.cancel_order(symbol, order_id)
-                                self.cancelled_tp_orders.add(order_id)
+                            # Cancel wrong TP and mark as cancelled
+                            self.client.cancel_order(symbol, order_id)
+                            self.cancelled_tp_orders.add(order_id)
 
                             # Create correct TP
                             tp_roi = symbol_config.get("tp_roi", 0.08)
@@ -1765,8 +1816,8 @@ class BinanceLiveTradingEngine:
 
                     self.log(f"    [STOP DAY] Closed {position.side} @ ${fill_price:,.4f} | P&L: ${pnl:+.2f}", level="TRADE")
 
-                    # Update daily stats
-                    self.daily_pnl += pnl
+                    # Update daily stats (with validation)
+                    pnl = self._validate_and_add_pnl(pnl, position.margin_used, symbol, "STOP_DAY")
                     self.daily_trades += 1
                     if pnl >= 0:
                         self.daily_wins += 1
@@ -1932,17 +1983,17 @@ class BinanceLiveTradingEngine:
                 dca_level=position.dca_count
             )
 
-            # Update daily stats
-            self.daily_pnl += half_pnl
+            # Update daily stats (with validation)
+            half_margin = position.margin_used / 2  # Half position margin
+            half_pnl = self._validate_and_add_pnl(half_pnl, half_margin, symbol, "BOOST_HALF_CLOSE")
             self.daily_trades += 1
             if half_pnl > 0:
                 self.daily_wins += 1
             else:
                 self.daily_losses += 1
-            
-            # Update per-symbol stats
+
+            # Update per-symbol stats (already done in _validate_and_add_pnl)
             if hasattr(self, "symbol_stats") and symbol in self.symbol_stats:
-                self.symbol_stats[symbol]["pnl"] += half_pnl
                 if half_pnl > 0:
                     self.symbol_stats[symbol]["tp_count"] += 1
                     self.symbol_stats[symbol]["wins"] += 1
@@ -2492,8 +2543,8 @@ class BinanceLiveTradingEngine:
                 else:
                     pnl = (position.avg_entry_price - fill_price) * position.quantity
 
-                # Update daily stats
-                self.daily_pnl += pnl
+                # Update daily stats (with validation)
+                pnl = self._validate_and_add_pnl(pnl, position.margin_used, symbol, "TREND_FLIP")
                 if pnl > 0:
                     self.daily_wins += 1
                 else:
@@ -2707,8 +2758,8 @@ class BinanceLiveTradingEngine:
                     else:
                         pnl = (position.avg_entry_price - fill_price) * position.quantity
 
-                    # Update daily stats
-                    self.daily_pnl += pnl
+                    # Update daily stats (with validation)
+                    pnl = self._validate_and_add_pnl(pnl, position.margin_used, symbol, "HEDGE_TIMEOUT")
                     self.daily_trades += 1
                     if pnl > 0:
                         self.daily_wins += 1
@@ -3327,13 +3378,13 @@ class BinanceLiveTradingEngine:
                             exit_type = "UNKNOWN"
                             self.daily_wins += 1  # Assume win if unsure
 
-                    # Update daily stats
-                    self.daily_pnl += realized_pnl
+                    # Update daily stats (with validation)
+                    # Use margin_released as estimate of margin_used for this position
+                    realized_pnl = self._validate_and_add_pnl(realized_pnl, margin_released, actual_symbol, exit_type)
                     self.daily_trades += 1
 
-                    # Update per-symbol stats
+                    # Update per-symbol stats (already done in _validate_and_add_pnl)
                     if hasattr(self, "symbol_stats") and actual_symbol in self.symbol_stats:
-                        self.symbol_stats[actual_symbol]["pnl"] += realized_pnl
                         if exit_type == "TP":
                             self.symbol_stats[actual_symbol]["tp_count"] += 1
                             self.symbol_stats[actual_symbol]["wins"] += 1
@@ -4021,8 +4072,8 @@ class BinanceLiveTradingEngine:
                 dca_level=position.dca_count
             )
 
-            # Update stats
-            self.daily_pnl += final_pnl
+            # Update stats (with validation)
+            final_pnl = self._validate_and_add_pnl(final_pnl, position.margin_used, symbol, "STALE_EXIT")
             self.daily_trades += 1
             if final_pnl > 0:
                 self.daily_wins += 1
@@ -4150,8 +4201,8 @@ class BinanceLiveTradingEngine:
                         dca_level=position.dca_count
                     )
 
-                    # Update stats
-                    self.daily_pnl += final_pnl
+                    # Update stats (with validation)
+                    final_pnl = self._validate_and_add_pnl(final_pnl, position.margin_used, symbol, "TRAILING_TP")
                     self.daily_trades += 1
                     if final_pnl > 0:
                         self.daily_wins += 1
@@ -4270,8 +4321,8 @@ class BinanceLiveTradingEngine:
                     dca_level=position.dca_count
                 )
 
-                # Update stats
-                self.daily_pnl += pnl
+                # Update stats (with validation)
+                pnl = self._validate_and_add_pnl(pnl, position.margin_used, symbol, "AUTO_CLOSE")
                 self.daily_trades += 1
                 if pnl > 0:
                     self.daily_wins += 1
@@ -4300,6 +4351,9 @@ class BinanceLiveTradingEngine:
         balance = self.client.get_balance()
         open_count = len(self.positions)
         timestamp = datetime.now().strftime("%H:%M:%S")
+
+        # Validate daily P&L against balance (catch fake values)
+        self._validate_daily_pnl(balance)
 
         # Print scan header
         print("\n" + "="*70)
@@ -5531,7 +5585,8 @@ class BinanceLiveTradingEngine:
                         pnl = (pos.avg_entry_price - fill_price) * pos.quantity
 
                     self.log(f"  CLOSED {position_key} @ ${fill_price:,.2f} | P&L: ${pnl:+.2f}")
-                    self.daily_pnl += pnl
+                    # Update P&L (with validation)
+                    self._validate_and_add_pnl(pnl, pos.margin_used, symbol, "CLOSE_ALL")
 
                     # Release margin
                     self.symbol_margin_used[symbol] = 0.0

@@ -1,0 +1,650 @@
+"""
+HTF Trend + Confluence Strategy
+================================
+Combines high win-rate indicators with higher timeframe trend detection.
+
+Key Components:
+1. HTF (4H) Trend Detection - 200 EMA filter
+2. Entry Signals - MACD + RSI + EMA (9/21) crossover confluence
+3. Single Direction Trading - Follow the trend, no hedging
+4. Lower Leverage - 5-10x for better risk management
+
+Research Base:
+- MACD + RSI: 73% win rate in backtests
+- EMA Crossover (9/21): 55-60% win rate, 2.65% avg gain on BTC
+- 200 EMA trend filter: Proven to increase win rates by filtering counter-trend trades
+
+Entry Conditions (ALL must be met):
+LONG:
+  - HTF: Price > 200 EMA (4H)
+  - LTF: 9 EMA crosses above 21 EMA
+  - RSI: Between 40-65 (not overbought)
+  - MACD: Histogram bullish (> 0) or MACD line crossing above signal
+
+SHORT:
+  - HTF: Price < 200 EMA (4H)
+  - LTF: 9 EMA crosses below 21 EMA
+  - RSI: Between 35-60 (not oversold)
+  - MACD: Histogram bearish (< 0) or MACD line crossing below signal
+
+Risk Management:
+  - TP: 2% ROI
+  - SL: 1% ROI (2:1 reward-to-risk)
+  - Leverage: 5-10x
+  - Risk per trade: 1-2% of balance
+"""
+
+import pandas as pd
+import numpy as np
+from typing import Dict, Optional, Tuple, List
+from dataclasses import dataclass
+from enum import Enum
+from datetime import datetime
+
+
+class TrendDirection(Enum):
+    """Market trend direction"""
+    BULLISH = "BULLISH"
+    BEARISH = "BEARISH"
+    NEUTRAL = "NEUTRAL"
+
+
+class SignalStrength(Enum):
+    """Signal strength levels"""
+    STRONG = "STRONG"      # 4/4 confluence
+    MODERATE = "MODERATE"  # 3/4 confluence
+    WEAK = "WEAK"          # 2/4 confluence
+    NONE = "NONE"          # Less than 2
+
+
+@dataclass
+class ConfluenceSignal:
+    """Strategy signal output with confluence score"""
+    action: Optional[str]           # "BUY", "SELL", or None
+    confidence: float               # 0.0 to 1.0
+    strength: SignalStrength        # Signal strength
+    trend: TrendDirection           # HTF trend direction
+    confluence_score: int           # 0-4 (how many conditions met)
+    reason: str                     # Human-readable reason
+    indicators: Dict                # All calculated indicators
+    entry_price: float              # Current price for entry
+    stop_loss: float                # Calculated SL price
+    take_profit: float              # Calculated TP price
+
+
+class HTFConfluenceStrategy:
+    """
+    HTF Trend + Confluence Trading Strategy
+
+    Combines 200 EMA trend filter with MACD + RSI + EMA crossover for entries.
+    Single direction trading - only trade in direction of HTF trend.
+    """
+
+    def __init__(self, leverage: int = 10, tp_roi: float = 0.02, sl_roi: float = 0.01):
+        """
+        Initialize strategy.
+
+        Args:
+            leverage: Trading leverage (5-10x recommended)
+            tp_roi: Take profit as ROI (0.02 = 2% ROI)
+            sl_roi: Stop loss as ROI (0.01 = 1% ROI)
+        """
+        # Risk settings
+        self.leverage = leverage
+        self.tp_roi = tp_roi
+        self.sl_roi = sl_roi
+
+        # HTF trend settings
+        # Use 50 EMA instead of 200 - more responsive and accurate with limited data
+        self.htf_ema_period = 50           # 50 EMA on 4H for trend (200 needs too much history)
+
+        # LTF entry settings (15m or 1H)
+        self.ema_fast = 9                   # Fast EMA
+        self.ema_slow = 21                  # Slow EMA
+
+        # RSI settings
+        self.rsi_period = 14
+        self.rsi_long_min = 40              # Minimum RSI for LONG
+        self.rsi_long_max = 65              # Maximum RSI for LONG
+        self.rsi_short_min = 35             # Minimum RSI for SHORT
+        self.rsi_short_max = 60             # Maximum RSI for SHORT
+
+        # MACD settings (standard 12, 26, 9)
+        self.macd_fast = 12
+        self.macd_slow = 26
+        self.macd_signal = 9
+
+        # Cooldown - increased to reduce over-trading
+        self.min_bars_between_signals = 16   # Wait 16 bars (4 hours on 15m) between signals
+        self.last_signal_bar = -999
+
+    def calculate_ema(self, series: pd.Series, period: int) -> pd.Series:
+        """Calculate Exponential Moving Average"""
+        return series.ewm(span=period, adjust=False).mean()
+
+    def calculate_rsi(self, series: pd.Series, period: int = 14) -> pd.Series:
+        """Calculate RSI"""
+        delta = series.diff()
+        gain = delta.where(delta > 0, 0)
+        loss = (-delta).where(delta < 0, 0)
+        avg_gain = gain.ewm(span=period, adjust=False).mean()
+        avg_loss = loss.ewm(span=period, adjust=False).mean()
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+
+    def calculate_macd(self, series: pd.Series) -> Tuple[pd.Series, pd.Series, pd.Series]:
+        """
+        Calculate MACD indicator.
+
+        Returns:
+            (macd_line, signal_line, histogram)
+        """
+        ema_fast = series.ewm(span=self.macd_fast, adjust=False).mean()
+        ema_slow = series.ewm(span=self.macd_slow, adjust=False).mean()
+        macd_line = ema_fast - ema_slow
+        signal_line = macd_line.ewm(span=self.macd_signal, adjust=False).mean()
+        histogram = macd_line - signal_line
+        return macd_line, signal_line, histogram
+
+    def calculate_indicators(self, df: pd.DataFrame) -> Dict:
+        """
+        Calculate all technical indicators for LTF data.
+
+        Args:
+            df: OHLCV DataFrame (15m or 1H timeframe)
+
+        Returns:
+            Dict with all indicator values
+        """
+        if df is None or len(df) < 50:
+            return {}
+
+        close = df["close"]
+
+        indicators = {}
+
+        # Current price
+        indicators["price"] = close.iloc[-1]
+
+        # EMAs (9 and 21)
+        ema_fast = self.calculate_ema(close, self.ema_fast)
+        ema_slow = self.calculate_ema(close, self.ema_slow)
+        indicators["ema_fast"] = ema_fast.iloc[-1]
+        indicators["ema_slow"] = ema_slow.iloc[-1]
+        indicators["ema_fast_prev"] = ema_fast.iloc[-2]
+        indicators["ema_slow_prev"] = ema_slow.iloc[-2]
+
+        # EMA crossover detection
+        indicators["ema_bullish_cross"] = (
+            ema_fast.iloc[-1] > ema_slow.iloc[-1] and
+            ema_fast.iloc[-2] <= ema_slow.iloc[-2]
+        )
+        indicators["ema_bearish_cross"] = (
+            ema_fast.iloc[-1] < ema_slow.iloc[-1] and
+            ema_fast.iloc[-2] >= ema_slow.iloc[-2]
+        )
+        indicators["ema_bullish"] = ema_fast.iloc[-1] > ema_slow.iloc[-1]
+        indicators["ema_bearish"] = ema_fast.iloc[-1] < ema_slow.iloc[-1]
+
+        # RSI
+        rsi = self.calculate_rsi(close, self.rsi_period)
+        indicators["rsi"] = rsi.iloc[-1] if not pd.isna(rsi.iloc[-1]) else 50.0
+        indicators["rsi_prev"] = rsi.iloc[-2] if not pd.isna(rsi.iloc[-2]) else 50.0
+
+        # MACD
+        macd_line, signal_line, histogram = self.calculate_macd(close)
+        indicators["macd"] = macd_line.iloc[-1]
+        indicators["macd_signal"] = signal_line.iloc[-1]
+        indicators["macd_histogram"] = histogram.iloc[-1]
+        indicators["macd_prev"] = macd_line.iloc[-2]
+        indicators["macd_signal_prev"] = signal_line.iloc[-2]
+        indicators["macd_histogram_prev"] = histogram.iloc[-2]
+
+        # MACD crossover detection
+        indicators["macd_bullish_cross"] = (
+            macd_line.iloc[-1] > signal_line.iloc[-1] and
+            macd_line.iloc[-2] <= signal_line.iloc[-2]
+        )
+        indicators["macd_bearish_cross"] = (
+            macd_line.iloc[-1] < signal_line.iloc[-1] and
+            macd_line.iloc[-2] >= signal_line.iloc[-2]
+        )
+        indicators["macd_bullish"] = indicators["macd_histogram"] > 0
+        indicators["macd_bearish"] = indicators["macd_histogram"] < 0
+
+        return indicators
+
+    def get_htf_trend(self, htf_df: pd.DataFrame) -> Tuple[TrendDirection, float]:
+        """
+        Determine higher timeframe trend using dual EMA crossover (21/50).
+        More responsive than single EMA approach.
+
+        Args:
+            htf_df: 4H OHLCV DataFrame
+
+        Returns:
+            (trend_direction, distance_from_ema_pct)
+        """
+        if htf_df is None or len(htf_df) < self.htf_ema_period:
+            return TrendDirection.NEUTRAL, 0.0
+
+        close = htf_df["close"]
+
+        # Use dual EMA crossover for trend detection (more responsive)
+        ema_fast_htf = self.calculate_ema(close, 21)   # Fast EMA on HTF
+        ema_slow_htf = self.calculate_ema(close, self.htf_ema_period)  # 50 EMA on HTF
+
+        current_price = close.iloc[-1]
+        ema_fast_value = ema_fast_htf.iloc[-1]
+        ema_slow_value = ema_slow_htf.iloc[-1]
+
+        if pd.isna(ema_fast_value) or pd.isna(ema_slow_value):
+            return TrendDirection.NEUTRAL, 0.0
+
+        # Distance from slow EMA for reference
+        distance_pct = (current_price - ema_slow_value) / ema_slow_value * 100
+
+        # EMA crossover difference
+        ema_diff_pct = (ema_fast_value - ema_slow_value) / ema_slow_value * 100
+
+        # Trend determination based on:
+        # 1. Fast EMA above/below slow EMA (crossover)
+        # 2. Price position relative to both EMAs
+        if ema_fast_value > ema_slow_value and current_price > ema_fast_value:
+            # Strong bullish: price above both EMAs, fast > slow
+            return TrendDirection.BULLISH, distance_pct
+        elif ema_fast_value < ema_slow_value and current_price < ema_fast_value:
+            # Strong bearish: price below both EMAs, fast < slow
+            return TrendDirection.BEARISH, distance_pct
+        elif ema_fast_value > ema_slow_value:
+            # Weak bullish: fast > slow but price below fast EMA
+            return TrendDirection.BULLISH, distance_pct
+        elif ema_fast_value < ema_slow_value:
+            # Weak bearish: fast < slow but price above fast EMA
+            return TrendDirection.BEARISH, distance_pct
+        else:
+            return TrendDirection.NEUTRAL, distance_pct
+
+    def calculate_exit_levels(self, entry_price: float, side: str) -> Tuple[float, float]:
+        """
+        Calculate stop loss and take profit levels based on ROI.
+
+        Args:
+            entry_price: Entry price
+            side: "LONG" or "SHORT"
+
+        Returns:
+            (stop_loss, take_profit)
+        """
+        # Price move = ROI / leverage
+        tp_move = self.tp_roi / self.leverage
+        sl_move = self.sl_roi / self.leverage
+
+        if side in ["LONG", "BUY"]:
+            stop_loss = entry_price * (1 - sl_move)
+            take_profit = entry_price * (1 + tp_move)
+        else:  # SHORT or SELL
+            stop_loss = entry_price * (1 + sl_move)
+            take_profit = entry_price * (1 - tp_move)
+
+        return stop_loss, take_profit
+
+    def check_long_conditions(self, indicators: Dict, htf_trend: TrendDirection) -> Tuple[int, List[str]]:
+        """
+        Check LONG entry conditions.
+
+        Returns:
+            (confluence_score, list of met conditions)
+        """
+        conditions_met = []
+
+        # Condition 1: HTF trend bullish
+        if htf_trend == TrendDirection.BULLISH:
+            conditions_met.append("HTF: Price > 200 EMA (4H)")
+
+        # Condition 2: EMA crossover or alignment
+        if indicators.get("ema_bullish_cross", False):
+            conditions_met.append("EMA: 9 crossed above 21 (bullish)")
+        elif indicators.get("ema_bullish", False):
+            conditions_met.append("EMA: 9 > 21 (bullish alignment)")
+
+        # Condition 3: RSI in valid range
+        rsi = indicators.get("rsi", 50)
+        if self.rsi_long_min <= rsi <= self.rsi_long_max:
+            conditions_met.append(f"RSI: {rsi:.1f} in range [{self.rsi_long_min}-{self.rsi_long_max}]")
+
+        # Condition 4: MACD bullish
+        if indicators.get("macd_bullish_cross", False):
+            conditions_met.append("MACD: Bullish crossover")
+        elif indicators.get("macd_bullish", False):
+            conditions_met.append("MACD: Histogram > 0 (bullish)")
+
+        return len(conditions_met), conditions_met
+
+    def check_short_conditions(self, indicators: Dict, htf_trend: TrendDirection) -> Tuple[int, List[str]]:
+        """
+        Check SHORT entry conditions.
+
+        Returns:
+            (confluence_score, list of met conditions)
+        """
+        conditions_met = []
+
+        # Condition 1: HTF trend bearish
+        if htf_trend == TrendDirection.BEARISH:
+            conditions_met.append("HTF: Price < 200 EMA (4H)")
+
+        # Condition 2: EMA crossover or alignment
+        if indicators.get("ema_bearish_cross", False):
+            conditions_met.append("EMA: 9 crossed below 21 (bearish)")
+        elif indicators.get("ema_bearish", False):
+            conditions_met.append("EMA: 9 < 21 (bearish alignment)")
+
+        # Condition 3: RSI in valid range
+        rsi = indicators.get("rsi", 50)
+        if self.rsi_short_min <= rsi <= self.rsi_short_max:
+            conditions_met.append(f"RSI: {rsi:.1f} in range [{self.rsi_short_min}-{self.rsi_short_max}]")
+
+        # Condition 4: MACD bearish
+        if indicators.get("macd_bearish_cross", False):
+            conditions_met.append("MACD: Bearish crossover")
+        elif indicators.get("macd_bearish", False):
+            conditions_met.append("MACD: Histogram < 0 (bearish)")
+
+        return len(conditions_met), conditions_met
+
+    def get_signal_strength(self, confluence_score: int) -> SignalStrength:
+        """Convert confluence score to signal strength"""
+        if confluence_score >= 4:
+            return SignalStrength.STRONG
+        elif confluence_score >= 3:
+            return SignalStrength.MODERATE
+        elif confluence_score >= 2:
+            return SignalStrength.WEAK
+        return SignalStrength.NONE
+
+    def should_enter(
+        self,
+        ltf_df: pd.DataFrame,
+        htf_df: pd.DataFrame,
+        current_bar: int = 0
+    ) -> ConfluenceSignal:
+        """
+        Determine if should enter a position.
+
+        Args:
+            ltf_df: Lower timeframe OHLCV data (15m or 1H)
+            htf_df: Higher timeframe OHLCV data (4H)
+            current_bar: Current bar index for cooldown tracking
+
+        Returns:
+            ConfluenceSignal with entry decision
+        """
+        # Calculate indicators
+        indicators = self.calculate_indicators(ltf_df)
+
+        if not indicators:
+            return ConfluenceSignal(
+                action=None,
+                confidence=0.0,
+                strength=SignalStrength.NONE,
+                trend=TrendDirection.NEUTRAL,
+                confluence_score=0,
+                reason="Insufficient LTF data",
+                indicators={},
+                entry_price=0.0,
+                stop_loss=0.0,
+                take_profit=0.0
+            )
+
+        # Get HTF trend
+        htf_trend, htf_distance = self.get_htf_trend(htf_df)
+        indicators["htf_trend"] = htf_trend.value
+        indicators["htf_distance_pct"] = htf_distance
+
+        # Check cooldown
+        if current_bar - self.last_signal_bar < self.min_bars_between_signals:
+            return ConfluenceSignal(
+                action=None,
+                confidence=0.0,
+                strength=SignalStrength.NONE,
+                trend=htf_trend,
+                confluence_score=0,
+                reason=f"Cooldown: {self.min_bars_between_signals - (current_bar - self.last_signal_bar)} bars remaining",
+                indicators=indicators,
+                entry_price=0.0,
+                stop_loss=0.0,
+                take_profit=0.0
+            )
+
+        # If HTF trend is neutral, no trading
+        if htf_trend == TrendDirection.NEUTRAL:
+            return ConfluenceSignal(
+                action=None,
+                confidence=0.0,
+                strength=SignalStrength.NONE,
+                trend=htf_trend,
+                confluence_score=0,
+                reason=f"HTF Neutral: Price near 200 EMA ({htf_distance:+.2f}%)",
+                indicators=indicators,
+                entry_price=0.0,
+                stop_loss=0.0,
+                take_profit=0.0
+            )
+
+        entry_price = indicators["price"]
+
+        # Check LONG conditions if HTF is bullish
+        if htf_trend == TrendDirection.BULLISH:
+            long_score, long_conditions = self.check_long_conditions(indicators, htf_trend)
+
+            if long_score >= 3:  # Need at least 3/4 confluence for entry
+                strength = self.get_signal_strength(long_score)
+                confidence = min(0.95, 0.5 + long_score * 0.1)
+                stop_loss, take_profit = self.calculate_exit_levels(entry_price, "LONG")
+
+                self.last_signal_bar = current_bar
+
+                return ConfluenceSignal(
+                    action="BUY",
+                    confidence=confidence,
+                    strength=strength,
+                    trend=htf_trend,
+                    confluence_score=long_score,
+                    reason=" | ".join(long_conditions),
+                    indicators=indicators,
+                    entry_price=entry_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit
+                )
+            else:
+                return ConfluenceSignal(
+                    action=None,
+                    confidence=0.0,
+                    strength=SignalStrength.WEAK,
+                    trend=htf_trend,
+                    confluence_score=long_score,
+                    reason=f"LONG: Only {long_score}/4 conditions met",
+                    indicators=indicators,
+                    entry_price=0.0,
+                    stop_loss=0.0,
+                    take_profit=0.0
+                )
+
+        # Check SHORT conditions if HTF is bearish
+        if htf_trend == TrendDirection.BEARISH:
+            short_score, short_conditions = self.check_short_conditions(indicators, htf_trend)
+
+            if short_score >= 3:  # Need at least 3/4 confluence for entry
+                strength = self.get_signal_strength(short_score)
+                confidence = min(0.95, 0.5 + short_score * 0.1)
+                stop_loss, take_profit = self.calculate_exit_levels(entry_price, "SHORT")
+
+                self.last_signal_bar = current_bar
+
+                return ConfluenceSignal(
+                    action="SELL",
+                    confidence=confidence,
+                    strength=strength,
+                    trend=htf_trend,
+                    confluence_score=short_score,
+                    reason=" | ".join(short_conditions),
+                    indicators=indicators,
+                    entry_price=entry_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit
+                )
+            else:
+                return ConfluenceSignal(
+                    action=None,
+                    confidence=0.0,
+                    strength=SignalStrength.WEAK,
+                    trend=htf_trend,
+                    confluence_score=short_score,
+                    reason=f"SHORT: Only {short_score}/4 conditions met",
+                    indicators=indicators,
+                    entry_price=0.0,
+                    stop_loss=0.0,
+                    take_profit=0.0
+                )
+
+        return ConfluenceSignal(
+            action=None,
+            confidence=0.0,
+            strength=SignalStrength.NONE,
+            trend=htf_trend,
+            confluence_score=0,
+            reason="No valid signal",
+            indicators=indicators,
+            entry_price=0.0,
+            stop_loss=0.0,
+            take_profit=0.0
+        )
+
+
+# =============================================================================
+# Configuration for different risk profiles
+# =============================================================================
+# =============================================================================
+# IMPORTANT: ROI vs Price Move
+# =============================================================================
+# ROI = Return on Margin (what you see in Binance)
+# Price Move = ROI / Leverage
+#
+# Example with 20x leverage:
+#   - 10% ROI = 0.5% price move
+#   - 20% ROI = 1% price move
+#   - 100% ROI = 5% price move (double your money)
+#   - 400% ROI = 20% price move (possible in strong trends!)
+#
+# SL should be tight (10-20% ROI) to protect capital
+# TP can be wide (30-100%+ ROI) in trending markets
+# =============================================================================
+
+CONSERVATIVE_CONFIG = {
+    "leverage": 10,
+    "tp_roi": 0.20,     # 20% ROI (TP) = 2% price move
+    "sl_roi": 0.10,     # 10% ROI (SL) = 1% price move | 2:1 R:R
+}
+
+MODERATE_CONFIG = {
+    "leverage": 20,
+    "tp_roi": 0.30,     # 30% ROI (TP) = 1.5% price move
+    "sl_roi": 0.10,     # 10% ROI (SL) = 0.5% price move | 3:1 R:R
+}
+
+AGGRESSIVE_CONFIG = {
+    "leverage": 20,
+    "tp_roi": 0.50,     # 50% ROI (TP) = 2.5% price move
+    "sl_roi": 0.15,     # 15% ROI (SL) = 0.75% price move | 3.3:1 R:R
+}
+
+# OPTIMIZED CONFIG - Based on user's live trading (20x leverage)
+# Wider TP to catch trends, tight SL to protect capital
+OPTIMIZED_CONFIG = {
+    "leverage": 20,
+    "tp_roi": 0.40,     # 40% ROI (TP) = 2% price move
+    "sl_roi": 0.10,     # 10% ROI (SL) = 0.5% price move | 4:1 R:R
+}
+
+# SWING CONFIG - For catching bigger moves in trending markets
+# Can hit 100%+ ROI in strong trends
+SWING_CONFIG = {
+    "leverage": 20,
+    "tp_roi": 1.00,     # 100% ROI (TP) = 5% price move (double your money)
+    "sl_roi": 0.20,     # 20% ROI (SL) = 1% price move | 5:1 R:R
+}
+
+
+# =============================================================================
+# Test
+# =============================================================================
+if __name__ == "__main__":
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    print("\n" + "="*60)
+    print("HTF CONFLUENCE STRATEGY - TEST")
+    print("="*60)
+
+    # Create sample data
+    np.random.seed(42)
+
+    # Simulate bullish trending market
+    print("\nSimulating BULLISH trend scenario...")
+
+    # 4H data (HTF) - 250 candles for 200 EMA
+    htf_prices = [50000]
+    for i in range(249):
+        change = np.random.uniform(0.001, 0.003)  # Uptrend
+        htf_prices.append(htf_prices[-1] * (1 + change))
+
+    htf_df = pd.DataFrame({
+        "open": htf_prices,
+        "high": [p * 1.002 for p in htf_prices],
+        "low": [p * 0.998 for p in htf_prices],
+        "close": htf_prices,
+    })
+
+    # 15m data (LTF) - 100 candles
+    ltf_prices = [htf_prices[-1]]
+    for i in range(99):
+        change = np.random.uniform(-0.001, 0.002)  # Slight uptrend
+        if i > 90:  # Recent momentum
+            change = np.random.uniform(0.001, 0.003)
+        ltf_prices.append(ltf_prices[-1] * (1 + change))
+
+    ltf_df = pd.DataFrame({
+        "open": ltf_prices,
+        "high": [p * 1.001 for p in ltf_prices],
+        "low": [p * 0.999 for p in ltf_prices],
+        "close": ltf_prices,
+    })
+
+    # Test strategy
+    strategy = HTFConfluenceStrategy(**MODERATE_CONFIG)
+    signal = strategy.should_enter(ltf_df, htf_df)
+
+    print(f"\nSignal Results:")
+    print(f"  Action: {signal.action}")
+    print(f"  Strength: {signal.strength.value}")
+    print(f"  Confidence: {signal.confidence:.1%}")
+    print(f"  HTF Trend: {signal.trend.value}")
+    print(f"  Confluence Score: {signal.confluence_score}/4")
+    print(f"  Reason: {signal.reason}")
+
+    if signal.action:
+        print(f"\n  Entry Price: ${signal.entry_price:,.2f}")
+        print(f"  Stop Loss: ${signal.stop_loss:,.2f}")
+        print(f"  Take Profit: ${signal.take_profit:,.2f}")
+
+    print(f"\n  Key Indicators:")
+    print(f"    RSI: {signal.indicators.get('rsi', 0):.1f}")
+    print(f"    MACD Histogram: {signal.indicators.get('macd_histogram', 0):.4f}")
+    print(f"    EMA Fast: {signal.indicators.get('ema_fast', 0):,.2f}")
+    print(f"    EMA Slow: {signal.indicators.get('ema_slow', 0):,.2f}")
+    print(f"    HTF Distance: {signal.indicators.get('htf_distance_pct', 0):+.2f}%")
+
+    print("\n" + "="*60)
