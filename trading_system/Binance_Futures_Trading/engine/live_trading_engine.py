@@ -289,6 +289,13 @@ class BinanceLiveTradingEngine:
                     saved_trading_capital = data.get("trading_capital", self.initial_capital)
                     saved_initial = data.get("initial_capital", self.initial_capital)
 
+                    # SAFETY: Reset impossible profit values (from entry_price bug)
+                    # If profit is more negative than -50% of balance, it's fake
+                    if self.total_realized_profit < -actual_balance * 0.5:
+                        self.log(f"[SMART COMPOUND] WARNING: Fake profit ${self.total_realized_profit:.2f} detected (entry_price bug)", level="WARN")
+                        self.log(f"[SMART COMPOUND] Resetting profit to $0.00", level="WARN")
+                        self.total_realized_profit = 0.0
+
                     # CHECK: If actual balance is significantly different from saved capital,
                     # reset to actual balance (prevents sizing based on wrong capital)
                     capital_diff = abs(actual_balance - saved_trading_capital)
@@ -1961,7 +1968,8 @@ class BinanceLiveTradingEngine:
 
                     position.quantity = total_qty
                     position.avg_entry_price = new_avg_entry
-                    position.entry_price = new_avg_entry  # Keep entry_price in sync
+                    # CRITICAL: NEVER modify position.entry_price - it's the ORIGINAL entry
+                    # Only avg_entry_price should be updated during re-entries
 
                     self.log(f"    [BOOST] SUCCESS: New total qty {total_qty} @ avg ${new_avg_entry:,.4f}", level="TRADE")
                     self.log(f"    [BOOST] Cycle #{position.half_close_count} complete | Total locked: ${self.boost_locked_profit.get(symbol, 0):+.2f}", level="TRADE")
@@ -5065,6 +5073,20 @@ class BinanceLiveTradingEngine:
                     peak_roi = saved_pos.get("peak_roi", 0.0)
                     trailing_active = saved_pos.get("trailing_active", False)
                     dca_str = "NO DCA" if num_dca_levels == 0 else f"DCA={dca_level}/{num_dca_levels}"
+
+                    # CRITICAL: Validate entry_price against actual Binance position
+                    # If saved entry_price is corrupted (>50% different from Binance), fix it
+                    actual_binance_entry = pos["entry_price"]
+                    saved_entry = saved_pos.get("entry_price", actual_binance_entry)
+                    saved_avg_entry = saved_pos.get("avg_entry_price", actual_binance_entry)
+
+                    if abs(saved_entry - actual_binance_entry) / actual_binance_entry > 0.5:
+                        self.log(f"  [ENTRY FIX] {position_key}: Corrupted entry ${saved_entry:,.2f} != Binance ${actual_binance_entry:,.2f}", level="WARN")
+                        self.log(f"  [ENTRY FIX] {position_key}: Resetting to Binance entry ${actual_binance_entry:,.2f}", level="WARN")
+                        # Update saved state to fix corruption
+                        saved_pos["entry_price"] = actual_binance_entry
+                        saved_pos["avg_entry_price"] = actual_binance_entry
+
                     self.log(f"  [STATE] {position_key}: Restored {dca_str}, Boosted={is_boosted}")
                 else:
                     # Fallback: NO DCA = always 0, otherwise estimate from margin
