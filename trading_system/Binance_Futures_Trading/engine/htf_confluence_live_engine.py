@@ -355,7 +355,7 @@ class HTFConfluenceLiveEngine:
 
         quantity = round(quantity, qty_precision)
 
-        logger.debug(f"[{symbol}] Position size: {quantity} (risk ${risk_amount:.2f})")
+        logger.debug(f"[{symbol}] Position size: {quantity} (margin ${margin:.2f} x {self.leverage}x leverage)")
 
         return quantity
 
