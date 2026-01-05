@@ -45,6 +45,7 @@ FUTURES_SYMBOLS_LIVE = [
     "BTCUSDT",   # Bitcoin - +6.9% in 90-day backtest, 0 liquidations
     "ETHUSDT",   # Ethereum - +34.9% in 90-day backtest, 0 liquidations
     "BNBUSDT",   # BNB - +54.3% in 90-day backtest, 0 liquidations (BEST)
+    "DOTUSDT",   # Polkadot - Added for live trading
 ]
 
 # DEMO MODE: All symbols for testing
@@ -178,15 +179,9 @@ SYMBOL_SETTINGS = {
         "price_precision": 3,
         "qty_precision": 1,
         "tick_size": 0.001,
-        "dca_volatility_mult": 1.0,   # No extra multiplier - custom levels below
-        # ENHANCED BOOST - Default settings (DOT is volatile, works well)
-        "tp_roi": 0.08,               # 8% TP (default) - works well for DOT
-        "boost_trigger_dca": 2,       # Trigger boost at DCA 2 (only 2 levels now)
-        # DOT - LIMITED TO 2 LEVELS
-        "dca_levels": [
-            {"trigger_roi": -0.25, "multiplier": 1.50, "tp_roi": 0.06, "require_trend_filter": True},   # DCA1: -25% ROI
-            {"trigger_roi": -0.40, "multiplier": 1.75, "tp_roi": 0.06, "require_trend_filter": True},   # DCA2: -40% ROI
-        ],
+        "tp_roi": 0.08,               # 8% TP - same as BTC/ETH/BNB
+        # NO DCA - empty list (same as BTC/ETH/BNB in live mode)
+        "dca_levels": [],
     },
     "LTCUSDT": {
         "min_qty": 0.01,

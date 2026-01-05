@@ -190,8 +190,9 @@ class BinanceLiveTradingEngine:
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "session_stats.json"
         )
-        # Load saved session stats (if any)
-        self._load_session_stats()
+        # Load saved session stats (if any) - DISABLED for now due to fake profit bugs
+        # self._load_session_stats()
+        self.log("[STATS] Session stats persistence DISABLED - starting fresh", level="WARN")
 
         # Logging
         self.log_dir = os.path.join(
@@ -1136,11 +1137,59 @@ class BinanceLiveTradingEngine:
                 if "orderId" in boost_order:
                     pos.quantity += boost_add_qty
                     self.log(f"    [BOOST] SUCCESS: {side} now has {pos.quantity} qty (1.5x)")
+
+                    # IMPORTANT: Update TP order to only close 50% of boosted position
+                    # This enables the half-close cycle: close 50% at TP, keep 50% with trailing
+                    self._update_tp_order_for_boost(symbol, pos, side)
+
                     self._save_position_state()
                 else:
                     self.log(f"    [BOOST] WARNING: Failed to add boost qty: {boost_order}", level="WARN")
         except Exception as e:
             self.log(f"    [BOOST] ERROR adding boost position: {e}", level="ERROR")
+
+    def _update_tp_order_for_boost(self, symbol: str, pos: 'LivePosition', side: str):
+        """
+        Update TP order to only close 50% of boosted position.
+        This is critical for the half-close cycle to work correctly.
+
+        When position gets boosted 1.5x, the TP order needs to be updated to:
+        - Close only 50% of the NEW boosted quantity
+        - This allows the half-close logic to execute properly
+        """
+        try:
+            # Cancel existing TP orders
+            orders = self.client.get_open_orders(symbol)
+            for order in orders:
+                if order.get('type') == 'TAKE_PROFIT_MARKET' and order.get('positionSide') == side:
+                    self.client.cancel_order(symbol, order['orderId'])
+                    self.log(f"    [BOOST] Cancelled old TP order for {side}")
+
+            # Calculate new TP order quantity (50% of boosted position)
+            symbol_config = SYMBOL_SETTINGS.get(symbol, {})
+            qty_precision = symbol_config.get("qty_precision", 3)
+            half_qty = round(pos.quantity / 2, qty_precision)
+
+            # Get TP price from position
+            tp_roi = symbol_config.get("tp_roi", 0.08)
+            tp_pct = tp_roi / self.leverage
+
+            if side == "LONG":
+                tp_price = round(pos.entry_price * (1 + tp_pct), symbol_config.get("price_precision", 2))
+                order_side = "SELL"
+            else:
+                tp_price = round(pos.entry_price * (1 - tp_pct), symbol_config.get("price_precision", 2))
+                order_side = "BUY"
+
+            # Place new TP order for 50% only
+            tp_order = self.client.place_take_profit(symbol, order_side, half_qty, tp_price, position_side=side)
+            if "orderId" in tp_order:
+                self.log(f"    [BOOST] Updated TP to 50%: {half_qty} @ ${tp_price} (half-close enabled)")
+            else:
+                self.log(f"    [BOOST] WARNING: Failed to update TP order", level="WARN")
+
+        except Exception as e:
+            self.log(f"    [BOOST] ERROR updating TP order: {e}", level="ERROR")
 
     def _check_roi_boost_activation(self, symbol: str, current_price: float):
         """
@@ -1595,6 +1644,15 @@ class BinanceLiveTradingEngine:
         """
         if not position.is_boosted:
             return False
+        
+        # SAFETY LIMIT: Max 5 boost cycles to prevent runaway loops
+        MAX_BOOST_CYCLES = 5
+        if position.half_close_count >= MAX_BOOST_CYCLES:
+            self.log(f"[BOOST LIMIT] {symbol} {position.side}: Max cycles ({MAX_BOOST_CYCLES}) reached, stopping boost", level="WARN")
+            position.is_boosted = False
+            position.trailing_active = False
+            self._save_position_state()
+            return False
 
         pos_key = self.get_position_key(symbol, position.side)
 
@@ -1630,10 +1688,16 @@ class BinanceLiveTradingEngine:
             fill_price = float(close_order.get("avgPrice", current_price))
 
             # Calculate P&L for the closed portion
+            # SAFETY: Use entry_price if avg_entry_price is corrupted
+            safe_entry = position.avg_entry_price
+            if safe_entry <= 0 or safe_entry < fill_price * 0.1 or safe_entry > fill_price * 10:
+                safe_entry = position.entry_price
+                self.log(f"    [BOOST] WARNING: avg_entry ${position.avg_entry_price:.2f} invalid, using entry_price ${safe_entry:.2f}", level="WARN")
+            
             if position.side == "LONG":
-                half_pnl = (fill_price - position.avg_entry_price) * half_qty
+                half_pnl = (fill_price - safe_entry) * half_qty
             else:
-                half_pnl = (position.avg_entry_price - fill_price) * half_qty
+                half_pnl = (safe_entry - fill_price) * half_qty
 
             self.log(f"    [BOOST] Closed 50% @ ${fill_price:,.4f} | P&L: ${half_pnl:+.2f}", level="TRADE")
 
@@ -1664,11 +1728,21 @@ class BinanceLiveTradingEngine:
                 self.daily_wins += 1
             else:
                 self.daily_losses += 1
+            
+            # Update per-symbol stats
+            if hasattr(self, "symbol_stats") and symbol in self.symbol_stats:
+                self.symbol_stats[symbol]["pnl"] += half_pnl
+                if half_pnl > 0:
+                    self.symbol_stats[symbol]["tp_count"] += 1
+                    self.symbol_stats[symbol]["wins"] += 1
+                else:
+                    self.symbol_stats[symbol]["losses"] += 1
 
             # 2. ACTIVATE TRAILING SL on remaining 50%
             position.trailing_active = True
-            position.peak_roi = 0.0  # Reset peak for trailing
-            self.log(f"    [BOOST] Remaining 50% now has TRAILING SL active", level="TRADE")
+            # DON'T reset peak_roi - preserve it for trailing logic!
+            # position.peak_roi stays at current value to track highest point
+            self.log(f"    [BOOST] Remaining 50% now has TRAILING SL active (peak_roi: {position.peak_roi*100:.1f}%)", level="TRADE")
 
             # 3. RE-ENTER at 1.5x size
             # Calculate new position size (1.5x of original base)
@@ -1693,13 +1767,23 @@ class BinanceLiveTradingEngine:
                     old_avg = position.avg_entry_price
                     if old_avg <= 0 or old_avg < reentry_price * 0.1:  # Sanity check
                         old_avg = position.entry_price
-                        self.log(f"    [BOOST] WARNING: avg_entry_price was invalid, using entry_price ${old_avg:,.2f}", level="WARN")
+                        self.log(f"    [BOOST] WARNING: avg_entry_price was invalid ${position.avg_entry_price:,.4f}, using entry_price ${old_avg:,.2f}", level="WARN")
+                    
+                    # CRITICAL: If BOTH are invalid, use reentry_price (current market price)
+                    if old_avg <= 0 or old_avg < reentry_price * 0.1:
+                        old_avg = reentry_price
+                        self.log(f"    [BOOST] CRITICAL: Both prices invalid, using current market price ${old_avg:,.2f}", level="ERROR")
 
                     # Weighted average entry price
                     new_avg_entry = (
                         (old_avg * remaining_qty) +
                         (reentry_price * new_entry_qty)
                     ) / total_qty
+                    
+                    # VALIDATION: Ensure new_avg_entry is never 0
+                    if new_avg_entry <= 0 or new_avg_entry < reentry_price * 0.1:
+                        new_avg_entry = reentry_price
+                        self.log(f"    [BOOST] ERROR: Calculated avg was invalid, forcing to ${new_avg_entry:,.2f}", level="ERROR")
 
                     position.quantity = total_qty
                     position.avg_entry_price = new_avg_entry
@@ -2977,15 +3061,16 @@ class BinanceLiveTradingEngine:
                         # Get the ACTUAL realized PNL from Binance income history
                         income_records = self.client.get_income_history(actual_symbol, "REALIZED_PNL", limit=20)
                         if income_records:
-                            # Get the most recent realized PNL (within last 60 seconds)
+                            # Get the most recent realized PNL (within last 120 seconds - extended from 60)
+                            # Longer window needed for half-close operations and API lag
                             import time
                             now_ms = int(time.time() * 1000)
                             for record in income_records:
                                 record_time = int(record.get("time", 0))
-                                # Only consider PNL from last 60 seconds
-                                if now_ms - record_time < 60000:
+                                # Only consider PNL from last 120 seconds
+                                if now_ms - record_time < 120000:
                                     realized_pnl = float(record.get("income", 0))
-                                    self.log(f"  Binance reported PNL: ${realized_pnl:+.4f}")
+                                    self.log(f"  Binance reported PNL: ${realized_pnl:+.4f} (from {(now_ms - record_time)/1000:.1f}s ago)")
                                     break
 
                         # Get exit price for logging
@@ -2999,16 +3084,19 @@ class BinanceLiveTradingEngine:
 
                         # Determine win/loss based on BINANCE reported PNL
                         # SIMPLE RULE: Positive PNL = WIN (TP), Negative PNL = LOSS (SL)
-                        if realized_pnl > 0:
+                        # CRITICAL: Only count if PNL is significant (>$0.01) to avoid fake wins
+                        if realized_pnl > 0.01:  # At least 1 cent profit
                             exit_type = "TP"
                             self.daily_wins += 1
-                        elif realized_pnl < 0:
+                        elif realized_pnl < -0.01:  # At least 1 cent loss
                             exit_type = "SL"
                             self.daily_losses += 1
                         else:
-                            # Breakeven or no PNL found - count as win
-                            exit_type = "BE"
-                            self.daily_wins += 1
+                            # NO PNL found or exact breakeven - DON'T COUNT AS WIN!
+                            # This prevents fake profit reports when Binance doesn't report PNL
+                            exit_type = "UNKNOWN"
+                            self.log(f"  ⚠️ WARNING: No significant PNL found for {actual_symbol} {closed_side} close (${realized_pnl:+.4f})", level="ERROR")
+                            # Don't update wins/losses - we don't know the real result
 
                     except Exception as e:
                         # Fallback: use Binance unrealized PNL from position
@@ -3066,8 +3154,8 @@ class BinanceLiveTradingEngine:
                         dca_level=local_pos.dca_count
                     )
 
-                    # Save session stats after each trade
-                    self._save_session_stats()
+                    # Save session stats after each trade - DISABLED due to fake profit bugs
+                    # self._save_session_stats()
 
                     # ============================================
                     # CANCEL ALL REMAINING ORDERS FOR THIS SYMBOL
@@ -3162,14 +3250,26 @@ class BinanceLiveTradingEngine:
                         dca_level = 0  # NO DCA mode
                     else:
                         dca_level = self.detect_dca_level_from_margin(binance_symbol, margin_used)
+                    
+                    # VALIDATION: Ensure entry_price is valid
+                    entry_price = pos.get("entry_price", 0)
+                    if entry_price <= 0:
+                        # Try to get from Binance directly
+                        try:
+                            current_price_data = self.client.get_current_price(binance_symbol)
+                            entry_price = current_price_data["price"]
+                            self.log(f"  [SYNC ERROR] {binance_symbol} {binance_side}: Invalid entry_price from Binance, using current price ${entry_price:,.2f}", level="ERROR")
+                        except:
+                            self.log(f"  [SYNC ERROR] {binance_symbol} {binance_side}: Cannot sync - entry_price is 0 and no current price", level="ERROR")
+                            continue  # Skip this position
 
                     self.positions[pos_key] = LivePosition(
                         symbol=binance_symbol,
                         side=binance_side,
-                        entry_price=pos["entry_price"],
+                        entry_price=entry_price,
                         quantity=pos["quantity"],
                         entry_time=datetime.now(),
-                        avg_entry_price=pos["entry_price"],
+                        avg_entry_price=entry_price,
                         margin_used=margin_used,
                         dca_count=dca_level
                     )
@@ -4229,6 +4329,14 @@ class BinanceLiveTradingEngine:
                     pnl_dollar = float(binance_pos.get("unrealized_pnl", 0))
                     liq_price = float(binance_pos.get("liquidation_price", 0))
                     margin_used = float(binance_pos.get("isolated_wallet", 0)) or pos.margin_used
+                    
+                    # Calculate liquidation price manually if Binance returns 0
+                    if liq_price == 0 and entry_price > 0:
+                        leverage = self.leverage  # Use engine's leverage setting
+                        if side == "LONG":
+                            liq_price = entry_price * (1 - (1 / leverage))  # Entry × 0.95 for 20x
+                        else:
+                            liq_price = entry_price * (1 + (1 / leverage))  # Entry × 1.05 for 20x
 
                     # Skip if no entry price
                     if entry_price <= 0:
@@ -4255,8 +4363,15 @@ class BinanceLiveTradingEngine:
                         orders = self.client.get_open_orders(symbol)
                         for order in orders:
                             order_type = order.get("type", "")
-                            stop_price = float(order.get("stopPrice", 0))
+                            # Support both stopPrice (regular) and triggerPrice (algo orders)
+                            stop_price = float(order.get("stopPrice", order.get("triggerPrice", 0)))
                             order_side = order.get("side", "")
+                            order_position_side = order.get("positionSide", "BOTH")
+                            
+                            # In hedge mode, only match orders for this position side
+                            if self.hedge_mode and order_position_side != side:
+                                continue
+                            
                             if side == "LONG":
                                 if order_type == "TAKE_PROFIT_MARKET" and order_side == "SELL" and stop_price > entry_price:
                                     tp_price = stop_price
@@ -4692,13 +4807,27 @@ class BinanceLiveTradingEngine:
                 self.boost_trigger_side = saved_boost.get("boost_trigger_side", {})
                 self.boost_locked_profit = saved_boost.get("boost_locked_profit", {})
                 self.boost_cycle_count = saved_boost.get("boost_cycle_count", {})
+                
+                # SAFETY: Reset corrupted locked profits (from entry_price=0 bug)
+                # Any negative locked profit > $50 is from the bug (boost should accumulate profit, not losses)
+                for sym, locked in list(self.boost_locked_profit.items()):
+                    if locked < -50 or locked > 1000:  # Negative > $50 or positive > $1000 = corrupted
+                        self.log(f"  [BOOST] RESET: {sym} had corrupted locked profit ${locked:+.2f} (from entry_price bug)", level="WARN")
+                        self.boost_locked_profit[sym] = 0.0
+                        # Also reset cycle count
+                        if sym in self.boost_cycle_count:
+                            old_count = self.boost_cycle_count[sym]
+                            self.boost_cycle_count[sym] = 0
+                            self.log(f"  [BOOST] RESET: {sym} cycle count from {old_count} to 0", level="WARN")
 
                 # Log restored boost state
                 for symbol, active in self.boost_mode_active.items():
                     if active:
                         boosted = self.boosted_side.get(symbol, "?")
                         trigger = self.boost_trigger_side.get(symbol, "?")
-                        self.log(f"  [BOOST] Restored: {symbol} {boosted} is BOOSTED (triggered by {trigger})")
+                        locked = self.boost_locked_profit.get(symbol, 0)
+                        cycles = self.boost_cycle_count.get(symbol, 0)
+                        self.log(f"  [BOOST] Restored: {symbol} {boosted} is BOOSTED (triggered by {trigger}) | Cycles: {cycles} | Locked: ${locked:+.2f}")
 
             for pos in binance_positions:
                 symbol = pos["symbol"]
@@ -4741,6 +4870,13 @@ class BinanceLiveTradingEngine:
                     is_boosted = saved_pos.get("is_boosted", False)
                     boost_multiplier = saved_pos.get("boost_multiplier", 1.0)
                     half_close_count = saved_pos.get("half_close_count", 0)
+                    
+                    # SAFETY: If locked profit was reset for this symbol, also reset half_close_count
+                    if half_close_count > 5 and self.boost_locked_profit.get(symbol, 0) == 0:
+                        old_count = half_close_count
+                        half_close_count = 0
+                        self.log(f"  [STATE] {position_key}: Reset half_close_count from {old_count} to 0 (locked profit was reset)", level="WARN")
+                    
                     peak_roi = saved_pos.get("peak_roi", 0.0)
                     trailing_active = saved_pos.get("trailing_active", False)
                     dca_str = "NO DCA" if num_dca_levels == 0 else f"DCA={dca_level}/{num_dca_levels}"
@@ -4942,8 +5078,36 @@ class BinanceLiveTradingEngine:
             # position_side already set above for order filtering
 
             if entry_price <= 0:
-                self.log(f"  Cannot place SL/TP for {symbol}: entry_price is {entry_price}", level="WARN")
-                return
+                self.log(f"  [ERROR] Cannot place SL/TP for {symbol} {position_side}: entry_price is {entry_price:.4f} - Position corrupted!", level="ERROR")
+                self.log(f"  [FIX] Attempting to sync position from Binance...", level="ERROR")
+                # Try to get actual entry price from Binance
+                try:
+                    binance_pos = self.client.get_position(symbol, position_side)
+                    if binance_pos and binance_pos.get("entry_price", 0) > 0:
+                        entry_price = binance_pos["entry_price"]
+                        self.log(f"  [FIX] Retrieved entry price from Binance: ${entry_price:,.4f}", level="WARN")
+                        # Update local position
+                        if position_key in self.positions:
+                            self.positions[position_key].entry_price = entry_price
+                            self.positions[position_key].avg_entry_price = entry_price
+                            self._save_position_state()
+                            self.log(f"  [FIX] Updated local position with correct entry price", level="WARN")
+                    else:
+                        self.log(f"  [FIX] Could not retrieve valid entry price from Binance - skipping SL/TP", level="ERROR")
+                        return
+                except Exception as e:
+                    self.log(f"  [FIX] Failed to sync from Binance: {e}", level="ERROR")
+                    return
+            
+            # Additional validation: entry_price should be near market price
+            try:
+                current_market = self.client.get_current_price(symbol)["price"]
+                # If entry price is more than 50% away from current price, something is wrong
+                price_diff_pct = abs(entry_price - current_market) / current_market
+                if price_diff_pct > 0.5:
+                    self.log(f"  [WARN] Entry price ${entry_price:,.2f} is {price_diff_pct*100:.1f}% away from market ${current_market:,.2f}", level="WARN")
+            except:
+                pass
 
             # Calculate SL/TP prices using ROI-BASED calculation for leveraged scalping
             # Formula: price_move = roi / leverage
