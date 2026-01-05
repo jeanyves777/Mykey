@@ -1269,26 +1269,44 @@ class BinanceLiveTradingEngine:
                         self.log(f"[TP-FIX] {symbol} {side}: ERROR creating TP: {e}", level="ERROR")
 
                 else:
-                    # TP order exists - validate quantity
-                    tp_order = tp_orders[0]  # Should only be one TP order per side
-                    actual_tp_qty = abs(float(tp_order['origQty']))
-                    pct_of_position = (actual_tp_qty / pos.quantity) * 100 if pos.quantity > 0 else 0
+                    # Multiple TP orders exist - SHOULD ONLY BE ONE!
+                    # Check all TPs and find correct one
+                    correct_tp = None
+                    incorrect_tps = []
 
-                    # Allow 5% tolerance for rounding
-                    if is_boosted:
-                        # Boosted position - should be ~50%
-                        if pct_of_position > 55:
-                            # ISSUE: Boosted position has full TP order instead of half
-                            issues_found += 1
-                            self.log(f"[TP-CHECK] {symbol} {side} [BOOSTED]: TP is {pct_of_position:.1f}% (should be 50%)", level="WARN")
+                    for tp_order in tp_orders:
+                        actual_tp_qty = abs(float(tp_order['origQty']))
+                        pct_of_position = (actual_tp_qty / pos.quantity) * 100 if pos.quantity > 0 else 0
 
-                            # AUTO-FIX: Update to 50%
+                        # Determine if this TP is correct
+                        is_correct = False
+                        if is_boosted and 45 <= pct_of_position <= 55:
+                            is_correct = True
+                        elif not is_boosted and pct_of_position >= 95:
+                            is_correct = True
+
+                        if is_correct:
+                            correct_tp = tp_order
+                        else:
+                            incorrect_tps.append((tp_order, actual_tp_qty, pct_of_position))
+
+                    # CASE 1: Multiple TPs exist (correct + incorrect)
+                    if len(tp_orders) > 1:
+                        # Cancel ALL incorrect TPs
+                        for tp_order, qty, pct in incorrect_tps:
                             try:
-                                # Cancel incorrect TP
                                 self.client.cancel_order(symbol, tp_order['orderId'])
-                                self.log(f"[TP-FIX] {symbol} {side}: Cancelled incorrect TP ({actual_tp_qty} = {pct_of_position:.1f}%)", level="INFO")
+                                self.log(f"[TP-CLEANUP] {symbol} {side}: Cancelled duplicate/incorrect TP ({qty} = {pct:.1f}%)", level="INFO")
+                            except Exception as e:
+                                if "Unknown order" not in str(e):
+                                    self.log(f"[TP-CLEANUP] {symbol} {side}: Error: {e}", level="WARN")
 
-                                # Create correct TP (50%)
+                        # If NO correct TP exists after cleanup, create one
+                        if not correct_tp:
+                            issues_found += 1
+                            self.log(f"[TP-CHECK] {symbol} {side}: No correct TP after cleanup", level="WARN")
+
+                            try:
                                 tp_roi = symbol_config.get("tp_roi", 0.08)
                                 tp_pct = tp_roi / self.leverage
 
@@ -1302,43 +1320,40 @@ class BinanceLiveTradingEngine:
                                 new_tp = self.client.place_take_profit(symbol, order_side, expected_tp_qty, tp_price, position_side=side)
                                 if "orderId" in new_tp:
                                     issues_fixed += 1
-                                    self.log(f"[TP-FIX] {symbol} {side}: Created correct TP {expected_tp_qty} @ ${tp_price} (50%)", level="INFO")
-                                else:
-                                    self.log(f"[TP-FIX] {symbol} {side}: FAILED to create correct TP", level="ERROR")
+                                    pct_str = "50%" if is_boosted else "100%"
+                                    self.log(f"[TP-FIX] {symbol} {side}: Created correct TP {expected_tp_qty} @ ${tp_price} ({pct_str})", level="INFO")
                             except Exception as e:
-                                self.log(f"[TP-FIX] {symbol} {side}: ERROR fixing TP: {e}", level="ERROR")
-                    else:
-                        # Non-boosted position - should be ~100%
-                        if pct_of_position < 95:
-                            # ISSUE: Non-boosted position has partial TP order
-                            issues_found += 1
-                            self.log(f"[TP-CHECK] {symbol} {side}: TP is {pct_of_position:.1f}% (should be 100%)", level="WARN")
+                                self.log(f"[TP-FIX] {symbol} {side}: ERROR: {e}", level="ERROR")
 
-                            # AUTO-FIX: Update to 100%
-                            try:
-                                # Cancel incorrect TP
-                                self.client.cancel_order(symbol, tp_order['orderId'])
-                                self.log(f"[TP-FIX] {symbol} {side}: Cancelled incorrect TP ({actual_tp_qty} = {pct_of_position:.1f}%)", level="INFO")
+                    # CASE 2: Only ONE TP exists but it's wrong
+                    elif not correct_tp:
+                        issues_found += 1
+                        tp_order, qty, pct = incorrect_tps[0]
+                        self.log(f"[TP-CHECK] {symbol} {side}: Wrong TP qty {qty} ({pct:.1f}%)", level="WARN")
 
-                                # Create correct TP (100%)
-                                tp_roi = symbol_config.get("tp_roi", 0.08)
-                                tp_pct = tp_roi / self.leverage
+                        try:
+                            # Cancel wrong TP
+                            self.client.cancel_order(symbol, tp_order['orderId'])
 
-                                if side == "LONG":
-                                    tp_price = round(pos.entry_price * (1 + tp_pct), symbol_config.get("price_precision", 2))
-                                    order_side = "SELL"
-                                else:
-                                    tp_price = round(pos.entry_price * (1 - tp_pct), symbol_config.get("price_precision", 2))
-                                    order_side = "BUY"
+                            # Create correct TP
+                            tp_roi = symbol_config.get("tp_roi", 0.08)
+                            tp_pct = tp_roi / self.leverage
 
-                                new_tp = self.client.place_take_profit(symbol, order_side, expected_tp_qty, tp_price, position_side=side)
-                                if "orderId" in new_tp:
-                                    issues_fixed += 1
-                                    self.log(f"[TP-FIX] {symbol} {side}: Created correct TP {expected_tp_qty} @ ${tp_price} (100%)", level="INFO")
-                                else:
-                                    self.log(f"[TP-FIX] {symbol} {side}: FAILED to create correct TP", level="ERROR")
-                            except Exception as e:
-                                self.log(f"[TP-FIX] {symbol} {side}: ERROR fixing TP: {e}", level="ERROR")
+                            if side == "LONG":
+                                tp_price = round(pos.entry_price * (1 + tp_pct), symbol_config.get("price_precision", 2))
+                                order_side = "SELL"
+                            else:
+                                tp_price = round(pos.entry_price * (1 - tp_pct), symbol_config.get("price_precision", 2))
+                                order_side = "BUY"
+
+                            new_tp = self.client.place_take_profit(symbol, order_side, expected_tp_qty, tp_price, position_side=side)
+                            if "orderId" in new_tp:
+                                issues_fixed += 1
+                                pct_str = "50%" if is_boosted else "100%"
+                                self.log(f"[TP-FIX] {symbol} {side}: Fixed TP to {expected_tp_qty} @ ${tp_price} ({pct_str})", level="INFO")
+                        except Exception as e:
+                            if "Unknown order" not in str(e):
+                                self.log(f"[TP-FIX] {symbol} {side}: ERROR: {e}", level="ERROR")
 
             # Log summary
             if issues_found > 0:
