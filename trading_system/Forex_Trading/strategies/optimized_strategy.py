@@ -452,6 +452,32 @@ class OptimizedForexStrategy:
         """Reset daily cooldowns"""
         self.daily_cooldowns = {}
 
+    def calculate_position_size(self, instrument, entry_price):
+        """Calculate position size - $1 per pip for all pairs"""
+        if instrument in ['EUR_USD', 'GBP_USD', 'AUD_USD', 'NZD_USD', 'USD_CHF', 'USD_CAD']:
+            return 10000
+        elif 'JPY' in instrument:
+            return 1000
+        else:
+            return 10000
+
+    def calculate_tp_sl_prices(self, instrument, entry_price, direction, settings):
+        """Calculate TP and SL prices"""
+        tp_pips = settings.get('tp_pips', 8)
+        sl_pips = settings.get('sl_pips', 20)
+        pip_value = 0.0001 if 'JPY' not in instrument else 0.01
+
+        if direction == 'BUY':
+            return {
+                'tp': entry_price + (tp_pips * pip_value),
+                'sl': entry_price - (sl_pips * pip_value)
+            }
+        else:
+            return {
+                'tp': entry_price - (tp_pips * pip_value),
+                'sl': entry_price + (sl_pips * pip_value)
+            }
+
     def should_enter_trade(self, instrument, df_5min, current_positions=0, trades_today=0, daily_pl_pct=0.0, now=None):
         """Check if should enter trade - wrapper for functional get_signal"""
         # Calculate indicators
