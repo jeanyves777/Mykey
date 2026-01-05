@@ -1191,6 +1191,165 @@ class BinanceLiveTradingEngine:
         except Exception as e:
             self.log(f"    [BOOST] ERROR updating TP order: {e}", level="ERROR")
 
+    def validate_and_fix_tp_orders(self):
+        """
+        AUTOMATIC TP ORDER VALIDATION & FIX
+        ===================================
+        Validates that all TP orders are correct and auto-fixes any issues.
+
+        This function runs:
+        1. At startup (after syncing positions)
+        2. Every scan cycle in the main loop
+
+        Checks performed:
+        - Boosted positions MUST have TP orders for 50% quantity only
+        - Non-boosted positions MUST have TP orders for 100% quantity
+        - Missing TP orders are created
+        - Incorrect TP orders are cancelled and recreated
+
+        This ensures the half-close cycle works correctly at all times.
+        """
+        try:
+            issues_found = 0
+            issues_fixed = 0
+
+            for position_key, pos in self.positions.items():
+                # Extract symbol from position key (handles both 'DOTUSDT' and 'DOTUSDT_LONG')
+                symbol = self.get_symbol_from_key(position_key)
+                side = pos.side
+
+                # Get symbol configuration
+                symbol_config = SYMBOL_SETTINGS.get(symbol, {})
+                qty_precision = symbol_config.get("qty_precision", 3)
+
+                # Get current open orders for this symbol
+                try:
+                    orders = self.client.get_open_orders(symbol)
+                    tp_orders = [o for o in orders if o.get('type') == 'TAKE_PROFIT_MARKET' and o.get('positionSide') == side]
+                except Exception as e:
+                    self.log(f"[TP-CHECK] ERROR getting orders for {symbol} {side}: {e}", level="ERROR")
+                    continue
+
+                # Determine if position is boosted
+                is_boosted = pos.is_boosted or pos.boost_multiplier > 1.0
+
+                # Calculate expected TP quantity
+                if is_boosted:
+                    expected_tp_qty = round(pos.quantity / 2, qty_precision)  # 50% for boosted
+                    expected_pct = 50
+                else:
+                    expected_tp_qty = round(pos.quantity, qty_precision)  # 100% for normal
+                    expected_pct = 100
+
+                # Check TP order status
+                if not tp_orders:
+                    # ISSUE: Missing TP order
+                    issues_found += 1
+                    self.log(f"[TP-CHECK] {symbol} {side}: TP order MISSING (boosted={is_boosted})", level="WARN")
+
+                    # AUTO-FIX: Create missing TP order
+                    try:
+                        tp_roi = symbol_config.get("tp_roi", 0.08)
+                        tp_pct = tp_roi / self.leverage
+
+                        if side == "LONG":
+                            tp_price = round(pos.entry_price * (1 + tp_pct), symbol_config.get("price_precision", 2))
+                            order_side = "SELL"
+                        else:
+                            tp_price = round(pos.entry_price * (1 - tp_pct), symbol_config.get("price_precision", 2))
+                            order_side = "BUY"
+
+                        tp_order = self.client.place_take_profit(symbol, order_side, expected_tp_qty, tp_price, position_side=side)
+                        if "orderId" in tp_order:
+                            issues_fixed += 1
+                            self.log(f"[TP-FIX] {symbol} {side}: Created TP order {expected_tp_qty} @ ${tp_price} ({expected_pct}%)", level="INFO")
+                        else:
+                            self.log(f"[TP-FIX] {symbol} {side}: FAILED to create TP order", level="ERROR")
+                    except Exception as e:
+                        self.log(f"[TP-FIX] {symbol} {side}: ERROR creating TP: {e}", level="ERROR")
+
+                else:
+                    # TP order exists - validate quantity
+                    tp_order = tp_orders[0]  # Should only be one TP order per side
+                    actual_tp_qty = abs(float(tp_order['origQty']))
+                    pct_of_position = (actual_tp_qty / pos.quantity) * 100 if pos.quantity > 0 else 0
+
+                    # Allow 5% tolerance for rounding
+                    if is_boosted:
+                        # Boosted position - should be ~50%
+                        if pct_of_position > 55:
+                            # ISSUE: Boosted position has full TP order instead of half
+                            issues_found += 1
+                            self.log(f"[TP-CHECK] {symbol} {side} [BOOSTED]: TP is {pct_of_position:.1f}% (should be 50%)", level="WARN")
+
+                            # AUTO-FIX: Update to 50%
+                            try:
+                                # Cancel incorrect TP
+                                self.client.cancel_order(symbol, tp_order['orderId'])
+                                self.log(f"[TP-FIX] {symbol} {side}: Cancelled incorrect TP ({actual_tp_qty} = {pct_of_position:.1f}%)", level="INFO")
+
+                                # Create correct TP (50%)
+                                tp_roi = symbol_config.get("tp_roi", 0.08)
+                                tp_pct = tp_roi / self.leverage
+
+                                if side == "LONG":
+                                    tp_price = round(pos.entry_price * (1 + tp_pct), symbol_config.get("price_precision", 2))
+                                    order_side = "SELL"
+                                else:
+                                    tp_price = round(pos.entry_price * (1 - tp_pct), symbol_config.get("price_precision", 2))
+                                    order_side = "BUY"
+
+                                new_tp = self.client.place_take_profit(symbol, order_side, expected_tp_qty, tp_price, position_side=side)
+                                if "orderId" in new_tp:
+                                    issues_fixed += 1
+                                    self.log(f"[TP-FIX] {symbol} {side}: Created correct TP {expected_tp_qty} @ ${tp_price} (50%)", level="INFO")
+                                else:
+                                    self.log(f"[TP-FIX] {symbol} {side}: FAILED to create correct TP", level="ERROR")
+                            except Exception as e:
+                                self.log(f"[TP-FIX] {symbol} {side}: ERROR fixing TP: {e}", level="ERROR")
+                    else:
+                        # Non-boosted position - should be ~100%
+                        if pct_of_position < 95:
+                            # ISSUE: Non-boosted position has partial TP order
+                            issues_found += 1
+                            self.log(f"[TP-CHECK] {symbol} {side}: TP is {pct_of_position:.1f}% (should be 100%)", level="WARN")
+
+                            # AUTO-FIX: Update to 100%
+                            try:
+                                # Cancel incorrect TP
+                                self.client.cancel_order(symbol, tp_order['orderId'])
+                                self.log(f"[TP-FIX] {symbol} {side}: Cancelled incorrect TP ({actual_tp_qty} = {pct_of_position:.1f}%)", level="INFO")
+
+                                # Create correct TP (100%)
+                                tp_roi = symbol_config.get("tp_roi", 0.08)
+                                tp_pct = tp_roi / self.leverage
+
+                                if side == "LONG":
+                                    tp_price = round(pos.entry_price * (1 + tp_pct), symbol_config.get("price_precision", 2))
+                                    order_side = "SELL"
+                                else:
+                                    tp_price = round(pos.entry_price * (1 - tp_pct), symbol_config.get("price_precision", 2))
+                                    order_side = "BUY"
+
+                                new_tp = self.client.place_take_profit(symbol, order_side, expected_tp_qty, tp_price, position_side=side)
+                                if "orderId" in new_tp:
+                                    issues_fixed += 1
+                                    self.log(f"[TP-FIX] {symbol} {side}: Created correct TP {expected_tp_qty} @ ${tp_price} (100%)", level="INFO")
+                                else:
+                                    self.log(f"[TP-FIX] {symbol} {side}: FAILED to create correct TP", level="ERROR")
+                            except Exception as e:
+                                self.log(f"[TP-FIX] {symbol} {side}: ERROR fixing TP: {e}", level="ERROR")
+
+            # Log summary
+            if issues_found > 0:
+                self.log(f"[TP-CHECK] Found {issues_found} TP issues, fixed {issues_fixed}", level="INFO")
+
+            return issues_found, issues_fixed
+
+        except Exception as e:
+            self.log(f"[TP-CHECK] ERROR during validation: {e}", level="ERROR")
+            return 0, 0
+
     def _check_roi_boost_activation(self, symbol: str, current_price: float):
         """
         ROI-BASED BOOST ACTIVATION (replaces DCA level-based)
@@ -4702,6 +4861,13 @@ class BinanceLiveTradingEngine:
         # Sync existing positions from previous sessions
         self.sync_existing_positions()
 
+        # CRITICAL: Validate and fix all TP orders after sync
+        # This ensures boosted positions have 50% TP orders, not 100%
+        self.log("=" * 60, level="INFO")
+        self.log("[STARTUP] Validating all TP orders...", level="INFO")
+        self.validate_and_fix_tp_orders()
+        self.log("=" * 60, level="INFO")
+
         check_interval = 60  # Scan every 60 seconds (like Forex system)
         status_interval = 300
         last_status = datetime.now()
@@ -4747,6 +4913,10 @@ class BinanceLiveTradingEngine:
 
                 self.check_entry_signals()
                 self.manage_positions()
+
+                # CRITICAL: Validate and fix TP orders every scan cycle
+                # This ensures boosted positions always have correct 50% TP orders
+                self.validate_and_fix_tp_orders()
 
                 # SELF-HEALING: Check and fix any state inconsistencies
                 self._check_and_fix_inconsistencies()
