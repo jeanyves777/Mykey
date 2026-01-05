@@ -38,15 +38,15 @@ def main():
     # 2. Cancel ALL open orders
     print("\n[2] Cancelling ALL open orders...")
     try:
-        # Get all open orders
-        all_orders = client.client.futures_get_open_orders()
+        # Get all open orders using client method
+        all_orders = client.get_open_orders()
         if all_orders:
             print(f"Found {len(all_orders)} open order(s)")
             for order in all_orders:
                 symbol = order['symbol']
                 order_id = order['orderId']
                 try:
-                    client.client.futures_cancel_order(symbol=symbol, orderId=order_id)
+                    client.cancel_order(symbol=symbol, order_id=order_id)
                     print(f"  Cancelled order {order_id} on {symbol}")
                 except Exception as e:
                     print(f"  Failed to cancel {order_id}: {e}")
@@ -110,7 +110,7 @@ def main():
     else:
         print("✓ All positions closed successfully!")
 
-    all_orders = client.client.futures_get_open_orders()
+    all_orders = client.get_open_orders()
     if all_orders:
         print(f"⚠ WARNING: Still have {len(all_orders)} open order(s)")
     else:
@@ -119,7 +119,7 @@ def main():
     # 6. Show account balance
     print("\n[6] Account Balance:")
     try:
-        account = client.client.futures_account()
+        account = client.get_account_info()
         balance = float(account['totalWalletBalance'])
         available = float(account['availableBalance'])
         print(f"  Total Balance: ${balance:.2f}")
