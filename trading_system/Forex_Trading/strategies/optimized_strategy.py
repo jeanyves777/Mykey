@@ -486,14 +486,19 @@ class OptimizedForexStrategy:
         # Get signal using functional approach
         signal, reason = get_signal(instrument, df, self.config)
 
+        # Get pair settings
+        settings = _get_default_pair_settings(instrument)
+
         if signal:
             return {
                 "action": signal,
                 "reason": reason,
-                "confidence": 0.8  # Default confidence
+                "confidence": 0.8,
+                "settings": settings
             }
         else:
             return {
                 "action": "SKIP",
-                "reason": reason
+                "reason": reason,
+                "settings": settings
             }
