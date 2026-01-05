@@ -605,9 +605,26 @@ class HTFConfluenceLiveEngine:
                     if exit_type:
                         logger.info(f"[{symbol}] Position exit: {exit_type}")
                     else:
-                        # Position still open - skip analysis
+                        # Position still open - show status with current price
                         pos = self.positions[symbol]
-                        logger.debug(f"[{symbol}] Position open: {pos['side']} @ ${pos['entry_price']:,.4f}")
+                        try:
+                            price_data = self.client.get_current_price(symbol)
+                            current_price = price_data["price"]
+                            entry = pos["entry_price"]
+
+                            # Calculate unrealized ROI
+                            if pos["side"] == "LONG":
+                                roi = (current_price - entry) / entry * self.leverage * 100
+                                distance_to_tp = (pos["tp_price"] - current_price) / current_price * 100
+                                distance_to_sl = (current_price - pos["sl_price"]) / current_price * 100
+                            else:
+                                roi = (entry - current_price) / entry * self.leverage * 100
+                                distance_to_tp = (current_price - pos["tp_price"]) / current_price * 100
+                                distance_to_sl = (pos["sl_price"] - current_price) / current_price * 100
+
+                            logger.info(f"[{symbol}] {pos['side']} @ ${entry:,.4f} | Now: ${current_price:,.4f} | ROI: {roi:+.1f}% | TP: {distance_to_tp:.2f}% away | SL: {distance_to_sl:.2f}% away")
+                        except:
+                            logger.info(f"[{symbol}] {pos['side']} @ ${pos['entry_price']:,.4f} (monitoring)")
                     continue
 
                 # Check cooldown
