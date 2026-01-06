@@ -79,7 +79,7 @@ class HTFConfluenceLiveEngine:
             total_capital: Total capital to use (None = use account balance)
             risk_per_trade: Risk per trade as fraction (default: 2%)
         """
-        self.symbols = symbols or ["DOTUSDT", "BNBUSDT", "AVAXUSDT", "XRPUSDT"]
+        self.symbols = symbols or ["DOTUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT"]
         self.default_config = config or MODERATE_CONFIG
         self.testnet = testnet
         self.total_capital = total_capital
@@ -737,6 +737,20 @@ class HTFConfluenceLiveEngine:
 
                 # Cancel any remaining orders
                 self.client.cancel_orders_for_side(symbol, position_side)
+
+                # Scan for new signal immediately after close
+                logger.info(f"[{symbol}] Scanning for new signal...")
+                signal = self.analyze_symbol(symbol)
+                if signal:
+                    trend_str = signal.trend.value if hasattr(signal, 'trend') else "?"
+                    if signal.action:
+                        logger.info(f"[{symbol}] Signal: {signal.action} | Trend: {trend_str} | Score: {signal.confluence_score}/4")
+                        if signal.confluence_score < 3:
+                            logger.info(f"[{symbol}] Waiting for stronger confluence (need 3+)")
+                    else:
+                        logger.info(f"[{symbol}] No signal | Trend: {trend_str} | Waiting for entry conditions")
+                else:
+                    logger.info(f"[{symbol}] Could not analyze - will retry next cycle")
 
                 return exit_type
 

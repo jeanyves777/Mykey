@@ -585,34 +585,33 @@ SWING_CONFIG = {
 # - AVAX: Trending well, tight SL works (10% ROI = 0.5% price move)
 #
 # Optimization results (60-day backtest):
-# - DOTUSDT: 50TP/15SL → +210% return, 33% win rate
-# - BNBUSDT: 40TP/10SL → +59% return, 25% win rate
-# - AVAXUSDT: 40TP/10SL → +183% return, 28% win rate
+# Optimized with REAL Binance Futures data (60-day backtest Jan 2026)
+# Total: +165.8% return over 60 days
 # =============================================================================
 ASSET_SPECIFIC_CONFIG = {
     "DOTUSDT": {
         "leverage": 20,
-        "tp_roi": 0.50,     # 50% ROI (TP) = 2.5% price move
-        "sl_roi": 0.15,     # 15% ROI (SL) = 0.75% price move | 3.3:1 R:R
-        # Wider SL avoids getting stopped on normal pullbacks
+        "tp_roi": 0.40,     # 40% ROI (TP) = 2% price move
+        "sl_roi": 0.20,     # 20% ROI (SL) = 1% price move | 2:1 R:R
+        # +51.3% return, 38% win rate
     },
     "BNBUSDT": {
         "leverage": 20,
-        "tp_roi": 0.40,     # 40% ROI (TP) = 2% price move
-        "sl_roi": 0.10,     # 10% ROI (SL) = 0.5% price move | 4:1 R:R
-        # Tight SL works for less volatile BNB
-    },
-    "AVAXUSDT": {
-        "leverage": 20,
-        "tp_roi": 0.40,     # 40% ROI (TP) = 2% price move
-        "sl_roi": 0.10,     # 10% ROI (SL) = 0.5% price move | 4:1 R:R
-        # Strong trending, tight SL works
+        "tp_roi": 0.30,     # 30% ROI (TP) = 1.5% price move
+        "sl_roi": 0.10,     # 10% ROI (SL) = 0.5% price move | 3:1 R:R
+        # +66.5% return, 30% win rate
     },
     "XRPUSDT": {
         "leverage": 20,
         "tp_roi": 0.40,     # 40% ROI (TP) = 2% price move
-        "sl_roi": 0.10,     # 10% ROI (SL) = 0.5% price move | 4:1 R:R
-        # Same profile as BNB/AVAX - 171% backtest return
+        "sl_roi": 0.20,     # 20% ROI (SL) = 1% price move | 2:1 R:R
+        # +31.8% return, 38% win rate
+    },
+    "ADAUSDT": {
+        "leverage": 20,
+        "tp_roi": 0.60,     # 60% ROI (TP) = 3% price move
+        "sl_roi": 0.20,     # 20% ROI (SL) = 1% price move | 3:1 R:R
+        # +16.2% return, 27% win rate
     },
 }
 
