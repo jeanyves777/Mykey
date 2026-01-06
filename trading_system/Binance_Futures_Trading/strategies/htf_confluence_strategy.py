@@ -122,8 +122,8 @@ class HTFConfluenceStrategy:
         self.min_bars_between_signals = 16   # Wait 16 bars (4 hours on 15m) between signals
         self.last_signal_bar = -999
 
-        # STRENGTHENED: Require minimum confluence score
-        self.min_confluence_score = 4       # Require ALL 4 conditions for entry (was 3)
+        # Minimum confluence score (keep 3 but with stricter individual conditions)
+        self.min_confluence_score = 3       # Need 3/4 conditions (each condition is now stricter)
 
     def calculate_ema(self, series: pd.Series, period: int) -> pd.Series:
         """Calculate Exponential Moving Average"""
@@ -361,22 +361,24 @@ class HTFConfluenceStrategy:
             else:
                 conditions_met.append(f"HTF: Bullish but ADX {adx:.1f} (weak trend)")
 
-        # Condition 2: EMA crossover ONLY (not just alignment) - STRICTER
+        # Condition 2: EMA crossover or strong alignment
         if indicators.get("ema_bullish_cross", False):
             conditions_met.append("EMA: 9 crossed above 21 (fresh crossover)")
-        # Removed: elif ema_bullish alignment - too weak
+        elif indicators.get("ema_bullish", False):
+            conditions_met.append("EMA: 9 > 21 (bullish alignment)")
 
         # Condition 3: RSI in valid range (tightened)
         rsi = indicators.get("rsi", 50)
         if self.rsi_long_min <= rsi <= self.rsi_long_max:
             conditions_met.append(f"RSI: {rsi:.1f} in range [{self.rsi_long_min}-{self.rsi_long_max}]")
 
-        # Condition 4: MACD bullish with momentum building - STRICTER
+        # Condition 4: MACD bullish with momentum (crossover or momentum building)
         if indicators.get("macd_bullish_cross", False):
             conditions_met.append("MACD: Fresh bullish crossover")
         elif indicators.get("macd_momentum_bullish", False):
             conditions_met.append("MACD: Histogram > 0 & increasing (momentum)")
-        # Removed: elif just macd_bullish histogram > 0 - too weak
+        elif indicators.get("macd_bullish", False):
+            conditions_met.append("MACD: Histogram > 0 (bullish)")
 
         return len(conditions_met), conditions_met
 
@@ -397,22 +399,24 @@ class HTFConfluenceStrategy:
             else:
                 conditions_met.append(f"HTF: Bearish but ADX {adx:.1f} (weak trend)")
 
-        # Condition 2: EMA crossover ONLY (not just alignment) - STRICTER
+        # Condition 2: EMA crossover or strong alignment
         if indicators.get("ema_bearish_cross", False):
             conditions_met.append("EMA: 9 crossed below 21 (fresh crossover)")
-        # Removed: elif ema_bearish alignment - too weak
+        elif indicators.get("ema_bearish", False):
+            conditions_met.append("EMA: 9 < 21 (bearish alignment)")
 
         # Condition 3: RSI in valid range (tightened)
         rsi = indicators.get("rsi", 50)
         if self.rsi_short_min <= rsi <= self.rsi_short_max:
             conditions_met.append(f"RSI: {rsi:.1f} in range [{self.rsi_short_min}-{self.rsi_short_max}]")
 
-        # Condition 4: MACD bearish with momentum building - STRICTER
+        # Condition 4: MACD bearish with momentum (crossover or momentum building)
         if indicators.get("macd_bearish_cross", False):
             conditions_met.append("MACD: Fresh bearish crossover")
         elif indicators.get("macd_momentum_bearish", False):
             conditions_met.append("MACD: Histogram < 0 & decreasing (momentum)")
-        # Removed: elif just macd_bearish histogram < 0 - too weak
+        elif indicators.get("macd_bearish", False):
+            conditions_met.append("MACD: Histogram < 0 (bearish)")
 
         return len(conditions_met), conditions_met
 
