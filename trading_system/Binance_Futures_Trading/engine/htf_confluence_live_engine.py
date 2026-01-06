@@ -79,7 +79,7 @@ class HTFConfluenceLiveEngine:
             total_capital: Total capital to use (None = use account balance)
             risk_per_trade: Risk per trade as fraction (default: 2%)
         """
-        self.symbols = symbols or ["DOTUSDT", "BNBUSDT", "AVAXUSDT"]
+        self.symbols = symbols or ["DOTUSDT", "BNBUSDT", "AVAXUSDT", "XRPUSDT"]
         self.default_config = config or MODERATE_CONFIG
         self.testnet = testnet
         self.total_capital = total_capital

@@ -608,6 +608,12 @@ ASSET_SPECIFIC_CONFIG = {
         "sl_roi": 0.10,     # 10% ROI (SL) = 0.5% price move | 4:1 R:R
         # Strong trending, tight SL works
     },
+    "XRPUSDT": {
+        "leverage": 20,
+        "tp_roi": 0.40,     # 40% ROI (TP) = 2% price move
+        "sl_roi": 0.10,     # 10% ROI (SL) = 0.5% price move | 4:1 R:R
+        # Same profile as BNB/AVAX - 171% backtest return
+    },
 }
 
 def get_config_for_symbol(symbol: str) -> dict:
