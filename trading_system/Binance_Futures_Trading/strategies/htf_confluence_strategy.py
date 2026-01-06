@@ -102,21 +102,28 @@ class HTFConfluenceStrategy:
         self.ema_fast = 9                   # Fast EMA
         self.ema_slow = 21                  # Slow EMA
 
-        # RSI settings
+        # RSI settings - TIGHTENED for better win rate
         self.rsi_period = 14
-        self.rsi_long_min = 40              # Minimum RSI for LONG
-        self.rsi_long_max = 65              # Maximum RSI for LONG
-        self.rsi_short_min = 35             # Minimum RSI for SHORT
-        self.rsi_short_max = 60             # Maximum RSI for SHORT
+        self.rsi_long_min = 45              # Minimum RSI for LONG (was 40)
+        self.rsi_long_max = 60              # Maximum RSI for LONG (was 65)
+        self.rsi_short_min = 40             # Minimum RSI for SHORT (was 35)
+        self.rsi_short_max = 55             # Maximum RSI for SHORT (was 60)
 
         # MACD settings (standard 12, 26, 9)
         self.macd_fast = 12
         self.macd_slow = 26
         self.macd_signal = 9
 
+        # ADX settings for trend strength filter
+        self.adx_period = 14
+        self.adx_threshold = 20             # Minimum ADX for trending market
+
         # Cooldown - increased to reduce over-trading
         self.min_bars_between_signals = 16   # Wait 16 bars (4 hours on 15m) between signals
         self.last_signal_bar = -999
+
+        # STRENGTHENED: Require minimum confluence score
+        self.min_confluence_score = 4       # Require ALL 4 conditions for entry (was 3)
 
     def calculate_ema(self, series: pd.Series, period: int) -> pd.Series:
         """Calculate Exponential Moving Average"""
@@ -146,6 +153,38 @@ class HTFConfluenceStrategy:
         signal_line = macd_line.ewm(span=self.macd_signal, adjust=False).mean()
         histogram = macd_line - signal_line
         return macd_line, signal_line, histogram
+
+    def calculate_adx(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """
+        Calculate Average Directional Index (ADX) for trend strength.
+        ADX > 20 indicates trending market, ADX < 20 indicates ranging market.
+        """
+        high = df["high"]
+        low = df["low"]
+        close = df["close"]
+
+        # Calculate True Range
+        tr1 = high - low
+        tr2 = abs(high - close.shift(1))
+        tr3 = abs(low - close.shift(1))
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+        # Calculate +DM and -DM
+        plus_dm = high.diff()
+        minus_dm = -low.diff()
+        plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
+        minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
+
+        # Smooth TR, +DM, -DM
+        atr = tr.ewm(span=period, adjust=False).mean()
+        plus_di = 100 * (plus_dm.ewm(span=period, adjust=False).mean() / atr)
+        minus_di = 100 * (minus_dm.ewm(span=period, adjust=False).mean() / atr)
+
+        # Calculate DX and ADX
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+        adx = dx.ewm(span=period, adjust=False).mean()
+
+        return adx
 
     def calculate_indicators(self, df: pd.DataFrame) -> Dict:
         """
@@ -212,6 +251,21 @@ class HTFConfluenceStrategy:
         )
         indicators["macd_bullish"] = indicators["macd_histogram"] > 0
         indicators["macd_bearish"] = indicators["macd_histogram"] < 0
+
+        # STRENGTHENED: MACD momentum building (histogram increasing)
+        indicators["macd_momentum_bullish"] = (
+            indicators["macd_histogram"] > indicators["macd_histogram_prev"] and
+            indicators["macd_histogram"] > 0
+        )
+        indicators["macd_momentum_bearish"] = (
+            indicators["macd_histogram"] < indicators["macd_histogram_prev"] and
+            indicators["macd_histogram"] < 0
+        )
+
+        # ADX for trend strength
+        adx = self.calculate_adx(df, self.adx_period)
+        indicators["adx"] = adx.iloc[-1] if not pd.isna(adx.iloc[-1]) else 0.0
+        indicators["adx_trending"] = indicators["adx"] >= self.adx_threshold
 
         return indicators
 
@@ -292,65 +346,73 @@ class HTFConfluenceStrategy:
 
     def check_long_conditions(self, indicators: Dict, htf_trend: TrendDirection) -> Tuple[int, List[str]]:
         """
-        Check LONG entry conditions.
+        Check LONG entry conditions - STRENGTHENED for better win rate.
 
         Returns:
             (confluence_score, list of met conditions)
         """
         conditions_met = []
 
-        # Condition 1: HTF trend bullish
+        # Condition 1: HTF trend bullish + ADX trending (trend strength)
         if htf_trend == TrendDirection.BULLISH:
-            conditions_met.append("HTF: Price > 200 EMA (4H)")
+            adx = indicators.get("adx", 0)
+            if indicators.get("adx_trending", False):
+                conditions_met.append(f"HTF: Bullish + ADX {adx:.1f} (trending)")
+            else:
+                conditions_met.append(f"HTF: Bullish but ADX {adx:.1f} (weak trend)")
 
-        # Condition 2: EMA crossover or alignment
+        # Condition 2: EMA crossover ONLY (not just alignment) - STRICTER
         if indicators.get("ema_bullish_cross", False):
-            conditions_met.append("EMA: 9 crossed above 21 (bullish)")
-        elif indicators.get("ema_bullish", False):
-            conditions_met.append("EMA: 9 > 21 (bullish alignment)")
+            conditions_met.append("EMA: 9 crossed above 21 (fresh crossover)")
+        # Removed: elif ema_bullish alignment - too weak
 
-        # Condition 3: RSI in valid range
+        # Condition 3: RSI in valid range (tightened)
         rsi = indicators.get("rsi", 50)
         if self.rsi_long_min <= rsi <= self.rsi_long_max:
             conditions_met.append(f"RSI: {rsi:.1f} in range [{self.rsi_long_min}-{self.rsi_long_max}]")
 
-        # Condition 4: MACD bullish
+        # Condition 4: MACD bullish with momentum building - STRICTER
         if indicators.get("macd_bullish_cross", False):
-            conditions_met.append("MACD: Bullish crossover")
-        elif indicators.get("macd_bullish", False):
-            conditions_met.append("MACD: Histogram > 0 (bullish)")
+            conditions_met.append("MACD: Fresh bullish crossover")
+        elif indicators.get("macd_momentum_bullish", False):
+            conditions_met.append("MACD: Histogram > 0 & increasing (momentum)")
+        # Removed: elif just macd_bullish histogram > 0 - too weak
 
         return len(conditions_met), conditions_met
 
     def check_short_conditions(self, indicators: Dict, htf_trend: TrendDirection) -> Tuple[int, List[str]]:
         """
-        Check SHORT entry conditions.
+        Check SHORT entry conditions - STRENGTHENED for better win rate.
 
         Returns:
             (confluence_score, list of met conditions)
         """
         conditions_met = []
 
-        # Condition 1: HTF trend bearish
+        # Condition 1: HTF trend bearish + ADX trending (trend strength)
         if htf_trend == TrendDirection.BEARISH:
-            conditions_met.append("HTF: Price < 200 EMA (4H)")
+            adx = indicators.get("adx", 0)
+            if indicators.get("adx_trending", False):
+                conditions_met.append(f"HTF: Bearish + ADX {adx:.1f} (trending)")
+            else:
+                conditions_met.append(f"HTF: Bearish but ADX {adx:.1f} (weak trend)")
 
-        # Condition 2: EMA crossover or alignment
+        # Condition 2: EMA crossover ONLY (not just alignment) - STRICTER
         if indicators.get("ema_bearish_cross", False):
-            conditions_met.append("EMA: 9 crossed below 21 (bearish)")
-        elif indicators.get("ema_bearish", False):
-            conditions_met.append("EMA: 9 < 21 (bearish alignment)")
+            conditions_met.append("EMA: 9 crossed below 21 (fresh crossover)")
+        # Removed: elif ema_bearish alignment - too weak
 
-        # Condition 3: RSI in valid range
+        # Condition 3: RSI in valid range (tightened)
         rsi = indicators.get("rsi", 50)
         if self.rsi_short_min <= rsi <= self.rsi_short_max:
             conditions_met.append(f"RSI: {rsi:.1f} in range [{self.rsi_short_min}-{self.rsi_short_max}]")
 
-        # Condition 4: MACD bearish
+        # Condition 4: MACD bearish with momentum building - STRICTER
         if indicators.get("macd_bearish_cross", False):
-            conditions_met.append("MACD: Bearish crossover")
-        elif indicators.get("macd_bearish", False):
-            conditions_met.append("MACD: Histogram < 0 (bearish)")
+            conditions_met.append("MACD: Fresh bearish crossover")
+        elif indicators.get("macd_momentum_bearish", False):
+            conditions_met.append("MACD: Histogram < 0 & decreasing (momentum)")
+        # Removed: elif just macd_bearish histogram < 0 - too weak
 
         return len(conditions_met), conditions_met
 
@@ -439,7 +501,8 @@ class HTFConfluenceStrategy:
         if htf_trend == TrendDirection.BULLISH:
             long_score, long_conditions = self.check_long_conditions(indicators, htf_trend)
 
-            if long_score >= 3:  # Need at least 3/4 confluence for entry
+            # STRENGTHENED: Require min_confluence_score (default 4 = ALL conditions)
+            if long_score >= self.min_confluence_score:
                 strength = self.get_signal_strength(long_score)
                 confidence = min(0.95, 0.5 + long_score * 0.1)
                 stop_loss, take_profit = self.calculate_exit_levels(entry_price, "LONG")
@@ -465,7 +528,7 @@ class HTFConfluenceStrategy:
                     strength=SignalStrength.WEAK,
                     trend=htf_trend,
                     confluence_score=long_score,
-                    reason=f"LONG: Only {long_score}/4 conditions met",
+                    reason=f"LONG: Only {long_score}/{self.min_confluence_score} conditions met",
                     indicators=indicators,
                     entry_price=0.0,
                     stop_loss=0.0,
@@ -476,7 +539,8 @@ class HTFConfluenceStrategy:
         if htf_trend == TrendDirection.BEARISH:
             short_score, short_conditions = self.check_short_conditions(indicators, htf_trend)
 
-            if short_score >= 3:  # Need at least 3/4 confluence for entry
+            # STRENGTHENED: Require min_confluence_score (default 4 = ALL conditions)
+            if short_score >= self.min_confluence_score:
                 strength = self.get_signal_strength(short_score)
                 confidence = min(0.95, 0.5 + short_score * 0.1)
                 stop_loss, take_profit = self.calculate_exit_levels(entry_price, "SHORT")
@@ -502,7 +566,7 @@ class HTFConfluenceStrategy:
                     strength=SignalStrength.WEAK,
                     trend=htf_trend,
                     confluence_score=short_score,
-                    reason=f"SHORT: Only {short_score}/4 conditions met",
+                    reason=f"SHORT: Only {short_score}/{self.min_confluence_score} conditions met",
                     indicators=indicators,
                     entry_price=0.0,
                     stop_loss=0.0,
