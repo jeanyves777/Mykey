@@ -685,42 +685,44 @@ class HTFConfluenceLiveEngine:
             position = self.client.get_position(symbol, position_side)
 
             if not position or position["quantity"] == 0:
-                # Position closed - determine how
+                # Position closed - get actual realized PnL from API
                 entry_price = tracked["entry_price"]
-                tp_price = tracked["tp_price"]
-                sl_price = tracked["sl_price"]
 
-                # Get current price to estimate exit
-                price_data = self.client.get_current_price(symbol)
-                current_price = price_data["price"]
-
-                # Determine exit type based on price proximity
-                if position_side == "LONG":
-                    if current_price >= tp_price * 0.999:  # Within 0.1% of TP
-                        exit_type = "TP"
-                        pnl = tracked["quantity"] * (tp_price - entry_price)
+                # Query income history to get actual realized PnL
+                try:
+                    income_history = self.client.get_income_history(symbol=symbol, income_type="REALIZED_PNL", limit=5)
+                    if income_history:
+                        # Get the most recent realized PnL for this symbol
+                        pnl = float(income_history[0].get("income", 0))
                     else:
-                        exit_type = "SL"
-                        pnl = tracked["quantity"] * (sl_price - entry_price)
-                else:  # SHORT
-                    if current_price <= tp_price * 1.001:  # Within 0.1% of TP
-                        exit_type = "TP"
-                        pnl = tracked["quantity"] * (entry_price - tp_price)
-                    else:
-                        exit_type = "SL"
-                        pnl = tracked["quantity"] * (entry_price - sl_price)
+                        # Fallback: estimate from recent trades
+                        recent_trades = self.client.get_recent_trades(symbol, limit=5)
+                        if recent_trades:
+                            pnl = sum(float(t.get("realizedPnl", 0)) for t in recent_trades)
+                        else:
+                            pnl = 0
+                except Exception as e:
+                    logger.warning(f"[{symbol}] Could not get realized PnL: {e}")
+                    pnl = 0
 
-                # Update stats
-                roi = (pnl / (tracked["quantity"] * entry_price)) * self.leverage * 100
+                # Determine win/loss based on actual PnL (positive = win, negative = loss)
+                if pnl > 0:
+                    exit_type = "TP"
+                else:
+                    exit_type = "SL"
+
+                # Calculate ROI from actual PnL
+                margin = (tracked["quantity"] * entry_price) / self.leverage
+                roi = (pnl / margin) * 100 if margin > 0 else 0
 
                 if exit_type == "TP":
                     self.wins_today += 1
                     self.symbol_stats[symbol]["wins"] += 1
-                    logger.info(f"[{symbol}] Position closed - TP HIT! ROI: +{roi:.1f}%")
+                    logger.info(f"[{symbol}] Position closed - TP HIT! PnL: ${pnl:+.2f} | ROI: {roi:+.1f}%")
                 else:
                     self.losses_today += 1
                     self.symbol_stats[symbol]["losses"] += 1
-                    logger.info(f"[{symbol}] Position closed - SL HIT. ROI: {roi:.1f}%")
+                    logger.info(f"[{symbol}] Position closed - SL HIT. PnL: ${pnl:.2f} | ROI: {roi:.1f}%")
 
                 self.pnl_today += pnl
                 self.symbol_stats[symbol]["pnl"] += pnl
@@ -846,7 +848,14 @@ class HTFConfluenceLiveEngine:
                         else:
                             logger.warning(f"[{symbol}] Failed to open position")
                     else:
-                        logger.debug(f"[{symbol}] Signal too weak: {signal.confluence_score}/4")
+                        # Show signal status when not strong enough
+                        trend_str = signal.trend.value if hasattr(signal, 'trend') else "?"
+                        logger.info(f"[{symbol}] Watching | Trend: {trend_str} | Signal: {signal.action} ({signal.confluence_score}/4) - waiting for stronger confluence")
+                else:
+                    # No signal - show what we're looking for
+                    if signal:
+                        trend_str = signal.trend.value if hasattr(signal, 'trend') else "NEUTRAL"
+                        logger.info(f"[{symbol}] Watching | Trend: {trend_str} | No entry signal")
 
             except Exception as e:
                 logger.error(f"[{symbol}] Cycle error: {e}")
