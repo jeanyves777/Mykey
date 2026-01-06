@@ -33,6 +33,8 @@ from engine.binance_client import BinanceClient
 from strategies.htf_confluence_strategy import (
     HTFConfluenceStrategy,
     MODERATE_CONFIG,
+    ASSET_SPECIFIC_CONFIG,
+    get_config_for_symbol,
     TrendDirection,
     SignalStrength
 )
@@ -77,24 +79,31 @@ class HTFConfluenceLiveEngine:
             total_capital: Total capital to use (None = use account balance)
             risk_per_trade: Risk per trade as fraction (default: 2%)
         """
-        self.symbols = symbols or ["DOTUSDT", "BNBUSDT"]
-        self.config = config or MODERATE_CONFIG
+        self.symbols = symbols or ["DOTUSDT", "BNBUSDT", "AVAXUSDT"]
+        self.default_config = config or MODERATE_CONFIG
         self.testnet = testnet
         self.total_capital = total_capital
         self.risk_per_trade = risk_per_trade
 
-        # Extract config values
-        self.leverage = self.config["leverage"]
-        self.tp_roi = self.config["tp_roi"]
-        self.sl_roi = self.config["sl_roi"]
+        # Use ASSET-SPECIFIC configs for each symbol
+        # Each symbol gets its own optimized TP/SL settings based on backtest results
+        self.symbol_configs = {}
+        for symbol in self.symbols:
+            self.symbol_configs[symbol] = get_config_for_symbol(symbol)
+
+        # Extract default config values (for display purposes)
+        self.leverage = self.default_config["leverage"]
+        self.tp_roi = self.default_config["tp_roi"]
+        self.sl_roi = self.default_config["sl_roi"]
 
         # Initialize Binance client
         self.client = BinanceClient(testnet=testnet, use_demo=testnet)
 
-        # Initialize strategy for each symbol
+        # Initialize strategy for each symbol with ASSET-SPECIFIC config
         self.strategies = {}
         for symbol in self.symbols:
-            self.strategies[symbol] = HTFConfluenceStrategy(**self.config)
+            sym_config = self.symbol_configs[symbol]
+            self.strategies[symbol] = HTFConfluenceStrategy(**sym_config)
 
         # Position tracking
         self.positions = {}  # symbol -> position info
@@ -121,9 +130,17 @@ class HTFConfluenceLiveEngine:
         logger.info(f"Symbols: {', '.join(self.symbols)}")
         logger.info(f"Mode: {'DEMO/TESTNET' if testnet else 'LIVE MAINNET'}")
         logger.info(f"Leverage: {self.leverage}x")
-        logger.info(f"TP ROI: {self.tp_roi * 100:.0f}% | SL ROI: {self.sl_roi * 100:.0f}%")
-        logger.info(f"R:R Ratio: {self.tp_roi / self.sl_roi:.1f}:1")
         logger.info(f"Risk per trade: {self.risk_per_trade * 100:.0f}%")
+        logger.info("-" * 60)
+        logger.info("ASSET-SPECIFIC OPTIMIZED SETTINGS:")
+        for symbol in self.symbols:
+            cfg = self.symbol_configs[symbol]
+            tp = cfg["tp_roi"] * 100
+            sl = cfg["sl_roi"] * 100
+            rr = cfg["tp_roi"] / cfg["sl_roi"]
+            tp_price = cfg["tp_roi"] / cfg["leverage"] * 100
+            sl_price = cfg["sl_roi"] / cfg["leverage"] * 100
+            logger.info(f"  {symbol}: TP {tp:.0f}% / SL {sl:.0f}% ROI ({rr:.1f}:1 R:R) | Price: TP {tp_price:.2f}% / SL {sl_price:.2f}%")
         logger.info("=" * 60)
 
     def _load_stats(self):
@@ -581,12 +598,13 @@ class HTFConfluenceLiveEngine:
 
             logger.info(f"[{symbol}] Position opened: {position_side} {actual_qty} @ ${actual_entry:,.4f}")
 
-            # Calculate TP and SL prices
+            # Calculate TP and SL prices using ASSET-SPECIFIC config
             strategy = self.strategies[symbol]
+            sym_config = self.symbol_configs[symbol]
             sl_price, tp_price = strategy.calculate_exit_levels(actual_entry, position_side)
 
-            logger.info(f"[{symbol}] TP: ${tp_price:,.4f} ({self.tp_roi*100:.0f}% ROI)")
-            logger.info(f"[{symbol}] SL: ${sl_price:,.4f} ({self.sl_roi*100:.0f}% ROI)")
+            logger.info(f"[{symbol}] TP: ${tp_price:,.4f} ({sym_config['tp_roi']*100:.0f}% ROI)")
+            logger.info(f"[{symbol}] SL: ${sl_price:,.4f} ({sym_config['sl_roi']*100:.0f}% ROI)")
 
             # Place TP order
             close_side = "SELL" if position_side == "LONG" else "BUY"
@@ -956,7 +974,10 @@ def main():
         print("You are about to trade with REAL MONEY!")
         print(f"Symbols: {', '.join(args.symbols)}")
         print(f"Leverage: {engine.leverage}x")
-        print(f"TP: {engine.tp_roi*100:.0f}% ROI | SL: {engine.sl_roi*100:.0f}% ROI")
+        print("Asset-specific TP/SL settings:")
+        for symbol in engine.symbols:
+            cfg = engine.symbol_configs[symbol]
+            print(f"  {symbol}: TP {cfg['tp_roi']*100:.0f}% / SL {cfg['sl_roi']*100:.0f}% ROI")
         print("=" * 60)
 
         confirm = input("\nType 'CONFIRM' to start live trading: ")

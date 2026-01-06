@@ -692,6 +692,145 @@ def compare_configs():
     print("="*100)
 
 
+def optimize_asset_settings(symbols: list = None, days: int = 60, leverage: int = 20):
+    """
+    Find optimal SL/TP settings for each asset.
+    Tests multiple combinations and finds the best performing one per symbol.
+    """
+    if symbols is None:
+        symbols = ["DOTUSDT", "BNBUSDT", "AVAXUSDT"]
+
+    # SL/TP combinations to test (ROI values)
+    # Format: (tp_roi, sl_roi, name)
+    configs_to_test = [
+        # Tight SL (current - too tight for volatile coins)
+        (0.20, 0.10, "20TP/10SL"),  # 2:1 R:R
+        (0.30, 0.10, "30TP/10SL"),  # 3:1 R:R (current MODERATE)
+        (0.40, 0.10, "40TP/10SL"),  # 4:1 R:R
+
+        # Medium SL (better for volatile coins like DOT)
+        (0.20, 0.15, "20TP/15SL"),  # 1.3:1 R:R - higher win rate
+        (0.30, 0.15, "30TP/15SL"),  # 2:1 R:R
+        (0.40, 0.15, "40TP/15SL"),  # 2.7:1 R:R
+        (0.50, 0.15, "50TP/15SL"),  # 3.3:1 R:R
+
+        # Wide SL (for very volatile coins)
+        (0.30, 0.20, "30TP/20SL"),  # 1.5:1 R:R - highest win rate
+        (0.40, 0.20, "40TP/20SL"),  # 2:1 R:R
+        (0.50, 0.20, "50TP/20SL"),  # 2.5:1 R:R
+        (0.60, 0.20, "60TP/20SL"),  # 3:1 R:R
+
+        # Scalping (tight TP, wider SL)
+        (0.15, 0.15, "15TP/15SL"),  # 1:1 R:R - scalping
+        (0.20, 0.20, "20TP/20SL"),  # 1:1 R:R - balanced
+    ]
+
+    print("="*120)
+    print(f"ASSET-SPECIFIC SL/TP OPTIMIZATION - {days} DAYS")
+    print("="*120)
+    print(f"Testing {len(configs_to_test)} different SL/TP combinations per asset")
+    print(f"Leverage: {leverage}x")
+    print("="*120)
+
+    # Store best config per symbol
+    best_configs = {}
+    all_optimization_results = {}
+
+    for symbol in symbols:
+        print(f"\n{'='*100}")
+        print(f"OPTIMIZING: {symbol}")
+        print(f"{'='*100}")
+
+        symbol_results = []
+
+        # First, fetch data once for this symbol
+        temp_config = {"leverage": leverage, "tp_roi": 0.30, "sl_roi": 0.10}
+        temp_backtester = HTFConfluenceBacktester(symbol, start_balance=100.0, config=temp_config)
+        ltf_df, htf_df = temp_backtester.get_historical_data(days=days, ltf_interval="15m")
+
+        if ltf_df is None or htf_df is None:
+            print(f"ERROR: Could not fetch data for {symbol}")
+            continue
+
+        # Test each config
+        for tp_roi, sl_roi, config_name in configs_to_test:
+            config = {"leverage": leverage, "tp_roi": tp_roi, "sl_roi": sl_roi}
+
+            # Create backtester with this config
+            backtester = HTFConfluenceBacktester(symbol, start_balance=100.0, config=config)
+
+            # Silence individual trade output for optimization
+            import io
+            import sys
+            old_stdout = sys.stdout
+            sys.stdout = io.StringIO()
+
+            try:
+                result = backtester.run_backtest(ltf_df.copy(), htf_df.copy())
+            finally:
+                sys.stdout = old_stdout
+
+            # Store result
+            symbol_results.append({
+                "config_name": config_name,
+                "tp_roi": tp_roi,
+                "sl_roi": sl_roi,
+                "return_pct": result["return_pct"],
+                "win_rate": result["win_rate"],
+                "total_trades": result["total_trades"],
+                "max_drawdown": result["max_drawdown"],
+                "pnl": result["total_pnl"],
+                "profit_per_trade": result["total_pnl"] / result["total_trades"] if result["total_trades"] > 0 else 0
+            })
+
+        # Sort by return (primary) and win rate (secondary)
+        symbol_results.sort(key=lambda x: (x["return_pct"], x["win_rate"]), reverse=True)
+
+        all_optimization_results[symbol] = symbol_results
+
+        # Print results for this symbol
+        print(f"\n{'Config':<15} {'TP%':>6} {'SL%':>6} {'Return':>10} {'Win%':>8} {'Trades':>8} {'MaxDD':>8} {'$/Trade':>10}")
+        print("-"*85)
+
+        for r in symbol_results:
+            # Highlight best config
+            marker = " <<<" if r == symbol_results[0] else ""
+            print(f"{r['config_name']:<15} {r['tp_roi']*100:>5.0f}% {r['sl_roi']*100:>5.0f}% {r['return_pct']:>+9.1f}% {r['win_rate']:>7.1f}% {r['total_trades']:>7} {r['max_drawdown']:>7.1f}% ${r['profit_per_trade']:>+8.2f}{marker}")
+
+        # Store best config
+        best = symbol_results[0]
+        best_configs[symbol] = {
+            "tp_roi": best["tp_roi"],
+            "sl_roi": best["sl_roi"],
+            "expected_return": best["return_pct"],
+            "expected_winrate": best["win_rate"]
+        }
+
+    # Print final summary with recommended settings
+    print("\n" + "="*120)
+    print("OPTIMIZATION SUMMARY - RECOMMENDED ASSET-SPECIFIC SETTINGS")
+    print("="*120)
+    print(f"{'Symbol':<12} {'Best Config':<15} {'TP ROI':>8} {'SL ROI':>8} {'Price Move':>12} {'Return':>10} {'Win%':>8}")
+    print("-"*85)
+
+    for symbol, config in best_configs.items():
+        tp_price_move = config["tp_roi"] / leverage * 100
+        sl_price_move = config["sl_roi"] / leverage * 100
+        config_name = f"{int(config['tp_roi']*100)}TP/{int(config['sl_roi']*100)}SL"
+        print(f"{symbol:<12} {config_name:<15} {config['tp_roi']*100:>7.0f}% {config['sl_roi']*100:>7.0f}% TP:{tp_price_move:.2f}%/SL:{sl_price_move:.2f}% {config['expected_return']:>+9.1f}% {config['expected_winrate']:>7.1f}%")
+
+    print("\n" + "="*120)
+    print("PYTHON CONFIG TO USE:")
+    print("="*120)
+    print("ASSET_SPECIFIC_CONFIG = {")
+    for symbol, config in best_configs.items():
+        print(f'    "{symbol}": {{"leverage": {leverage}, "tp_roi": {config["tp_roi"]}, "sl_roi": {config["sl_roi"]}}},')
+    print("}")
+    print("="*120)
+
+    return best_configs, all_optimization_results
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -705,15 +844,25 @@ if __name__ == "__main__":
                         help="LTF interval for entry signals")
     parser.add_argument("--compare", action="store_true",
                         help="Compare all risk profiles")
+    parser.add_argument("--optimize", action="store_true",
+                        help="Find optimal SL/TP settings for each asset")
     parser.add_argument("--balance", type=float, default=100.0,
                         help="Starting balance (total if --shared is used)")
     parser.add_argument("--shared", action="store_true",
                         help="Split balance equally among symbols (shared capital)")
+    parser.add_argument("--leverage", type=int, default=20,
+                        help="Leverage to use (default: 20)")
 
     args = parser.parse_args()
 
     if args.compare:
         compare_configs()
+    elif args.optimize:
+        optimize_asset_settings(
+            symbols=args.symbols,
+            days=args.days,
+            leverage=args.leverage
+        )
     else:
         config_map = {
             "conservative": CONSERVATIVE_CONFIG,

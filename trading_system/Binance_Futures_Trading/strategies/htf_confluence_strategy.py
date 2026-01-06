@@ -576,6 +576,47 @@ SWING_CONFIG = {
     "sl_roi": 0.20,     # 20% ROI (SL) = 1% price move | 5:1 R:R
 }
 
+# =============================================================================
+# ASSET-SPECIFIC OPTIMIZED CONFIGS (from 60-day backtest optimization)
+# =============================================================================
+# Each asset has different volatility characteristics:
+# - DOT: More volatile, needs wider SL (15% ROI = 0.75% price move)
+# - BNB: Less volatile, tight SL works (10% ROI = 0.5% price move)
+# - AVAX: Trending well, tight SL works (10% ROI = 0.5% price move)
+#
+# Optimization results (60-day backtest):
+# - DOTUSDT: 50TP/15SL → +210% return, 33% win rate
+# - BNBUSDT: 40TP/10SL → +59% return, 25% win rate
+# - AVAXUSDT: 40TP/10SL → +183% return, 28% win rate
+# =============================================================================
+ASSET_SPECIFIC_CONFIG = {
+    "DOTUSDT": {
+        "leverage": 20,
+        "tp_roi": 0.50,     # 50% ROI (TP) = 2.5% price move
+        "sl_roi": 0.15,     # 15% ROI (SL) = 0.75% price move | 3.3:1 R:R
+        # Wider SL avoids getting stopped on normal pullbacks
+    },
+    "BNBUSDT": {
+        "leverage": 20,
+        "tp_roi": 0.40,     # 40% ROI (TP) = 2% price move
+        "sl_roi": 0.10,     # 10% ROI (SL) = 0.5% price move | 4:1 R:R
+        # Tight SL works for less volatile BNB
+    },
+    "AVAXUSDT": {
+        "leverage": 20,
+        "tp_roi": 0.40,     # 40% ROI (TP) = 2% price move
+        "sl_roi": 0.10,     # 10% ROI (SL) = 0.5% price move | 4:1 R:R
+        # Strong trending, tight SL works
+    },
+}
+
+def get_config_for_symbol(symbol: str) -> dict:
+    """
+    Get the optimized config for a specific symbol.
+    Falls back to MODERATE_CONFIG if symbol not in asset-specific configs.
+    """
+    return ASSET_SPECIFIC_CONFIG.get(symbol, MODERATE_CONFIG)
+
 
 # =============================================================================
 # Test
