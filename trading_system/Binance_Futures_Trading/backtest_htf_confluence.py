@@ -119,8 +119,7 @@ class HTFConfluenceBacktester:
         Returns:
             (ltf_df, htf_df) DataFrames
         """
-        print(f"
-Fetching {days} days of data for {self.symbol}...")
+        print(f"Fetching {days} days of data for {self.symbol}...")
         print("Using Binance Futures API for historical data...")
 
         def fetch_binance_futures_klines(symbol, interval, num_days):
