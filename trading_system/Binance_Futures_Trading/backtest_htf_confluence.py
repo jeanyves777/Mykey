@@ -21,7 +21,6 @@ import numpy as np
 import csv
 import time
 import requests
-import yfinance as yf
 from datetime import datetime, timedelta
 from strategies.htf_confluence_strategy import (
     HTFConfluenceStrategy,
