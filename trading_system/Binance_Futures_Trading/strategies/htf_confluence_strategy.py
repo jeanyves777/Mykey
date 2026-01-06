@@ -102,12 +102,12 @@ class HTFConfluenceStrategy:
         self.ema_fast = 9                   # Fast EMA
         self.ema_slow = 21                  # Slow EMA
 
-        # RSI settings - TIGHTENED for better win rate
+        # RSI settings - Original values (tighter RSI range was not better in backtest)
         self.rsi_period = 14
-        self.rsi_long_min = 45              # Minimum RSI for LONG (was 40)
-        self.rsi_long_max = 60              # Maximum RSI for LONG (was 65)
-        self.rsi_short_min = 40             # Minimum RSI for SHORT (was 35)
-        self.rsi_short_max = 55             # Maximum RSI for SHORT (was 60)
+        self.rsi_long_min = 40              # Minimum RSI for LONG
+        self.rsi_long_max = 65              # Maximum RSI for LONG
+        self.rsi_short_min = 35             # Minimum RSI for SHORT
+        self.rsi_short_max = 60             # Maximum RSI for SHORT
 
         # MACD settings (standard 12, 26, 9)
         self.macd_fast = 12
