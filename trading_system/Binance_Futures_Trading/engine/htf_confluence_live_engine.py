@@ -1424,8 +1424,7 @@ class HTFConfluenceLiveEngine:
             result = self.client.place_market_order(
                 symbol=symbol,
                 side=close_side,
-                quantity=pos["quantity"],
-                reduce_only=True
+                quantity=pos["quantity"]
             )
 
             if result:
@@ -1623,8 +1622,7 @@ class HTFConfluenceLiveEngine:
             result = self.client.place_market_order(
                 symbol=symbol,
                 side=close_side,
-                quantity=pos["quantity"],
-                reduce_only=True
+                quantity=pos["quantity"]
             )
 
             if result:
@@ -1734,8 +1732,7 @@ class HTFConfluenceLiveEngine:
                 result = self.client.place_market_order(
                     symbol=symbol,
                     side=close_side,
-                    quantity=pos["quantity"],
-                    reduce_only=True
+                    quantity=pos["quantity"]
                 )
 
                 if result:
