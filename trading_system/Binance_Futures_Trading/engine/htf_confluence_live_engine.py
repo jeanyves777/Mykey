@@ -1417,16 +1417,15 @@ class HTFConfluenceLiveEngine:
             # Close the position to lock profit!
             logger.info(f"[{symbol}] PROFIT LOCK triggered at {roi:+.1f}% ROI - Trend reversed!")
 
-            # Close position
+            # Close position using proper client method
             position_side = pos["side"]
             close_side = "SELL" if position_side == "LONG" else "BUY"
 
-            result = self.client.client.futures_create_order(
+            result = self.client.place_market_order(
                 symbol=symbol,
                 side=close_side,
-                type="MARKET",
                 quantity=pos["quantity"],
-                reduceOnly=True
+                reduce_only=True
             )
 
             if result:
@@ -1567,48 +1566,32 @@ class HTFConfluenceLiveEngine:
         try:
             pos = self.positions[symbol]
 
-            # Cancel existing SL order
+            # Cancel existing orders
             self.client.cancel_all_orders(symbol)
 
-            # Place new SL at breakeven
+            # Determine sides
             if pos["side"] == "LONG":
-                sl_order = self.client.client.futures_create_order(
-                    symbol=symbol,
-                    side="SELL",
-                    type="STOP_MARKET",
-                    stopPrice=round(breakeven_price, self._get_price_precision(symbol)),
-                    quantity=pos["quantity"],
-                    reduceOnly=True
-                )
+                sl_side = "SELL"
+                tp_side = "SELL"
             else:
-                sl_order = self.client.client.futures_create_order(
-                    symbol=symbol,
-                    side="BUY",
-                    type="STOP_MARKET",
-                    stopPrice=round(breakeven_price, self._get_price_precision(symbol)),
-                    quantity=pos["quantity"],
-                    reduceOnly=True
-                )
+                sl_side = "BUY"
+                tp_side = "BUY"
+
+            # Place new SL at breakeven using the proper client method
+            sl_order = self.client.place_stop_loss(
+                symbol=symbol,
+                side=sl_side,
+                quantity=pos["quantity"],
+                stop_price=breakeven_price
+            )
 
             # Also place TP order again
-            if pos["side"] == "LONG":
-                tp_order = self.client.client.futures_create_order(
-                    symbol=symbol,
-                    side="SELL",
-                    type="TAKE_PROFIT_MARKET",
-                    stopPrice=round(pos["tp_price"], self._get_price_precision(symbol)),
-                    quantity=pos["quantity"],
-                    reduceOnly=True
-                )
-            else:
-                tp_order = self.client.client.futures_create_order(
-                    symbol=symbol,
-                    side="BUY",
-                    type="TAKE_PROFIT_MARKET",
-                    stopPrice=round(pos["tp_price"], self._get_price_precision(symbol)),
-                    quantity=pos["quantity"],
-                    reduceOnly=True
-                )
+            tp_order = self.client.place_take_profit(
+                symbol=symbol,
+                side=tp_side,
+                quantity=pos["quantity"],
+                take_profit_price=pos["tp_price"]
+            )
 
             # Update tracked position
             pos["sl_price"] = breakeven_price
@@ -1636,13 +1619,12 @@ class HTFConfluenceLiveEngine:
             pos = self.positions[symbol]
             close_side = "SELL" if pos["side"] == "LONG" else "BUY"
 
-            # Close position
-            result = self.client.client.futures_create_order(
+            # Close position using proper client method
+            result = self.client.place_market_order(
                 symbol=symbol,
                 side=close_side,
-                type="MARKET",
                 quantity=pos["quantity"],
-                reduceOnly=True
+                reduce_only=True
             )
 
             if result:
@@ -1748,13 +1730,12 @@ class HTFConfluenceLiveEngine:
                 pos = self.positions[symbol]
                 close_side = "SELL" if pos["side"] == "LONG" else "BUY"
 
-                # Close position
-                result = self.client.client.futures_create_order(
+                # Close position using proper client method
+                result = self.client.place_market_order(
                     symbol=symbol,
                     side=close_side,
-                    type="MARKET",
                     quantity=pos["quantity"],
-                    reduceOnly=True
+                    reduce_only=True
                 )
 
                 if result:
