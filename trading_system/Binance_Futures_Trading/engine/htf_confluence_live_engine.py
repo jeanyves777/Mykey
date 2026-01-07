@@ -623,9 +623,53 @@ class HTFConfluenceLiveEngine:
                                 self.symbol_stats[symbol] = saved_stats[symbol]
                         logger.info(f"Loaded session stats: {self.wins_today}W/{self.losses_today}L, PnL: ${self.pnl_today:+.2f}")
                     else:
-                        logger.info("Stats file is from a previous day, starting fresh")
+                        logger.info("Stats file is from a previous day, syncing from Binance...")
+                        self._sync_stats_from_binance()
+            else:
+                logger.info("No stats file, syncing from Binance...")
+                self._sync_stats_from_binance()
         except Exception as e:
             logger.warning(f"Could not load stats: {e}")
+
+    def _sync_stats_from_binance(self):
+        """Sync today's stats from Binance income history."""
+        try:
+            # Get today's start timestamp
+            today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            start_time = int(today_start.timestamp() * 1000)
+
+            # Get income history for today
+            income = self.client.get_income_history(income_type="REALIZED_PNL", limit=100, start_time=start_time)
+
+            if not income:
+                logger.info("No income history for today")
+                return
+
+            # Count wins and losses from income history
+            for record in income:
+                symbol = record.get("symbol", "")
+                pnl = float(record.get("income", 0))
+
+                if symbol not in self.symbols:
+                    continue
+
+                self.trades_today += 1
+                self.pnl_today += pnl
+
+                if pnl > 0:
+                    self.wins_today += 1
+                    self.symbol_stats[symbol]["wins"] += 1
+                else:
+                    self.losses_today += 1
+                    self.symbol_stats[symbol]["losses"] += 1
+
+                self.symbol_stats[symbol]["pnl"] += pnl
+
+            logger.info(f"Synced from Binance: {self.wins_today}W/{self.losses_today}L, PnL: ${self.pnl_today:+.2f}")
+            self._save_stats()
+
+        except Exception as e:
+            logger.warning(f"Could not sync stats from Binance: {e}")
 
     def _save_stats(self):
         """Save session stats to file."""
