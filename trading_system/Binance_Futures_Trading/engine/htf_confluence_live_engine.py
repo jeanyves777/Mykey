@@ -1615,11 +1615,11 @@ class HTFConfluenceLiveEngine:
             # Case 2 & 3: Small profit exit or cut loss early
             if cycles_reversed >= self.reversal_cycle_threshold and confirmations <= 1:
                 if 0 <= roi < self.small_profit_exit_roi:
-                    logger.info(f"[{symbol}] 💰 SMALL PROFIT EXIT: ROI +{roi:.1f}%, confirms {confirmations}/4, reversed {cycles_reversed} cycles")
+                    logger.info(f"[{symbol}] 💰 SMALL PROFIT EXIT: ROI +{roi:.1f}%, confirms {confirmations}/6, reversed {cycles_reversed} cycles")
                     self._close_position_early(symbol, "SMALL_PROFIT_EXIT", roi)
                     return "SMALL_PROFIT_EXIT"
                 elif -10 <= roi < 0:
-                    logger.info(f"[{symbol}] ✂️ CUT LOSS EARLY: ROI {roi:.1f}%, confirms {confirmations}/4, reversed {cycles_reversed} cycles")
+                    logger.info(f"[{symbol}] ✂️ CUT LOSS EARLY: ROI {roi:.1f}%, confirms {confirmations}/6, reversed {cycles_reversed} cycles")
                     self._close_position_early(symbol, "CUT_LOSS_EARLY", roi)
                     return "CUT_LOSS_EARLY"
 
@@ -1986,7 +1986,7 @@ class HTFConfluenceLiveEngine:
                 if signal:
                     trend_str = signal.trend.value if hasattr(signal, 'trend') else "?"
                     if signal.action:
-                        logger.info(f"[{symbol}] Signal: {signal.action} | Trend: {trend_str} | Score: {signal.confluence_score}/4")
+                        logger.info(f"[{symbol}] Signal: {signal.action} | Trend: {trend_str} | Score: {signal.confluence_score}/6")
                         if signal.confluence_score < 3:
                             logger.info(f"[{symbol}] Waiting for stronger confluence (need 3+)")
                     else:
@@ -2305,11 +2305,11 @@ class HTFConfluenceLiveEngine:
                                     fakeout_status = "🛡️ Will move SL to breakeven"
                                 elif confirmations <= 1:
                                     if roi >= 0:
-                                        fakeout_status = f"⚠️ SMALL PROFIT EXIT (confirms {confirmations}/4)"
+                                        fakeout_status = f"⚠️ SMALL PROFIT EXIT (confirms {confirmations}/6)"
                                     else:
-                                        fakeout_status = f"⚠️ CUT LOSS EARLY (confirms {confirmations}/4)"
+                                        fakeout_status = f"⚠️ CUT LOSS EARLY (confirms {confirmations}/6)"
                                 else:
-                                    fakeout_status = f"👀 Monitoring (confirms {confirmations}/4)"
+                                    fakeout_status = f"👀 Monitoring (confirms {confirmations}/6)"
 
                                 # Check fakeout protection (pass both trends)
                                 fakeout_action = self.check_fakeout_protection(symbol, roi, htf_trend, ltf_trend, confirmations)
@@ -2335,8 +2335,8 @@ class HTFConfluenceLiveEngine:
                             logger.info(f"│ Margin: ${margin:.2f} | Position: ${position_value:.2f}")
                             logger.info(f"│ To TP: {to_tp_price:.3f}% ({to_tp_roi:+.1f}% ROI) | To SL: {to_sl_price:.3f}% ({to_sl_roi:.1f}% ROI)")
                             logger.info(f"│ ── TREND CHECK ──")
-                            logger.info(f"│ Entry: {original_trend} | 15m: {htf_trend} | 5m: {ltf_trend} {trend_match}")
-                            logger.info(f"│ 5m RSI: {rsi:.1f} | MACD: {macd_trend} | Confirms: {confirmations}/4")
+                            logger.info(f"│ Entry: {original_trend} | 1H: {htf_trend} | 15m: {ltf_trend} {trend_match}")
+                            logger.info(f"│ 15m RSI: {rsi:.1f} | MACD: {macd_trend} | Confirms: {confirmations}/6")
                             logger.info(f"│ Trailing: {trailing_status}")
                             logger.info(f"│ Profit Lock: {lock_status}")
                             logger.info(f"│ Fakeout: {fakeout_status}")
@@ -2359,7 +2359,7 @@ class HTFConfluenceLiveEngine:
                 if signal and signal.action:
                     # We have a signal - check if strong enough
                     if signal.confluence_score >= 3:
-                        logger.info(f"[{symbol}] SIGNAL: {signal.action} (Score: {signal.confluence_score}/4)")
+                        logger.info(f"[{symbol}] SIGNAL: {signal.action} (Score: {signal.confluence_score}/6)")
 
                         # Apply SMART ENTRY FILTERS before opening
                         filters_passed, filter_reason = self.check_smart_entry_filters(symbol, signal)
@@ -2405,7 +2405,7 @@ class HTFConfluenceLiveEngine:
                     else:
                         # Show signal status when not strong enough
                         trend_str = signal.trend.value if hasattr(signal, 'trend') else "?"
-                        logger.info(f"[{symbol}] Watching | Trend: {trend_str} | Signal: {signal.action} ({signal.confluence_score}/4) - waiting for stronger confluence")
+                        logger.info(f"[{symbol}] Watching | Trend: {trend_str} | Signal: {signal.action} ({signal.confluence_score}/6) - waiting for stronger confluence")
 
                         # LOG WEAK SIGNAL FOR ML (confluence too low)
                         self.ml_logger.log_signal(
@@ -2417,7 +2417,7 @@ class HTFConfluenceLiveEngine:
                             filters_passed=False,
                             filter_reason="N/A",
                             trade_executed=False,
-                            skip_reason=f"Low confluence ({signal.confluence_score}/4)"
+                            skip_reason=f"Low confluence ({signal.confluence_score}/6)"
                         )
                 else:
                     # No signal - diagnostics already shown by analyze_symbol(verbose=True)
