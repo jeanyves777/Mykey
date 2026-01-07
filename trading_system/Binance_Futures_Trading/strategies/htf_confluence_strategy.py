@@ -134,8 +134,8 @@ class HTFConfluenceStrategy:
         self.atr_spike_threshold = 1.5      # ATR > 1.5x average = spiking (choppy)
         self.atr_avg_period = 20            # Period to calculate average ATR
 
-        # Cooldown - reduced for day trading (5m bars)
-        self.min_bars_between_signals = 6   # Wait 6 bars (30 min on 5m) between signals
+        # Cooldown - DISABLED (trade whenever signal appears)
+        self.min_bars_between_signals = 0   # No cooldown
         self.last_signal_bar = -999
 
         # Minimum confluence score (keep 3 but with stricter individual conditions)

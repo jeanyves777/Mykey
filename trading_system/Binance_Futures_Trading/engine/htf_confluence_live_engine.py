@@ -534,6 +534,10 @@ class HTFConfluenceLiveEngine:
         self.min_adx = 20                  # Min ADX for trending market
         self.pullback_tolerance = 0.003    # 0.3% tolerance from 21 EMA
 
+        # SMART PROFIT LOCK - Close early if trend reverses while in profit
+        self.use_profit_lock = True        # Enable smart profit lock
+        self.profit_lock_min_roi = 30.0    # Minimum ROI% to consider profit lock (30%)
+
         logger.info("=" * 60)
         logger.info("HTF CONFLUENCE LIVE TRADING ENGINE")
         logger.info("=" * 60)
@@ -557,6 +561,10 @@ class HTFConfluenceLiveEngine:
         logger.info(f"  Candle Confirmation: {'ON' if self.use_candle_confirm else 'OFF'}")
         logger.info(f"  ATR Volatility Filter: {'ON' if self.use_atr_filter else 'OFF'} (max: {self.max_atr_pct}%)")
         logger.info(f"  ADX Trend Filter: {'ON' if self.use_adx_filter else 'OFF'} (min: {self.min_adx})")
+        logger.info("-" * 60)
+        logger.info("SMART PROFIT LOCK:")
+        logger.info(f"  Profit Lock: {'ON' if self.use_profit_lock else 'OFF'} (min ROI: {self.profit_lock_min_roi}%)")
+        logger.info(f"  Action: Close position if ROI >= {self.profit_lock_min_roi}% AND HTF trend reverses")
         logger.info("=" * 60)
 
     def _load_stats(self):
@@ -1318,6 +1326,130 @@ class HTFConfluenceLiveEngine:
             traceback.print_exc()
             return False
 
+    def check_profit_lock(self, symbol: str) -> bool:
+        """
+        Check if we should lock profit by closing early.
+
+        Conditions:
+        1. Position is at 30%+ ROI profit
+        2. HTF trend has reversed (EMA crossover against position)
+
+        Returns:
+            True if position was closed to lock profit
+        """
+        if not self.use_profit_lock:
+            return False
+
+        if symbol not in self.positions:
+            return False
+
+        try:
+            pos = self.positions[symbol]
+
+            # Get current price
+            price_data = self.client.get_current_price(symbol)
+            current_price = price_data["price"]
+            entry = pos["entry_price"]
+
+            # Calculate current ROI
+            if pos["side"] == "LONG":
+                price_move = (current_price - entry) / entry * 100
+            else:
+                price_move = (entry - current_price) / entry * 100
+            roi = price_move * self.leverage
+
+            # Check if we're at minimum profit level
+            if roi < self.profit_lock_min_roi:
+                return False
+
+            # Get HTF data to check trend
+            _, htf_df = self.get_market_data(symbol)
+            if htf_df is None or len(htf_df) < 50:
+                return False
+
+            # Calculate HTF EMAs
+            htf_close = htf_df['close']
+            htf_ema21 = htf_close.ewm(span=21, adjust=False).mean().iloc[-1]
+            htf_ema50 = htf_close.ewm(span=50, adjust=False).mean().iloc[-1]
+
+            # Check for trend reversal
+            trend_reversed = False
+            if pos["side"] == "LONG" and htf_ema21 < htf_ema50:
+                # LONG but HTF EMAs crossed bearish
+                trend_reversed = True
+            elif pos["side"] == "SHORT" and htf_ema21 > htf_ema50:
+                # SHORT but HTF EMAs crossed bullish
+                trend_reversed = True
+
+            if not trend_reversed:
+                return False
+
+            # Close the position to lock profit!
+            logger.info(f"[{symbol}] PROFIT LOCK triggered at {roi:+.1f}% ROI - Trend reversed!")
+
+            # Close position
+            position_side = pos["side"]
+            close_side = "SELL" if position_side == "LONG" else "BUY"
+
+            result = self.client.client.futures_create_order(
+                symbol=symbol,
+                side=close_side,
+                type="MARKET",
+                quantity=pos["quantity"],
+                reduceOnly=True
+            )
+
+            if result:
+                logger.info(f"[{symbol}] Position closed to lock ${roi * pos['quantity'] * entry / self.leverage / 100:+.2f} profit")
+
+                # Get actual PnL
+                try:
+                    time.sleep(1)  # Wait for order to fill
+                    income = self.client.get_income_history(symbol=symbol, income_type="REALIZED_PNL", limit=1)
+                    pnl = float(income[0].get("income", 0)) if income else 0
+                except:
+                    pnl = (roi / 100) * (pos["quantity"] * entry / self.leverage)
+
+                # Update stats
+                self.wins_today += 1
+                self.symbol_stats[symbol]["wins"] += 1
+                self.pnl_today += pnl
+                self.symbol_stats[symbol]["pnl"] += pnl
+                self.trades_today += 1
+
+                logger.info(f"[{symbol}] PROFIT LOCK WIN! PnL: ${pnl:+.2f} | ROI: {roi:+.1f}%")
+
+                # Log to ML
+                if symbol in self.active_trade_ids:
+                    trade_id = self.active_trade_ids[symbol]
+                    entry_time = pos.get("entry_time", datetime.now())
+                    duration = (datetime.now() - entry_time).total_seconds() / 60 if isinstance(entry_time, datetime) else 0
+                    self.ml_logger.log_trade_exit(
+                        trade_id=trade_id,
+                        exit_price=current_price,
+                        exit_type="PROFIT_LOCK",
+                        pnl=pnl,
+                        roi_pct=roi,
+                        price_move_pct=price_move,
+                        duration_minutes=duration
+                    )
+                    del self.active_trade_ids[symbol]
+
+                # Clean up
+                del self.positions[symbol]
+                self._save_tracked_positions()
+                self._save_stats()
+
+                # Cancel any remaining TP/SL orders
+                self.client.cancel_all_orders(symbol)
+
+                return True
+
+        except Exception as e:
+            logger.error(f"[{symbol}] Profit lock check failed: {e}")
+
+        return False
+
     def check_position(self, symbol: str) -> Optional[str]:
         """
         Check if position was closed (TP or SL hit).
@@ -1560,7 +1692,11 @@ class HTFConfluenceLiveEngine:
             try:
                 # Check if we have an existing position
                 if symbol in self.positions:
-                    # Check if position was closed
+                    # First check for profit lock (close early if trend reverses while in profit)
+                    if self.check_profit_lock(symbol):
+                        continue  # Position was closed, move to next symbol
+
+                    # Check if position was closed (TP/SL hit)
                     exit_type = self.check_position(symbol)
                     if exit_type:
                         logger.info(f"[{symbol}] Position exit: {exit_type}")
