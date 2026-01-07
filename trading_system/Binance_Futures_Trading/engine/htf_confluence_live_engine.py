@@ -534,20 +534,20 @@ class HTFConfluenceLiveEngine:
         self.min_adx = 20                  # Min ADX for trending market
         self.pullback_tolerance = 0.003    # 0.3% tolerance from 21 EMA
 
-        # SMART PROFIT LOCK - DISABLED (let TP/SL handle exits)
-        self.use_profit_lock = False       # DISABLED - simple TP/SL only
+        # SMART PROFIT LOCK - Close early if trend reverses while in profit
+        self.use_profit_lock = True        # Enable smart profit lock
         self.profit_lock_min_roi = 30.0    # Minimum ROI% to consider profit lock (30%)
 
-        # SMART FAKEOUT PROTECTION - DISABLED (let TP/SL handle exits)
-        self.use_fakeout_protection = False
+        # SMART FAKEOUT PROTECTION - Exit early on suspected fakeout entries (STRENGTHENED)
+        self.use_fakeout_protection = True
         self.reversal_cycles = {}          # symbol -> count of cycles HTF has been reversed
-        self.reversal_cycle_threshold = 3  # Wait 3 cycles before acting on reversal
-        self.breakeven_roi_threshold = 10.0   # Move SL to breakeven at +10% if reversed
-        self.small_profit_exit_roi = 10.0     # Close if ROI < this and confirms <= 1
-        self.damage_control_roi = -15.0       # Close immediately if ROI below this and reversed
+        self.reversal_cycle_threshold = 5  # STRENGTHENED: Wait 5 cycles (was 3) before acting
+        self.breakeven_roi_threshold = 15.0   # STRENGTHENED: Need 15% ROI (was 10%) for breakeven
+        self.small_profit_exit_roi = 5.0      # STRENGTHENED: Only exit at 5% (was 10%) - be more patient
+        self.damage_control_roi = -20.0       # STRENGTHENED: Wider tolerance -20% (was -15%)
 
-        # TRAILING PROFIT LOCK - DISABLED (let TP/SL handle exits)
-        self.use_trailing_profit_lock = False
+        # TRAILING PROFIT LOCK - Never give back too much profit
+        self.use_trailing_profit_lock = True
         self.peak_roi = {}                    # symbol -> highest ROI reached
         self.trailing_lock_activation = 30.0  # Start trailing after 30% ROI
         self.trailing_lock_distance = 15.0    # Close if ROI drops 15% from peak
