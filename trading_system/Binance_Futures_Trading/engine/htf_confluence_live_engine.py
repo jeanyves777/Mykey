@@ -538,6 +538,14 @@ class HTFConfluenceLiveEngine:
         self.use_profit_lock = True        # Enable smart profit lock
         self.profit_lock_min_roi = 30.0    # Minimum ROI% to consider profit lock (30%)
 
+        # SMART FAKEOUT PROTECTION - Exit early on suspected fakeout entries
+        self.use_fakeout_protection = True
+        self.reversal_cycles = {}          # symbol -> count of cycles HTF has been reversed
+        self.reversal_cycle_threshold = 3  # Wait 3 cycles before acting on reversal
+        self.breakeven_roi_threshold = 10.0   # Move SL to breakeven at +10% if reversed
+        self.small_profit_exit_roi = 10.0     # Close if ROI < this and confirms <= 1
+        self.damage_control_roi = -15.0       # Close immediately if ROI below this and reversed
+
         logger.info("=" * 60)
         logger.info("HTF CONFLUENCE LIVE TRADING ENGINE")
         logger.info("=" * 60)
@@ -565,6 +573,14 @@ class HTFConfluenceLiveEngine:
         logger.info("SMART PROFIT LOCK:")
         logger.info(f"  Profit Lock: {'ON' if self.use_profit_lock else 'OFF'} (min ROI: {self.profit_lock_min_roi}%)")
         logger.info(f"  Action: Close position if ROI >= {self.profit_lock_min_roi}% AND HTF trend reverses")
+        logger.info("-" * 60)
+        logger.info("SMART FAKEOUT PROTECTION:")
+        logger.info(f"  Fakeout Protection: {'ON' if self.use_fakeout_protection else 'OFF'}")
+        logger.info(f"  Reversal cycles to act: {self.reversal_cycle_threshold}")
+        logger.info(f"  ROI >= {self.breakeven_roi_threshold}%: Move SL to breakeven")
+        logger.info(f"  ROI 0-{self.small_profit_exit_roi}% + confirms ≤1: Small profit exit")
+        logger.info(f"  ROI -10-0% + confirms ≤1: Cut loss early")
+        logger.info(f"  ROI < {self.damage_control_roi}%: Damage control (immediate close)")
         logger.info("=" * 60)
 
     def _load_stats(self):
@@ -1450,6 +1466,218 @@ class HTFConfluenceLiveEngine:
 
         return False
 
+    def check_fakeout_protection(self, symbol: str, roi: float, htf_trend: str, confirmations: int) -> Optional[str]:
+        """
+        Smart fakeout protection - exit early on suspected fakeout entries.
+
+        Cases:
+        1. ROI >= +10% and reversed: Move SL to breakeven
+        2. ROI 0-10% and confirms <= 1 after 3 cycles: Close (small profit)
+        3. ROI -10% to 0% and confirms <= 1: Close (cut loss early)
+        4. ROI < -15% and reversed: Close immediately (damage control)
+
+        Returns:
+            Action taken: "BREAKEVEN", "SMALL_PROFIT_EXIT", "CUT_LOSS", "DAMAGE_CONTROL", or None
+        """
+        if not self.use_fakeout_protection:
+            return None
+
+        if symbol not in self.positions:
+            return None
+
+        pos = self.positions[symbol]
+        original_trend = "BULLISH" if pos["side"] == "LONG" else "BEARISH"
+        is_reversed = htf_trend != original_trend
+
+        # Track reversal cycles
+        if symbol not in self.reversal_cycles:
+            self.reversal_cycles[symbol] = 0
+
+        if is_reversed:
+            self.reversal_cycles[symbol] += 1
+        else:
+            # Trend back in our favor - reset counter
+            self.reversal_cycles[symbol] = 0
+            return None
+
+        cycles_reversed = self.reversal_cycles[symbol]
+
+        try:
+            # Case 4: DAMAGE CONTROL - ROI < -15% and reversed
+            if roi < self.damage_control_roi:
+                logger.info(f"[{symbol}] ⚠️ DAMAGE CONTROL: ROI {roi:.1f}% < {self.damage_control_roi}% with reversed trend!")
+                self._close_position_early(symbol, "DAMAGE_CONTROL", roi)
+                return "DAMAGE_CONTROL"
+
+            # Case 1: Move SL to breakeven at +10% if reversed
+            if roi >= self.breakeven_roi_threshold and cycles_reversed >= self.reversal_cycle_threshold:
+                # Move SL to entry price (breakeven)
+                entry_price = pos["entry_price"]
+                current_sl = pos.get("sl_price", 0)
+
+                # Only move if SL is worse than breakeven
+                if pos["side"] == "LONG" and current_sl < entry_price:
+                    logger.info(f"[{symbol}] 🛡️ BREAKEVEN: Moving SL to entry ${entry_price:.4f} (was ${current_sl:.4f})")
+                    self._move_sl_to_breakeven(symbol, entry_price)
+                    return "BREAKEVEN"
+                elif pos["side"] == "SHORT" and current_sl > entry_price:
+                    logger.info(f"[{symbol}] 🛡️ BREAKEVEN: Moving SL to entry ${entry_price:.4f} (was ${current_sl:.4f})")
+                    self._move_sl_to_breakeven(symbol, entry_price)
+                    return "BREAKEVEN"
+
+            # Case 2 & 3: Small profit exit or cut loss early
+            if cycles_reversed >= self.reversal_cycle_threshold and confirmations <= 1:
+                if 0 <= roi < self.small_profit_exit_roi:
+                    logger.info(f"[{symbol}] 💰 SMALL PROFIT EXIT: ROI +{roi:.1f}%, confirms {confirmations}/4, reversed {cycles_reversed} cycles")
+                    self._close_position_early(symbol, "SMALL_PROFIT_EXIT", roi)
+                    return "SMALL_PROFIT_EXIT"
+                elif -10 <= roi < 0:
+                    logger.info(f"[{symbol}] ✂️ CUT LOSS EARLY: ROI {roi:.1f}%, confirms {confirmations}/4, reversed {cycles_reversed} cycles")
+                    self._close_position_early(symbol, "CUT_LOSS_EARLY", roi)
+                    return "CUT_LOSS_EARLY"
+
+        except Exception as e:
+            logger.error(f"[{symbol}] Fakeout protection error: {e}")
+
+        return None
+
+    def _move_sl_to_breakeven(self, symbol: str, breakeven_price: float):
+        """Move stop loss to breakeven price."""
+        try:
+            pos = self.positions[symbol]
+
+            # Cancel existing SL order
+            self.client.cancel_all_orders(symbol)
+
+            # Place new SL at breakeven
+            if pos["side"] == "LONG":
+                sl_order = self.client.client.futures_create_order(
+                    symbol=symbol,
+                    side="SELL",
+                    type="STOP_MARKET",
+                    stopPrice=round(breakeven_price, self._get_price_precision(symbol)),
+                    quantity=pos["quantity"],
+                    reduceOnly=True
+                )
+            else:
+                sl_order = self.client.client.futures_create_order(
+                    symbol=symbol,
+                    side="BUY",
+                    type="STOP_MARKET",
+                    stopPrice=round(breakeven_price, self._get_price_precision(symbol)),
+                    quantity=pos["quantity"],
+                    reduceOnly=True
+                )
+
+            # Also place TP order again
+            if pos["side"] == "LONG":
+                tp_order = self.client.client.futures_create_order(
+                    symbol=symbol,
+                    side="SELL",
+                    type="TAKE_PROFIT_MARKET",
+                    stopPrice=round(pos["tp_price"], self._get_price_precision(symbol)),
+                    quantity=pos["quantity"],
+                    reduceOnly=True
+                )
+            else:
+                tp_order = self.client.client.futures_create_order(
+                    symbol=symbol,
+                    side="BUY",
+                    type="TAKE_PROFIT_MARKET",
+                    stopPrice=round(pos["tp_price"], self._get_price_precision(symbol)),
+                    quantity=pos["quantity"],
+                    reduceOnly=True
+                )
+
+            # Update tracked position
+            pos["sl_price"] = breakeven_price
+            pos["sl_moved_to_breakeven"] = True
+            self._save_tracked_positions()
+
+            logger.info(f"[{symbol}] SL moved to breakeven: ${breakeven_price:.4f}")
+
+        except Exception as e:
+            logger.error(f"[{symbol}] Failed to move SL to breakeven: {e}")
+
+    def _get_price_precision(self, symbol: str) -> int:
+        """Get price precision for symbol."""
+        precisions = {
+            "DOTUSDT": 4,
+            "BNBUSDT": 2,
+            "XRPUSDT": 4,
+            "ADAUSDT": 5
+        }
+        return precisions.get(symbol, 4)
+
+    def _close_position_early(self, symbol: str, reason: str, roi: float):
+        """Close position early for fakeout protection."""
+        try:
+            pos = self.positions[symbol]
+            close_side = "SELL" if pos["side"] == "LONG" else "BUY"
+
+            # Close position
+            result = self.client.client.futures_create_order(
+                symbol=symbol,
+                side=close_side,
+                type="MARKET",
+                quantity=pos["quantity"],
+                reduceOnly=True
+            )
+
+            if result:
+                # Get actual PnL
+                time.sleep(1)
+                try:
+                    income = self.client.get_income_history(symbol=symbol, income_type="REALIZED_PNL", limit=1)
+                    pnl = float(income[0].get("income", 0)) if income else 0
+                except:
+                    margin = (pos["quantity"] * pos["entry_price"]) / self.leverage
+                    pnl = margin * (roi / 100)
+
+                # Update stats
+                if pnl >= 0:
+                    self.wins_today += 1
+                    self.symbol_stats[symbol]["wins"] += 1
+                else:
+                    self.losses_today += 1
+                    self.symbol_stats[symbol]["losses"] += 1
+
+                self.pnl_today += pnl
+                self.symbol_stats[symbol]["pnl"] += pnl
+                self.trades_today += 1
+
+                logger.info(f"[{symbol}] {reason}: Closed at ROI {roi:+.1f}% | PnL: ${pnl:+.2f}")
+
+                # Log to ML
+                if symbol in self.active_trade_ids:
+                    trade_id = self.active_trade_ids[symbol]
+                    entry_time = pos.get("entry_time", datetime.now())
+                    duration = (datetime.now() - entry_time).total_seconds() / 60 if isinstance(entry_time, datetime) else 0
+                    price_data = self.client.get_current_price(symbol)
+                    self.ml_logger.log_trade_exit(
+                        trade_id=trade_id,
+                        exit_price=price_data["price"],
+                        exit_type=reason,
+                        pnl=pnl,
+                        roi_pct=roi,
+                        price_move_pct=roi / self.leverage,
+                        duration_minutes=duration
+                    )
+                    del self.active_trade_ids[symbol]
+
+                # Clean up
+                del self.positions[symbol]
+                if symbol in self.reversal_cycles:
+                    del self.reversal_cycles[symbol]
+                self._save_tracked_positions()
+                self._save_stats()
+
+                # Cancel any remaining orders
+                self.client.cancel_all_orders(symbol)
+
+        except Exception as e:
+            logger.error(f"[{symbol}] Failed to close position early: {e}")
+
     def check_position(self, symbol: str) -> Optional[str]:
         """
         Check if position was closed (TP or SL hit).
@@ -1789,6 +2017,32 @@ class HTFConfluenceLiveEngine:
                                 else:
                                     lock_status = f"ROI needs {self.profit_lock_min_roi - roi:.1f}% more"
 
+                                # Fakeout protection status
+                                cycles_reversed = self.reversal_cycles.get(symbol, 0)
+                                is_reversed = htf_trend != original_trend
+                                sl_at_breakeven = pos.get("sl_moved_to_breakeven", False)
+
+                                if not is_reversed:
+                                    fakeout_status = "✓ Trend valid"
+                                elif sl_at_breakeven:
+                                    fakeout_status = "🛡️ SL at breakeven (risk-free)"
+                                elif cycles_reversed < self.reversal_cycle_threshold:
+                                    fakeout_status = f"⏳ Watching ({cycles_reversed}/{self.reversal_cycle_threshold} cycles)"
+                                elif roi >= self.breakeven_roi_threshold:
+                                    fakeout_status = "🛡️ Will move SL to breakeven"
+                                elif confirmations <= 1:
+                                    if roi >= 0:
+                                        fakeout_status = f"⚠️ SMALL PROFIT EXIT (confirms {confirmations}/4)"
+                                    else:
+                                        fakeout_status = f"⚠️ CUT LOSS EARLY (confirms {confirmations}/4)"
+                                else:
+                                    fakeout_status = f"👀 Monitoring (confirms {confirmations}/4)"
+
+                                # Check fakeout protection
+                                fakeout_action = self.check_fakeout_protection(symbol, roi, htf_trend, confirmations)
+                                if fakeout_action:
+                                    continue  # Position was handled
+
                             except Exception as trend_e:
                                 htf_trend = "?"
                                 original_trend = "BULLISH" if pos["side"] == "LONG" else "BEARISH"
@@ -1797,6 +2051,8 @@ class HTFConfluenceLiveEngine:
                                 rsi = 0
                                 macd_trend = "?"
                                 lock_status = "Error checking trend"
+                                fakeout_status = "Error"
+                                cycles_reversed = 0
 
                             logger.info(f"┌─ {symbol} {pos['side']} ─────────────────────────────────")
                             logger.info(f"│ Entry: ${entry:,.4f} | Now: ${current_price:,.4f} | Qty: {qty}")
@@ -1807,6 +2063,7 @@ class HTFConfluenceLiveEngine:
                             logger.info(f"│ Entry Trend: {original_trend} | Current HTF: {htf_trend} {trend_match}")
                             logger.info(f"│ 5m RSI: {rsi:.1f} | MACD: {macd_trend} | Confirms: {confirmations}/4")
                             logger.info(f"│ Profit Lock: {lock_status}")
+                            logger.info(f"│ Fakeout: {fakeout_status}")
                             logger.info(f"└────────────────────────────────────────────────")
                         except Exception as e:
                             logger.info(f"[{symbol}] {pos['side']} @ ${pos['entry_price']:,.4f} (monitoring) - {e}")
