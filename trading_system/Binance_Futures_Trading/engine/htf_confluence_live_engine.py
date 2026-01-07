@@ -1701,7 +1701,7 @@ class HTFConfluenceLiveEngine:
                     if exit_type:
                         logger.info(f"[{symbol}] Position exit: {exit_type}")
                     else:
-                        # Position still open - show detailed status
+                        # Position still open - show detailed status with trend info
                         pos = self.positions[symbol]
                         try:
                             price_data = self.client.get_current_price(symbol)
@@ -1730,11 +1730,83 @@ class HTFConfluenceLiveEngine:
                             to_tp_roi = to_tp_price * self.leverage
                             to_sl_roi = to_sl_price * self.leverage
 
+                            # Get HTF trend info for reversal check
+                            try:
+                                _, htf_df = self.get_market_data(symbol)
+                                ltf_df, _ = self.get_market_data(symbol)
+
+                                # HTF EMAs (15m)
+                                htf_close = htf_df['close']
+                                htf_ema21 = htf_close.ewm(span=21, adjust=False).mean().iloc[-1]
+                                htf_ema50 = htf_close.ewm(span=50, adjust=False).mean().iloc[-1]
+                                htf_trend = "BULLISH" if htf_ema21 > htf_ema50 else "BEARISH"
+
+                                # LTF indicators (5m)
+                                ltf_close = ltf_df['close']
+                                ltf_ema9 = ltf_close.ewm(span=9, adjust=False).mean().iloc[-1]
+                                ltf_ema21 = ltf_close.ewm(span=21, adjust=False).mean().iloc[-1]
+                                ltf_ema50 = ltf_close.ewm(span=50, adjust=False).mean().iloc[-1]
+
+                                # RSI
+                                delta = ltf_close.diff()
+                                gain = delta.where(delta > 0, 0).ewm(span=14, adjust=False).mean()
+                                loss = (-delta).where(delta < 0, 0).ewm(span=14, adjust=False).mean()
+                                rs = gain / loss
+                                rsi = (100 - (100 / (1 + rs))).iloc[-1]
+
+                                # MACD
+                                ema12 = ltf_close.ewm(span=12, adjust=False).mean()
+                                ema26 = ltf_close.ewm(span=26, adjust=False).mean()
+                                macd = ema12 - ema26
+                                signal_line = macd.ewm(span=9, adjust=False).mean()
+                                macd_val = macd.iloc[-1]
+                                signal_val = signal_line.iloc[-1]
+                                macd_trend = "BULL" if macd_val > signal_val else "BEAR"
+
+                                # Check reversal conditions
+                                original_trend = "BULLISH" if pos["side"] == "LONG" else "BEARISH"
+                                trend_match = "✓" if htf_trend == original_trend else "✗ REVERSED"
+
+                                # EMA alignment for exit
+                                if pos["side"] == "LONG":
+                                    ema_aligned = ltf_ema9 > ltf_ema21 > ltf_ema50
+                                    rsi_ok = rsi > 30  # Not oversold
+                                    macd_ok = macd_val > signal_val
+                                else:
+                                    ema_aligned = ltf_ema9 < ltf_ema21 < ltf_ema50
+                                    rsi_ok = rsi < 70  # Not overbought
+                                    macd_ok = macd_val < signal_val
+
+                                # Count confirmations still valid
+                                confirmations = sum([ema_aligned, rsi_ok, macd_ok, htf_trend == original_trend])
+
+                                # Profit lock status
+                                if roi >= self.profit_lock_min_roi:
+                                    if htf_trend != original_trend:
+                                        lock_status = "⚠️ PROFIT LOCK TRIGGERED!"
+                                    else:
+                                        lock_status = f"🔓 Ready (ROI≥{self.profit_lock_min_roi}%, trend OK)"
+                                else:
+                                    lock_status = f"ROI needs {self.profit_lock_min_roi - roi:.1f}% more"
+
+                            except Exception as trend_e:
+                                htf_trend = "?"
+                                original_trend = "BULLISH" if pos["side"] == "LONG" else "BEARISH"
+                                trend_match = "?"
+                                confirmations = 0
+                                rsi = 0
+                                macd_trend = "?"
+                                lock_status = "Error checking trend"
+
                             logger.info(f"┌─ {symbol} {pos['side']} ─────────────────────────────────")
                             logger.info(f"│ Entry: ${entry:,.4f} | Now: ${current_price:,.4f} | Qty: {qty}")
                             logger.info(f"│ Price Move: {price_move:+.3f}% | ROI: {roi:+.1f}% | PnL: ${unrealized_pnl:+.2f}")
                             logger.info(f"│ Margin: ${margin:.2f} | Position: ${position_value:.2f}")
                             logger.info(f"│ To TP: {to_tp_price:.3f}% ({to_tp_roi:+.1f}% ROI) | To SL: {to_sl_price:.3f}% ({to_sl_roi:.1f}% ROI)")
+                            logger.info(f"│ ── TREND CHECK ──")
+                            logger.info(f"│ Entry Trend: {original_trend} | Current HTF: {htf_trend} {trend_match}")
+                            logger.info(f"│ 5m RSI: {rsi:.1f} | MACD: {macd_trend} | Confirms: {confirmations}/4")
+                            logger.info(f"│ Profit Lock: {lock_status}")
                             logger.info(f"└────────────────────────────────────────────────")
                         except Exception as e:
                             logger.info(f"[{symbol}] {pos['side']} @ ${pos['entry_price']:,.4f} (monitoring) - {e}")
