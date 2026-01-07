@@ -1466,15 +1466,18 @@ class HTFConfluenceLiveEngine:
 
         return False
 
-    def check_fakeout_protection(self, symbol: str, roi: float, htf_trend: str, confirmations: int) -> Optional[str]:
+    def check_fakeout_protection(self, symbol: str, roi: float, htf_trend: str, ltf_trend: str, confirmations: int) -> Optional[str]:
         """
         Smart fakeout protection - exit early on suspected fakeout entries.
 
+        IMPORTANT: Both HTF and LTF must be against us to count as a real reversal.
+        If only one timeframe is against us, we wait for more confirmation.
+
         Cases:
-        1. ROI >= +10% and reversed: Move SL to breakeven
+        1. ROI >= +10% and BOTH reversed: Move SL to breakeven
         2. ROI 0-10% and confirms <= 1 after 3 cycles: Close (small profit)
         3. ROI -10% to 0% and confirms <= 1: Close (cut loss early)
-        4. ROI < -15% and reversed: Close immediately (damage control)
+        4. ROI < -15% and BOTH reversed: Close immediately (damage control)
 
         Returns:
             Action taken: "BREAKEVEN", "SMALL_PROFIT_EXIT", "CUT_LOSS", "DAMAGE_CONTROL", or None
@@ -1487,7 +1490,11 @@ class HTFConfluenceLiveEngine:
 
         pos = self.positions[symbol]
         original_trend = "BULLISH" if pos["side"] == "LONG" else "BEARISH"
-        is_reversed = htf_trend != original_trend
+        htf_reversed = htf_trend != original_trend
+        ltf_reversed = ltf_trend != original_trend
+
+        # BOTH timeframes must be against us to count as real reversal
+        is_reversed = htf_reversed and ltf_reversed
 
         # Track reversal cycles
         if symbol not in self.reversal_cycles:
@@ -1496,7 +1503,7 @@ class HTFConfluenceLiveEngine:
         if is_reversed:
             self.reversal_cycles[symbol] += 1
         else:
-            # Trend back in our favor - reset counter
+            # At least one timeframe still in our favor - reset counter
             self.reversal_cycles[symbol] = 0
             return None
 
@@ -1993,7 +2000,28 @@ class HTFConfluenceLiveEngine:
 
                                 # Check reversal conditions
                                 original_trend = "BULLISH" if pos["side"] == "LONG" else "BEARISH"
-                                trend_match = "✓" if htf_trend == original_trend else "✗ REVERSED"
+
+                                # LTF trend based on EMA alignment
+                                if ltf_ema9 > ltf_ema21 > ltf_ema50:
+                                    ltf_trend = "BULLISH"
+                                elif ltf_ema9 < ltf_ema21 < ltf_ema50:
+                                    ltf_trend = "BEARISH"
+                                else:
+                                    ltf_trend = "MIXED"
+
+                                # Both must be against us for real reversal
+                                htf_reversed = htf_trend != original_trend
+                                ltf_reversed = ltf_trend != original_trend and ltf_trend != "MIXED"
+                                both_reversed = htf_reversed and ltf_reversed
+
+                                if both_reversed:
+                                    trend_match = "✗ BOTH REVERSED"
+                                elif htf_reversed:
+                                    trend_match = f"⚡ HTF reversed, 5m {ltf_trend}"
+                                elif ltf_reversed:
+                                    trend_match = f"⚡ 5m reversed, HTF OK"
+                                else:
+                                    trend_match = "✓"
 
                                 # EMA alignment for exit
                                 if pos["side"] == "LONG":
@@ -2008,26 +2036,28 @@ class HTFConfluenceLiveEngine:
                                 # Count confirmations still valid
                                 confirmations = sum([ema_aligned, rsi_ok, macd_ok, htf_trend == original_trend])
 
-                                # Profit lock status
+                                # Profit lock status (only triggers if BOTH reversed)
                                 if roi >= self.profit_lock_min_roi:
-                                    if htf_trend != original_trend:
+                                    if both_reversed:
                                         lock_status = "⚠️ PROFIT LOCK TRIGGERED!"
                                     else:
                                         lock_status = f"🔓 Ready (ROI≥{self.profit_lock_min_roi}%, trend OK)"
                                 else:
                                     lock_status = f"ROI needs {self.profit_lock_min_roi - roi:.1f}% more"
 
-                                # Fakeout protection status
+                                # Fakeout protection status (only counts if BOTH reversed)
                                 cycles_reversed = self.reversal_cycles.get(symbol, 0)
-                                is_reversed = htf_trend != original_trend
                                 sl_at_breakeven = pos.get("sl_moved_to_breakeven", False)
 
-                                if not is_reversed:
-                                    fakeout_status = "✓ Trend valid"
+                                if not both_reversed:
+                                    if htf_reversed or ltf_reversed:
+                                        fakeout_status = "👀 One TF against, watching"
+                                    else:
+                                        fakeout_status = "✓ Both TF valid"
                                 elif sl_at_breakeven:
                                     fakeout_status = "🛡️ SL at breakeven (risk-free)"
                                 elif cycles_reversed < self.reversal_cycle_threshold:
-                                    fakeout_status = f"⏳ Watching ({cycles_reversed}/{self.reversal_cycle_threshold} cycles)"
+                                    fakeout_status = f"⏳ BOTH reversed ({cycles_reversed}/{self.reversal_cycle_threshold} cycles)"
                                 elif roi >= self.breakeven_roi_threshold:
                                     fakeout_status = "🛡️ Will move SL to breakeven"
                                 elif confirmations <= 1:
@@ -2038,13 +2068,14 @@ class HTFConfluenceLiveEngine:
                                 else:
                                     fakeout_status = f"👀 Monitoring (confirms {confirmations}/4)"
 
-                                # Check fakeout protection
-                                fakeout_action = self.check_fakeout_protection(symbol, roi, htf_trend, confirmations)
+                                # Check fakeout protection (pass both trends)
+                                fakeout_action = self.check_fakeout_protection(symbol, roi, htf_trend, ltf_trend, confirmations)
                                 if fakeout_action:
                                     continue  # Position was handled
 
                             except Exception as trend_e:
                                 htf_trend = "?"
+                                ltf_trend = "?"
                                 original_trend = "BULLISH" if pos["side"] == "LONG" else "BEARISH"
                                 trend_match = "?"
                                 confirmations = 0
@@ -2060,7 +2091,7 @@ class HTFConfluenceLiveEngine:
                             logger.info(f"│ Margin: ${margin:.2f} | Position: ${position_value:.2f}")
                             logger.info(f"│ To TP: {to_tp_price:.3f}% ({to_tp_roi:+.1f}% ROI) | To SL: {to_sl_price:.3f}% ({to_sl_roi:.1f}% ROI)")
                             logger.info(f"│ ── TREND CHECK ──")
-                            logger.info(f"│ Entry Trend: {original_trend} | Current HTF: {htf_trend} {trend_match}")
+                            logger.info(f"│ Entry: {original_trend} | 15m: {htf_trend} | 5m: {ltf_trend} {trend_match}")
                             logger.info(f"│ 5m RSI: {rsi:.1f} | MACD: {macd_trend} | Confirms: {confirmations}/4")
                             logger.info(f"│ Profit Lock: {lock_status}")
                             logger.info(f"│ Fakeout: {fakeout_status}")
