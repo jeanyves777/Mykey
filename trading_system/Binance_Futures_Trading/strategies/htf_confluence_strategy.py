@@ -138,8 +138,8 @@ class HTFConfluenceStrategy:
         self.min_bars_between_signals = 0   # No cooldown
         self.last_signal_bar = -999
 
-        # Minimum confluence score (keep 3 but with stricter individual conditions)
-        self.min_confluence_score = 3       # Need 3/4 conditions (each condition is now stricter)
+        # Minimum confluence score - REQUIRE 6/6 for entry
+        self.min_confluence_score = 6       # Need ALL 6 conditions: 1H trend + 15m EMA + 15m RSI + 15m MACD + 5m EMA + ADX trending
 
     def calculate_ema(self, series: pd.Series, period: int) -> pd.Series:
         """Calculate Exponential Moving Average"""
@@ -412,77 +412,91 @@ class HTFConfluenceStrategy:
 
     def check_long_conditions(self, indicators: Dict, htf_trend: TrendDirection) -> Tuple[int, List[str]]:
         """
-        Check LONG entry conditions - STRENGTHENED for better win rate.
+        Check LONG entry conditions - 6/6 CONFLUENCE REQUIRED.
+
+        Conditions:
+        1. 1H Trend: EMA 21 > 50 (Bullish)
+        2. 15m EMA: 9 > 21 (Bullish alignment)
+        3. 15m RSI: 40-65 range
+        4. 15m MACD: Histogram > 0
+        5. 5m EMA: 9 > 21 (Confirmation)
+        6. ADX > 20 (Trending, not choppy)
 
         Returns:
             (confluence_score, list of met conditions)
         """
         conditions_met = []
 
-        # Condition 1: HTF trend bullish + ADX trending (trend strength)
+        # Condition 1: 1H Trend bullish (from htf_trend which now uses 1H data)
         if htf_trend == TrendDirection.BULLISH:
-            adx = indicators.get("adx", 0)
-            if indicators.get("adx_trending", False):
-                conditions_met.append(f"HTF: Bullish + ADX {adx:.1f} (trending)")
-            else:
-                conditions_met.append(f"HTF: Bullish but ADX {adx:.1f} (weak trend)")
+            conditions_met.append("1H: Bullish")
 
-        # Condition 2: EMA crossover or strong alignment
-        if indicators.get("ema_bullish_cross", False):
-            conditions_met.append("EMA: 9 crossed above 21 (fresh crossover)")
-        elif indicators.get("ema_bullish", False):
-            conditions_met.append("EMA: 9 > 21 (bullish alignment)")
+        # Condition 2: 15m EMA alignment (9 > 21)
+        if indicators.get("ema_bullish", False):
+            conditions_met.append("15m: EMA 9>21")
 
-        # Condition 3: RSI in valid range (tightened)
+        # Condition 3: 15m RSI in valid range
         rsi = indicators.get("rsi", 50)
         if self.rsi_long_min <= rsi <= self.rsi_long_max:
-            conditions_met.append(f"RSI: {rsi:.1f} in range [{self.rsi_long_min}-{self.rsi_long_max}]")
+            conditions_met.append(f"RSI {rsi:.0f}")
 
-        # Condition 4: MACD bullish with momentum (crossover or momentum building)
-        if indicators.get("macd_bullish_cross", False):
-            conditions_met.append("MACD: Fresh bullish crossover")
-        elif indicators.get("macd_momentum_bullish", False):
-            conditions_met.append("MACD: Histogram > 0 & increasing (momentum)")
-        elif indicators.get("macd_bullish", False):
-            conditions_met.append("MACD: Histogram > 0 (bullish)")
+        # Condition 4: 15m MACD bullish (histogram > 0)
+        if indicators.get("macd_bullish", False):
+            conditions_met.append("MACD>0")
+
+        # Condition 5: 5m EMA confirmation (9 > 21)
+        if indicators.get("5m_ema_bullish", False):
+            conditions_met.append("5m: Confirmed")
+
+        # Condition 6: ADX > 20 (NOT choppy - trending market)
+        adx = indicators.get("adx", 0)
+        if indicators.get("adx_trending", False):
+            conditions_met.append(f"ADX {adx:.0f}")
 
         return len(conditions_met), conditions_met
 
     def check_short_conditions(self, indicators: Dict, htf_trend: TrendDirection) -> Tuple[int, List[str]]:
         """
-        Check SHORT entry conditions - STRENGTHENED for better win rate.
+        Check SHORT entry conditions - 6/6 CONFLUENCE REQUIRED.
+
+        Conditions:
+        1. 1H Trend: EMA 21 < 50 (Bearish)
+        2. 15m EMA: 9 < 21 (Bearish alignment)
+        3. 15m RSI: 35-60 range
+        4. 15m MACD: Histogram < 0
+        5. 5m EMA: 9 < 21 (Confirmation)
+        6. ADX > 20 (Trending, not choppy)
 
         Returns:
             (confluence_score, list of met conditions)
         """
         conditions_met = []
 
-        # Condition 1: HTF trend bearish + ADX trending (trend strength)
+        # Condition 1: 1H Trend bearish (from htf_trend which now uses 1H data)
         if htf_trend == TrendDirection.BEARISH:
-            adx = indicators.get("adx", 0)
-            if indicators.get("adx_trending", False):
-                conditions_met.append(f"HTF: Bearish + ADX {adx:.1f} (trending)")
-            else:
-                conditions_met.append(f"HTF: Bearish but ADX {adx:.1f} (weak trend)")
+            conditions_met.append("1H: Bearish")
 
-        # Condition 2: EMA crossover or strong alignment
-        if indicators.get("ema_bearish_cross", False):
-            conditions_met.append("EMA: 9 crossed below 21 (fresh crossover)")
-        elif indicators.get("ema_bearish", False):
-            conditions_met.append("EMA: 9 < 21 (bearish alignment)")
+        # Condition 2: 15m EMA alignment (9 < 21)
+        if indicators.get("ema_bearish", False):
+            conditions_met.append("15m: EMA 9<21")
 
-        # Condition 3: RSI in valid range (tightened)
+        # Condition 3: 15m RSI in valid range
         rsi = indicators.get("rsi", 50)
         if self.rsi_short_min <= rsi <= self.rsi_short_max:
-            conditions_met.append(f"RSI: {rsi:.1f} in range [{self.rsi_short_min}-{self.rsi_short_max}]")
+            conditions_met.append(f"RSI {rsi:.0f}")
 
-        # Condition 4: MACD bearish with momentum (crossover or momentum building)
-        if indicators.get("macd_bearish_cross", False):
-            conditions_met.append("MACD: Fresh bearish crossover")
-        elif indicators.get("macd_momentum_bearish", False):
-            conditions_met.append("MACD: Histogram < 0 & decreasing (momentum)")
-        elif indicators.get("macd_bearish", False):
-            conditions_met.append("MACD: Histogram < 0 (bearish)")
+        # Condition 4: 15m MACD bearish (histogram < 0)
+        if indicators.get("macd_bearish", False):
+            conditions_met.append("MACD<0")
+
+        # Condition 5: 5m EMA confirmation (9 < 21)
+        if indicators.get("5m_ema_bearish", False):
+            conditions_met.append("5m: Confirmed")
+
+        # Condition 6: ADX > 20 (NOT choppy - trending market)
+        adx = indicators.get("adx", 0)
+        if indicators.get("adx_trending", False):
+            conditions_met.append(f"ADX {adx:.0f}")
 
         return len(conditions_met), conditions_met
 

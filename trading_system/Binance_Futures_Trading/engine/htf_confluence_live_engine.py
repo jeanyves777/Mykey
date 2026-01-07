@@ -534,20 +534,20 @@ class HTFConfluenceLiveEngine:
         self.min_adx = 20                  # Min ADX for trending market
         self.pullback_tolerance = 0.003    # 0.3% tolerance from 21 EMA
 
-        # SMART PROFIT LOCK - Close early if trend reverses while in profit
-        self.use_profit_lock = True        # Enable smart profit lock
+        # SMART PROFIT LOCK - DISABLED (let TP/SL handle exits)
+        self.use_profit_lock = False       # DISABLED - simple TP/SL only
         self.profit_lock_min_roi = 30.0    # Minimum ROI% to consider profit lock (30%)
 
-        # SMART FAKEOUT PROTECTION - Exit early on suspected fakeout entries
-        self.use_fakeout_protection = True
+        # SMART FAKEOUT PROTECTION - DISABLED (let TP/SL handle exits)
+        self.use_fakeout_protection = False
         self.reversal_cycles = {}          # symbol -> count of cycles HTF has been reversed
         self.reversal_cycle_threshold = 3  # Wait 3 cycles before acting on reversal
         self.breakeven_roi_threshold = 10.0   # Move SL to breakeven at +10% if reversed
         self.small_profit_exit_roi = 10.0     # Close if ROI < this and confirms <= 1
         self.damage_control_roi = -15.0       # Close immediately if ROI below this and reversed
 
-        # TRAILING PROFIT LOCK - Never give back too much profit
-        self.use_trailing_profit_lock = True
+        # TRAILING PROFIT LOCK - DISABLED (let TP/SL handle exits)
+        self.use_trailing_profit_lock = False
         self.peak_roi = {}                    # symbol -> highest ROI reached
         self.trailing_lock_activation = 30.0  # Start trailing after 30% ROI
         self.trailing_lock_distance = 15.0    # Close if ROI drops 15% from peak
@@ -944,7 +944,7 @@ class HTFConfluenceLiveEngine:
             import traceback
             traceback.print_exc()
 
-    def get_market_data(self, symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def get_market_data(self, symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
         Fetch market data for strategy analysis.
 
@@ -952,25 +952,27 @@ class HTFConfluenceLiveEngine:
             symbol: Trading symbol
 
         Returns:
-            (ltf_df, htf_df) - 5m and 15m DataFrames
+            (ltf_df, htf_df, m5_df) - 15m, 1H, and 5m DataFrames
         """
         try:
-            # Get 5m data (LTF) - for precise entries on scalping
-            ltf_df = self.client.get_klines(symbol, "5m", 150)
+            # Get 15m data (LTF) - entry signals with EMA/RSI/MACD
+            ltf_df = self.client.get_klines(symbol, "15m", 150)
 
-            # Get 15m data (HTF) - trend filter for day trading/scalping
-            # Changed from 4h/1h to 15m for faster trend detection
-            htf_df = self.client.get_klines(symbol, "15m", 150)
+            # Get 1H data (HTF) - trend detection with 21/50 EMA
+            htf_df = self.client.get_klines(symbol, "1h", 150)
+
+            # Get 5m data for confirmation
+            m5_df = self.client.get_klines(symbol, "5m", 50)
 
             if ltf_df.empty or htf_df.empty:
                 logger.warning(f"[{symbol}] Empty data received")
-                return None, None
+                return None, None, None
 
-            return ltf_df, htf_df
+            return ltf_df, htf_df, m5_df
 
         except Exception as e:
             logger.error(f"[{symbol}] Failed to fetch market data: {e}")
-            return None, None
+            return None, None, None
 
     def get_1m_data(self, symbol: str) -> pd.DataFrame:
         """Fetch 1-minute data for precise pullback detection."""
@@ -1129,7 +1131,7 @@ class HTFConfluenceLiveEngine:
         failed_filters = []
 
         # Get 5m data for ATR/ADX calculation
-        ltf_df, _ = self.get_market_data(symbol)
+        ltf_df, _, _ = self.get_market_data(symbol)
         if ltf_df is None:
             return True, "No data for filters"
 
@@ -1337,7 +1339,7 @@ class HTFConfluenceLiveEngine:
             margin = (actual_qty * actual_entry) / self.leverage
 
             # Get market conditions for ML logging
-            ltf_df, _ = self.get_market_data(symbol)
+            ltf_df, _, _ = self.get_market_data(symbol)
             atr_pct = self.calculate_atr(ltf_df, 14) if ltf_df is not None else 0
             adx = self.calculate_adx(ltf_df, 14) if ltf_df is not None else 0
 
@@ -1442,7 +1444,7 @@ class HTFConfluenceLiveEngine:
                 return False
 
             # Get HTF data to check trend
-            _, htf_df = self.get_market_data(symbol)
+            _, htf_df, _ = self.get_market_data(symbol)
             if htf_df is None or len(htf_df) < 50:
                 return False
 
@@ -1926,7 +1928,7 @@ class HTFConfluenceLiveEngine:
                     trade_id = self.active_trade_ids[symbol]
 
                     # Get current market conditions for exit logging
-                    ltf_df, _ = self.get_market_data(symbol)
+                    ltf_df, _, _ = self.get_market_data(symbol)
                     exit_atr = self.calculate_atr(ltf_df, 14) if ltf_df is not None else 0
                     exit_adx = self.calculate_adx(ltf_df, 14) if ltf_df is not None else 0
                     exit_rsi = 50
@@ -1996,18 +1998,55 @@ class HTFConfluenceLiveEngine:
             Signal dict or None
         """
         try:
-            # Get market data
-            ltf_df, htf_df = self.get_market_data(symbol)
+            # Get market data (15m LTF, 1H HTF, 5m confirmation)
+            ltf_df, htf_df, m5_df = self.get_market_data(symbol)
 
             if ltf_df is None or htf_df is None:
                 return None
 
-            # Get strategy signal
+            # Calculate 5m EMA confirmation
+            m5_ema_bullish = True  # Default to True if no 5m data
+            m5_ema_bearish = True
+            if m5_df is not None and len(m5_df) >= 25:
+                m5_close = m5_df['close']
+                m5_ema9 = m5_close.ewm(span=9, adjust=False).mean().iloc[-1]
+                m5_ema21 = m5_close.ewm(span=21, adjust=False).mean().iloc[-1]
+                m5_ema_bullish = m5_ema9 > m5_ema21
+                m5_ema_bearish = m5_ema9 < m5_ema21
+
+            # Get strategy and calculate indicators
             strategy = self.strategies[symbol]
+            indicators = strategy.calculate_indicators(ltf_df)
+            
+            if indicators:
+                # Inject 5m EMA confirmation into indicators
+                indicators["5m_ema_bullish"] = m5_ema_bullish
+                indicators["5m_ema_bearish"] = m5_ema_bearish
+            
+            # Get HTF trend
+            htf_trend, htf_distance = strategy.get_htf_trend(htf_df)
+            
+            if indicators:
+                indicators["htf_trend"] = htf_trend.value
+                indicators["htf_distance_pct"] = htf_distance
+            
+            # Now get signal with injected 5m data
+            # The strategy.should_enter recalculates indicators, so we need a workaround
+            # Temporarily patch the strategy's calculate_indicators to include our 5m data
+            original_calc = strategy.calculate_indicators
+            def patched_calc(df):
+                result = original_calc(df)
+                if result:
+                    result["5m_ema_bullish"] = m5_ema_bullish
+                    result["5m_ema_bearish"] = m5_ema_bearish
+                return result
+            
+            strategy.calculate_indicators = patched_calc
             signal = strategy.should_enter(ltf_df, htf_df)
+            strategy.calculate_indicators = original_calc  # Restore
 
             if signal.action:
-                logger.info(f"[{symbol}] Signal: {signal.action} | Strength: {signal.strength.value} | Score: {signal.confluence_score}/4")
+                logger.info(f"[{symbol}] Signal: {signal.action} | Strength: {signal.strength.value} | Score: {signal.confluence_score}/6")
                 logger.info(f"[{symbol}] Reason: {signal.reason}")
             elif verbose:
                 # Show detailed indicator breakdown when no signal
@@ -2017,6 +2056,8 @@ class HTFConfluenceLiveEngine:
 
         except Exception as e:
             logger.error(f"[{symbol}] Analysis failed: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def _log_signal_diagnostics(self, symbol: str, ltf_df: pd.DataFrame, htf_df: pd.DataFrame, signal):
@@ -2130,8 +2171,8 @@ class HTFConfluenceLiveEngine:
 
                             # Get HTF trend info for reversal check
                             try:
-                                _, htf_df = self.get_market_data(symbol)
-                                ltf_df, _ = self.get_market_data(symbol)
+                                _, htf_df, _ = self.get_market_data(symbol)
+                                ltf_df, _, _ = self.get_market_data(symbol)
 
                                 # HTF EMAs (15m)
                                 htf_close = htf_df['close']
@@ -2278,7 +2319,7 @@ class HTFConfluenceLiveEngine:
                     continue
 
                 # Get market data for ML logging
-                ltf_df, htf_df = self.get_market_data(symbol)
+                ltf_df, htf_df, _ = self.get_market_data(symbol)
                 m1_df = self.get_1m_data(symbol)
 
                 # Analyze for new signal (verbose=True shows diagnostics when no signal)
