@@ -1453,14 +1453,22 @@ class HTFConfluenceLiveEngine:
             htf_ema21 = htf_close.ewm(span=21, adjust=False).mean().iloc[-1]
             htf_ema50 = htf_close.ewm(span=50, adjust=False).mean().iloc[-1]
 
-            # Check for trend reversal
+            # STRENGTHENED: Check for STRONG trend reversal (not just EMA cross)
+            # Require: EMA cross + Price on wrong side + Clear EMA separation
+            current_price = close.iloc[-1]
+            ema_diff_pct = abs(htf_ema21 - htf_ema50) / htf_ema50 * 100
+            
             trend_reversed = False
-            if pos["side"] == "LONG" and htf_ema21 < htf_ema50:
-                # LONG but HTF EMAs crossed bearish
-                trend_reversed = True
-            elif pos["side"] == "SHORT" and htf_ema21 > htf_ema50:
-                # SHORT but HTF EMAs crossed bullish
-                trend_reversed = True
+            if pos["side"] == "LONG":
+                # LONG position - check for STRONG bearish reversal
+                # Need: EMA21 < EMA50 AND price below EMA21 AND clear separation
+                if htf_ema21 < htf_ema50 and current_price < htf_ema21 and ema_diff_pct > 0.3:
+                    trend_reversed = True
+            elif pos["side"] == "SHORT":
+                # SHORT position - check for STRONG bullish reversal
+                # Need: EMA21 > EMA50 AND price above EMA21 AND clear separation
+                if htf_ema21 > htf_ema50 and current_price > htf_ema21 and ema_diff_pct > 0.3:
+                    trend_reversed = True
 
             if not trend_reversed:
                 return False
@@ -1554,10 +1562,18 @@ class HTFConfluenceLiveEngine:
 
         pos = self.positions[symbol]
         original_trend = "BULLISH" if pos["side"] == "LONG" else "BEARISH"
-        htf_reversed = htf_trend != original_trend
-        ltf_reversed = ltf_trend != original_trend
+        
+        # STRENGTHENED REVERSAL DETECTION:
+        # Simple EMA cross is NOT enough - require STRONG reversal confirmation
+        # htf_trend and ltf_trend coming from the main loop are already calculated
+        # But we need to check for STRONG reversal, not just EMA cross
+        
+        # For fakeout protection, we need BOTH to be strongly against us
+        # The trend strings are "BULLISH", "BEARISH", or "MIXED"
+        htf_reversed = htf_trend != original_trend and htf_trend != "MIXED"
+        ltf_reversed = ltf_trend != original_trend and ltf_trend != "MIXED"
 
-        # BOTH timeframes must be against us to count as real reversal
+        # BOTH timeframes must be STRONGLY against us (not MIXED)
         is_reversed = htf_reversed and ltf_reversed
 
         # Track reversal cycles
@@ -2174,11 +2190,26 @@ class HTFConfluenceLiveEngine:
                                 _, htf_df, _ = self.get_market_data(symbol)
                                 ltf_df, _, _ = self.get_market_data(symbol)
 
-                                # HTF EMAs (15m)
+                                # HTF EMAs (1H) - STRENGTHENED reversal detection
                                 htf_close = htf_df['close']
+                                htf_price = htf_close.iloc[-1]
                                 htf_ema21 = htf_close.ewm(span=21, adjust=False).mean().iloc[-1]
                                 htf_ema50 = htf_close.ewm(span=50, adjust=False).mean().iloc[-1]
-                                htf_trend = "BULLISH" if htf_ema21 > htf_ema50 else "BEARISH"
+                                
+                                # STRONG trend requires: EMA alignment AND price confirmation
+                                # Not just EMA cross, but price must be on the right side
+                                ema_diff_pct = abs(htf_ema21 - htf_ema50) / htf_ema50 * 100
+                                
+                                if htf_ema21 > htf_ema50 and htf_price > htf_ema21:
+                                    htf_trend = "BULLISH"  # Strong bullish
+                                elif htf_ema21 < htf_ema50 and htf_price < htf_ema21:
+                                    htf_trend = "BEARISH"  # Strong bearish
+                                elif htf_ema21 > htf_ema50:
+                                    htf_trend = "BULLISH" if ema_diff_pct > 0.3 else "MIXED"  # Weak bullish needs clear separation
+                                elif htf_ema21 < htf_ema50:
+                                    htf_trend = "BEARISH" if ema_diff_pct > 0.3 else "MIXED"  # Weak bearish needs clear separation
+                                else:
+                                    htf_trend = "MIXED"
 
                                 # LTF indicators (5m)
                                 ltf_close = ltf_df['close']
