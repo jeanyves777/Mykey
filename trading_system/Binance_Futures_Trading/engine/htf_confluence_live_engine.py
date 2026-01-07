@@ -4,15 +4,22 @@ HTF Confluence Live Trading Engine
 Live trading engine for the HTF Trend + Confluence Strategy.
 
 Strategy:
-- HTF (4H): 21/50 EMA crossover trend filter
-- LTF (15m): MACD + RSI + EMA (9/21) confluence entry
+- HTF (15m): 21/50 EMA crossover trend filter (fast for scalping)
+- LTF (5m): MACD + RSI + EMA (9/21) confluence entry (precise entries)
 - Single direction trading (follow the trend)
 - MODERATE Config: 20x leverage, 30% ROI TP, 10% ROI SL (3:1 R:R)
 
-Backtest Results (60 days, DOT + BNB):
-- Total Return: +105.5%
-- Win Rate: 30.7%
-- Max Drawdown: 30.0%
+SMART ENTRY FILTERS (added for better entries):
+- 1m Pullback: Wait for dip to 21 EMA on 1-minute timeframe
+- Candle Confirmation: Require bullish/bearish candle pattern
+- Volatility Filter: Skip if ATR > 2% (too choppy)
+- Trend Filter: Skip if ADX < 20 (no clear trend)
+
+ML DATA LOGGING:
+- Logs every signal (traded and skipped) with full market context
+- Captures OHLCV data, indicators, and market conditions at signal time
+- Records trade results for supervised learning
+- Saved to CSV files for easy ML training
 """
 
 import os
@@ -20,6 +27,7 @@ import sys
 import time
 import json
 import logging
+import csv
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -46,6 +54,395 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+
+class MLTradeLogger:
+    """
+    ML Training Data Logger
+
+    Logs comprehensive data for every signal and trade for future ML training:
+    - Signal data: action, strength, confluence score, reason
+    - Market data: OHLCV, volume, indicators at multiple timeframes
+    - Trade results: entry, exit, PnL, duration, outcome
+
+    Data saved to CSV for easy ML model training.
+    """
+
+    def __init__(self, log_dir: str = None):
+        """Initialize ML logger."""
+        self.log_dir = log_dir or os.path.join(os.path.dirname(__file__), "ml_logs")
+        os.makedirs(self.log_dir, exist_ok=True)
+
+        # File paths
+        self.signals_file = os.path.join(self.log_dir, "signals_log.csv")
+        self.trades_file = os.path.join(self.log_dir, "trades_log.csv")
+        self.market_data_file = os.path.join(self.log_dir, "market_snapshots.csv")
+
+        # Initialize CSV files with headers if they don't exist
+        self._init_csv_files()
+
+        logger.info(f"ML Logger initialized - logs at: {self.log_dir}")
+
+    def _init_csv_files(self):
+        """Initialize CSV files with headers."""
+        # Signals log headers
+        if not os.path.exists(self.signals_file):
+            with open(self.signals_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    # Timestamp & ID
+                    'timestamp', 'signal_id', 'symbol',
+                    # Signal info
+                    'action', 'strength', 'confluence_score', 'reason',
+                    # Smart filter results
+                    'filters_passed', 'filter_reason',
+                    # Was trade executed?
+                    'trade_executed', 'skip_reason',
+                    # 5m (LTF) Price Data
+                    'ltf_open', 'ltf_high', 'ltf_low', 'ltf_close', 'ltf_volume',
+                    # 5m Indicators
+                    'ltf_ema9', 'ltf_ema21', 'ltf_ema50', 'ltf_rsi', 'ltf_macd', 'ltf_macd_signal', 'ltf_macd_hist',
+                    # 15m (HTF) Price Data
+                    'htf_open', 'htf_high', 'htf_low', 'htf_close', 'htf_volume',
+                    # 15m Indicators
+                    'htf_ema21', 'htf_ema50', 'htf_rsi',
+                    # 1m Data (for smart filters)
+                    'm1_close', 'm1_ema21', 'm1_distance_from_ema',
+                    # Volatility/Trend
+                    'atr_pct', 'adx',
+                    # Market structure
+                    'higher_high', 'higher_low', 'trend_direction',
+                    # Recent candle patterns
+                    'candle_body_ratio', 'candle_is_bullish',
+                    # Volume analysis
+                    'volume_sma20', 'volume_ratio',
+                    # Price levels
+                    'price_vs_daily_high', 'price_vs_daily_low',
+                ])
+
+        # Trades log headers
+        if not os.path.exists(self.trades_file):
+            with open(self.trades_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    # Trade ID (links to signal)
+                    'trade_id', 'signal_id', 'symbol',
+                    # Entry
+                    'entry_time', 'entry_price', 'position_side', 'quantity', 'margin',
+                    # TP/SL levels
+                    'tp_price', 'sl_price', 'tp_roi_target', 'sl_roi_target',
+                    # Exit
+                    'exit_time', 'exit_price', 'exit_type',
+                    # Results
+                    'pnl', 'roi_pct', 'price_move_pct', 'duration_minutes',
+                    # Outcome for ML
+                    'outcome',  # WIN/LOSS
+                    # Market conditions at entry
+                    'entry_atr_pct', 'entry_adx', 'entry_rsi', 'entry_volume_ratio',
+                    # Market conditions at exit
+                    'exit_atr_pct', 'exit_adx', 'exit_rsi',
+                ])
+
+        # Market snapshots headers
+        if not os.path.exists(self.market_data_file):
+            with open(self.market_data_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'timestamp', 'signal_id', 'symbol', 'timeframe',
+                    # Last 10 candles OHLCV
+                    'c0_open', 'c0_high', 'c0_low', 'c0_close', 'c0_volume',
+                    'c1_open', 'c1_high', 'c1_low', 'c1_close', 'c1_volume',
+                    'c2_open', 'c2_high', 'c2_low', 'c2_close', 'c2_volume',
+                    'c3_open', 'c3_high', 'c3_low', 'c3_close', 'c3_volume',
+                    'c4_open', 'c4_high', 'c4_low', 'c4_close', 'c4_volume',
+                    'c5_open', 'c5_high', 'c5_low', 'c5_close', 'c5_volume',
+                    'c6_open', 'c6_high', 'c6_low', 'c6_close', 'c6_volume',
+                    'c7_open', 'c7_high', 'c7_low', 'c7_close', 'c7_volume',
+                    'c8_open', 'c8_high', 'c8_low', 'c8_close', 'c8_volume',
+                    'c9_open', 'c9_high', 'c9_low', 'c9_close', 'c9_volume',
+                ])
+
+    def _generate_signal_id(self, symbol: str) -> str:
+        """Generate unique signal ID."""
+        return f"{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    def _calculate_indicators(self, df: pd.DataFrame) -> dict:
+        """Calculate indicators from OHLCV dataframe."""
+        if df is None or len(df) < 50:
+            return {}
+
+        close = df['close']
+        high = df['high']
+        low = df['low']
+        volume = df['volume']
+
+        # EMAs
+        ema9 = close.ewm(span=9, adjust=False).mean()
+        ema21 = close.ewm(span=21, adjust=False).mean()
+        ema50 = close.ewm(span=50, adjust=False).mean()
+
+        # RSI
+        delta = close.diff()
+        gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / (loss + 0.0001)
+        rsi = 100 - (100 / (1 + rs))
+
+        # MACD
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        macd = ema12 - ema26
+        macd_signal = macd.ewm(span=9, adjust=False).mean()
+        macd_hist = macd - macd_signal
+
+        # Volume SMA
+        vol_sma20 = volume.rolling(window=20).mean()
+
+        # ATR
+        tr1 = high - low
+        tr2 = abs(high - close.shift(1))
+        tr3 = abs(low - close.shift(1))
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=14).mean()
+
+        # ADX
+        plus_dm = high.diff()
+        minus_dm = -low.diff()
+        plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
+        minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
+        atr_smooth = tr.ewm(span=14, adjust=False).mean()
+        plus_di = 100 * (plus_dm.ewm(span=14, adjust=False).mean() / (atr_smooth + 0.0001))
+        minus_di = 100 * (minus_dm.ewm(span=14, adjust=False).mean() / (atr_smooth + 0.0001))
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 0.0001)
+        adx = dx.ewm(span=14, adjust=False).mean()
+
+        # Market structure
+        recent_highs = high.tail(20)
+        recent_lows = low.tail(20)
+        higher_high = high.iloc[-1] > high.iloc[-2] > high.iloc[-3]
+        higher_low = low.iloc[-1] > low.iloc[-2] > low.iloc[-3]
+
+        # Candle analysis
+        current = df.iloc[-1]
+        body = abs(current['close'] - current['open'])
+        total_range = current['high'] - current['low']
+        body_ratio = body / (total_range + 0.0001)
+        is_bullish = current['close'] > current['open']
+
+        return {
+            'open': current['open'],
+            'high': current['high'],
+            'low': current['low'],
+            'close': current['close'],
+            'volume': current['volume'],
+            'ema9': ema9.iloc[-1],
+            'ema21': ema21.iloc[-1],
+            'ema50': ema50.iloc[-1],
+            'rsi': rsi.iloc[-1],
+            'macd': macd.iloc[-1],
+            'macd_signal': macd_signal.iloc[-1],
+            'macd_hist': macd_hist.iloc[-1],
+            'atr': atr.iloc[-1],
+            'atr_pct': (atr.iloc[-1] / close.iloc[-1]) * 100,
+            'adx': adx.iloc[-1],
+            'vol_sma20': vol_sma20.iloc[-1],
+            'volume_ratio': current['volume'] / (vol_sma20.iloc[-1] + 0.0001),
+            'higher_high': higher_high,
+            'higher_low': higher_low,
+            'body_ratio': body_ratio,
+            'is_bullish': is_bullish,
+            'daily_high': high.tail(288).max(),  # ~24h of 5m candles
+            'daily_low': low.tail(288).min(),
+        }
+
+    def log_signal(self, symbol: str, signal, ltf_df: pd.DataFrame, htf_df: pd.DataFrame,
+                   m1_df: pd.DataFrame, filters_passed: bool, filter_reason: str,
+                   trade_executed: bool, skip_reason: str = "") -> str:
+        """
+        Log a signal with all market context for ML training.
+
+        Returns:
+            signal_id for linking to trade result
+        """
+        try:
+            signal_id = self._generate_signal_id(symbol)
+            timestamp = datetime.now().isoformat()
+
+            # Calculate indicators for each timeframe
+            ltf_ind = self._calculate_indicators(ltf_df)
+            htf_ind = self._calculate_indicators(htf_df)
+            m1_ind = self._calculate_indicators(m1_df) if m1_df is not None else {}
+
+            # Determine trend direction
+            if ltf_ind.get('ema21', 0) > ltf_ind.get('ema50', 0):
+                trend_direction = 'BULLISH'
+            elif ltf_ind.get('ema21', 0) < ltf_ind.get('ema50', 0):
+                trend_direction = 'BEARISH'
+            else:
+                trend_direction = 'NEUTRAL'
+
+            # Price vs daily range
+            current_price = ltf_ind.get('close', 0)
+            daily_high = ltf_ind.get('daily_high', current_price)
+            daily_low = ltf_ind.get('daily_low', current_price)
+            daily_range = daily_high - daily_low
+            price_vs_high = (daily_high - current_price) / (daily_range + 0.0001) if daily_range > 0 else 0.5
+            price_vs_low = (current_price - daily_low) / (daily_range + 0.0001) if daily_range > 0 else 0.5
+
+            # M1 distance from EMA
+            m1_distance = 0
+            if m1_ind:
+                m1_close = m1_ind.get('close', 0)
+                m1_ema21 = m1_ind.get('ema21', m1_close)
+                m1_distance = (m1_close - m1_ema21) / (m1_ema21 + 0.0001) * 100
+
+            # Write signal row
+            with open(self.signals_file, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    timestamp, signal_id, symbol,
+                    signal.action if signal else '',
+                    signal.strength.value if signal and hasattr(signal, 'strength') else '',
+                    signal.confluence_score if signal else 0,
+                    signal.reason if signal else '',
+                    filters_passed, filter_reason,
+                    trade_executed, skip_reason,
+                    # LTF data
+                    ltf_ind.get('open', ''), ltf_ind.get('high', ''), ltf_ind.get('low', ''),
+                    ltf_ind.get('close', ''), ltf_ind.get('volume', ''),
+                    ltf_ind.get('ema9', ''), ltf_ind.get('ema21', ''), ltf_ind.get('ema50', ''),
+                    ltf_ind.get('rsi', ''), ltf_ind.get('macd', ''),
+                    ltf_ind.get('macd_signal', ''), ltf_ind.get('macd_hist', ''),
+                    # HTF data
+                    htf_ind.get('open', ''), htf_ind.get('high', ''), htf_ind.get('low', ''),
+                    htf_ind.get('close', ''), htf_ind.get('volume', ''),
+                    htf_ind.get('ema21', ''), htf_ind.get('ema50', ''), htf_ind.get('rsi', ''),
+                    # M1 data
+                    m1_ind.get('close', ''), m1_ind.get('ema21', ''), m1_distance,
+                    # Volatility/Trend
+                    ltf_ind.get('atr_pct', ''), ltf_ind.get('adx', ''),
+                    # Market structure
+                    ltf_ind.get('higher_high', ''), ltf_ind.get('higher_low', ''), trend_direction,
+                    # Candle patterns
+                    ltf_ind.get('body_ratio', ''), ltf_ind.get('is_bullish', ''),
+                    # Volume
+                    ltf_ind.get('vol_sma20', ''), ltf_ind.get('volume_ratio', ''),
+                    # Price levels
+                    price_vs_high, price_vs_low,
+                ])
+
+            # Also save market snapshot (last 10 candles)
+            self._log_market_snapshot(signal_id, symbol, '5m', ltf_df)
+            self._log_market_snapshot(signal_id, symbol, '15m', htf_df)
+            if m1_df is not None:
+                self._log_market_snapshot(signal_id, symbol, '1m', m1_df)
+
+            logger.info(f"[ML] Signal logged: {signal_id}")
+            return signal_id
+
+        except Exception as e:
+            logger.error(f"[ML] Failed to log signal: {e}")
+            return ""
+
+    def _log_market_snapshot(self, signal_id: str, symbol: str, timeframe: str, df: pd.DataFrame):
+        """Log last 10 candles of market data."""
+        try:
+            if df is None or len(df) < 10:
+                return
+
+            timestamp = datetime.now().isoformat()
+            last_10 = df.tail(10)
+
+            row = [timestamp, signal_id, symbol, timeframe]
+
+            # Add last 10 candles (most recent first)
+            for i in range(10):
+                idx = -(i + 1)
+                if abs(idx) <= len(last_10):
+                    candle = last_10.iloc[idx]
+                    row.extend([
+                        candle['open'], candle['high'], candle['low'],
+                        candle['close'], candle['volume']
+                    ])
+                else:
+                    row.extend(['', '', '', '', ''])
+
+            with open(self.market_data_file, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+
+        except Exception as e:
+            logger.error(f"[ML] Failed to log market snapshot: {e}")
+
+    def log_trade_entry(self, signal_id: str, symbol: str, position_side: str,
+                        entry_price: float, quantity: float, margin: float,
+                        tp_price: float, sl_price: float, tp_roi: float, sl_roi: float,
+                        atr_pct: float, adx: float, rsi: float, volume_ratio: float) -> str:
+        """Log trade entry for later result matching."""
+        try:
+            trade_id = f"T_{signal_id}"
+            entry_time = datetime.now().isoformat()
+
+            # Write partial trade row (will be updated on exit)
+            with open(self.trades_file, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    trade_id, signal_id, symbol,
+                    entry_time, entry_price, position_side, quantity, margin,
+                    tp_price, sl_price, tp_roi, sl_roi,
+                    '', '', '',  # exit_time, exit_price, exit_type (filled on exit)
+                    '', '', '', '',  # pnl, roi, price_move, duration (filled on exit)
+                    '',  # outcome (filled on exit)
+                    atr_pct, adx, rsi, volume_ratio,
+                    '', '', '',  # exit conditions (filled on exit)
+                ])
+
+            logger.info(f"[ML] Trade entry logged: {trade_id}")
+            return trade_id
+
+        except Exception as e:
+            logger.error(f"[ML] Failed to log trade entry: {e}")
+            return ""
+
+    def log_trade_exit(self, trade_id: str, exit_price: float, exit_type: str,
+                       pnl: float, roi_pct: float, price_move_pct: float,
+                       duration_minutes: float, atr_pct: float = 0, adx: float = 0, rsi: float = 0):
+        """Update trade log with exit details."""
+        try:
+            # Read all trades
+            trades = []
+            with open(self.trades_file, 'r', newline='') as f:
+                reader = csv.reader(f)
+                trades = list(reader)
+
+            # Find and update the trade
+            for i, row in enumerate(trades):
+                if len(row) > 0 and row[0] == trade_id:
+                    # Update exit fields
+                    row[12] = datetime.now().isoformat()  # exit_time
+                    row[13] = exit_price  # exit_price
+                    row[14] = exit_type  # exit_type
+                    row[15] = pnl  # pnl
+                    row[16] = roi_pct  # roi_pct
+                    row[17] = price_move_pct  # price_move_pct
+                    row[18] = duration_minutes  # duration_minutes
+                    row[19] = 'WIN' if pnl > 0 else 'LOSS'  # outcome
+                    row[24] = atr_pct  # exit_atr_pct
+                    row[25] = adx  # exit_adx
+                    row[26] = rsi  # exit_rsi
+                    trades[i] = row
+                    break
+
+            # Write back all trades
+            with open(self.trades_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerows(trades)
+
+            outcome = 'WIN' if pnl > 0 else 'LOSS'
+            logger.info(f"[ML] Trade exit logged: {trade_id} - {outcome} (${pnl:+.2f})")
+
+        except Exception as e:
+            logger.error(f"[ML] Failed to log trade exit: {e}")
 
 
 class HTFConfluenceLiveEngine:
@@ -111,7 +508,7 @@ class HTFConfluenceLiveEngine:
 
         # Cooldown tracking (prevent over-trading)
         self.last_trade_time = {}  # symbol -> datetime
-        self.cooldown_minutes = 60  # 1 hour cooldown between trades per symbol
+        self.cooldown_minutes = 0  # No cooldown - trade whenever signal appears
 
         # Statistics - load from file if exists (persist across restarts)
         self.stats_file = os.path.join(os.path.dirname(__file__), "session_stats.json")
@@ -123,6 +520,19 @@ class HTFConfluenceLiveEngine:
         # Running state
         self.running = False
         self.check_interval = 60  # Check every 60 seconds (on 15m TF, no need for faster)
+
+        # ML TRAINING DATA LOGGER
+        self.ml_logger = MLTradeLogger()
+        self.active_trade_ids = {}  # symbol -> trade_id for linking entry to exit
+
+        # SMART ENTRY FILTER SETTINGS
+        self.use_1m_pullback = True        # Require pullback to 21 EMA on 1m
+        self.use_candle_confirm = True     # Require bullish/bearish candle
+        self.use_atr_filter = True         # Skip if ATR > max_atr_pct
+        self.use_adx_filter = True         # Skip if ADX < min_adx
+        self.max_atr_pct = 2.0             # Max ATR as % of price (skip if higher)
+        self.min_adx = 20                  # Min ADX for trending market
+        self.pullback_tolerance = 0.003    # 0.3% tolerance from 21 EMA
 
         logger.info("=" * 60)
         logger.info("HTF CONFLUENCE LIVE TRADING ENGINE")
@@ -141,6 +551,12 @@ class HTFConfluenceLiveEngine:
             tp_price = cfg["tp_roi"] / cfg["leverage"] * 100
             sl_price = cfg["sl_roi"] / cfg["leverage"] * 100
             logger.info(f"  {symbol}: TP {tp:.0f}% / SL {sl:.0f}% ROI ({rr:.1f}:1 R:R) | Price: TP {tp_price:.2f}% / SL {sl_price:.2f}%")
+        logger.info("-" * 60)
+        logger.info("SMART ENTRY FILTERS:")
+        logger.info(f"  1m Pullback to 21 EMA: {'ON' if self.use_1m_pullback else 'OFF'} (tolerance: {self.pullback_tolerance*100:.1f}%)")
+        logger.info(f"  Candle Confirmation: {'ON' if self.use_candle_confirm else 'OFF'}")
+        logger.info(f"  ATR Volatility Filter: {'ON' if self.use_atr_filter else 'OFF'} (max: {self.max_atr_pct}%)")
+        logger.info(f"  ADX Trend Filter: {'ON' if self.use_adx_filter else 'OFF'} (min: {self.min_adx})")
         logger.info("=" * 60)
 
     def _load_stats(self):
@@ -449,14 +865,15 @@ class HTFConfluenceLiveEngine:
             symbol: Trading symbol
 
         Returns:
-            (ltf_df, htf_df) - 15m and 4h DataFrames
+            (ltf_df, htf_df) - 5m and 15m DataFrames
         """
         try:
-            # Get 15m data (LTF) - need ~100 candles for indicators
-            ltf_df = self.client.get_klines(symbol, "15m", 150)
+            # Get 5m data (LTF) - for precise entries on scalping
+            ltf_df = self.client.get_klines(symbol, "5m", 150)
 
-            # Get 4h data (HTF) - need ~100 candles for 50 EMA
-            htf_df = self.client.get_klines(symbol, "4h", 150)
+            # Get 15m data (HTF) - trend filter for day trading/scalping
+            # Changed from 4h/1h to 15m for faster trend detection
+            htf_df = self.client.get_klines(symbol, "15m", 150)
 
             if ltf_df.empty or htf_df.empty:
                 logger.warning(f"[{symbol}] Empty data received")
@@ -467,6 +884,196 @@ class HTFConfluenceLiveEngine:
         except Exception as e:
             logger.error(f"[{symbol}] Failed to fetch market data: {e}")
             return None, None
+
+    def get_1m_data(self, symbol: str) -> pd.DataFrame:
+        """Fetch 1-minute data for precise pullback detection."""
+        try:
+            df = self.client.get_klines(symbol, "1m", 50)
+            return df
+        except Exception as e:
+            logger.error(f"[{symbol}] Failed to fetch 1m data: {e}")
+            return None
+
+    def calculate_ema(self, series: pd.Series, period: int) -> pd.Series:
+        """Calculate Exponential Moving Average."""
+        return series.ewm(span=period, adjust=False).mean()
+
+    def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> float:
+        """Calculate Average True Range as % of price."""
+        high = df["high"]
+        low = df["low"]
+        close = df["close"]
+
+        tr1 = high - low
+        tr2 = abs(high - close.shift(1))
+        tr3 = abs(low - close.shift(1))
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=period).mean().iloc[-1]
+
+        current_price = close.iloc[-1]
+        atr_pct = (atr / current_price) * 100
+        return atr_pct
+
+    def calculate_adx(self, df: pd.DataFrame, period: int = 14) -> float:
+        """Calculate Average Directional Index for trend strength."""
+        high = df["high"]
+        low = df["low"]
+        close = df["close"]
+
+        tr1 = high - low
+        tr2 = abs(high - close.shift(1))
+        tr3 = abs(low - close.shift(1))
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+        plus_dm = high.diff()
+        minus_dm = -low.diff()
+        plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
+        minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
+
+        atr = tr.ewm(span=period, adjust=False).mean()
+        plus_di = 100 * (plus_dm.ewm(span=period, adjust=False).mean() / atr)
+        minus_di = 100 * (minus_dm.ewm(span=period, adjust=False).mean() / atr)
+
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 0.0001)
+        adx = dx.ewm(span=period, adjust=False).mean()
+
+        return adx.iloc[-1] if not pd.isna(adx.iloc[-1]) else 0
+
+    def check_1m_pullback(self, symbol: str, direction: str) -> Tuple[bool, str]:
+        """
+        Check if price has pulled back to 21 EMA on 1-minute timeframe.
+
+        For LONG: Price should be near/touching 21 EMA from above (dip buy)
+        For SHORT: Price should be near/touching 21 EMA from below (rally sell)
+
+        Returns:
+            (passed, reason)
+        """
+        df = self.get_1m_data(symbol)
+        if df is None or len(df) < 25:
+            return True, "No 1m data (skipped)"
+
+        close = df["close"]
+        current_price = close.iloc[-1]
+        prev_price = close.iloc[-2]
+
+        ema21 = self.calculate_ema(close, 21)
+        ema_value = ema21.iloc[-1]
+
+        distance_from_ema = (current_price - ema_value) / ema_value
+
+        if direction in ["LONG", "BUY"]:
+            # For LONG: Price should be slightly above EMA (just bounced) or touching it
+            # Good: Price dipped to EMA and bouncing (distance -0.3% to +0.5%)
+            if -self.pullback_tolerance <= distance_from_ema <= 0.005:
+                if current_price >= prev_price:  # Bouncing up
+                    return True, f"1m pullback OK ({distance_from_ema*100:.2f}% from EMA, bouncing)"
+            return False, f"No 1m pullback ({distance_from_ema*100:.2f}% from EMA) - wait for dip"
+
+        elif direction in ["SHORT", "SELL"]:
+            # For SHORT: Price should be slightly below EMA (just rejected) or touching it
+            if -0.005 <= distance_from_ema <= self.pullback_tolerance:
+                if current_price <= prev_price:  # Rejecting down
+                    return True, f"1m rally OK ({distance_from_ema*100:.2f}% from EMA, rejecting)"
+            return False, f"No 1m rally ({distance_from_ema*100:.2f}% from EMA) - wait for rally"
+
+        return True, "Direction unknown"
+
+    def check_candle_confirmation(self, symbol: str, direction: str) -> Tuple[bool, str]:
+        """
+        Check if current 1m candle confirms the direction.
+
+        For LONG: Current candle should be bullish (close > open)
+        For SHORT: Current candle should be bearish (close < open)
+
+        Returns:
+            (passed, reason)
+        """
+        df = self.get_1m_data(symbol)
+        if df is None or len(df) < 3:
+            return True, "No 1m data (skipped)"
+
+        current = df.iloc[-1]
+        body = abs(current["close"] - current["open"])
+        total_range = current["high"] - current["low"]
+
+        if total_range == 0:
+            return False, "Doji candle (indecision)"
+
+        body_ratio = body / total_range
+
+        if direction in ["LONG", "BUY"]:
+            is_bullish = current["close"] > current["open"]
+            if is_bullish and body_ratio > 0.3:  # At least 30% body
+                lower_wick = min(current["close"], current["open"]) - current["low"]
+                upper_wick = current["high"] - max(current["close"], current["open"])
+                if lower_wick >= upper_wick:
+                    return True, "Bullish candle with rejection wick"
+                return True, "Bullish candle confirmed"
+            elif is_bullish:
+                return False, "Weak bullish candle (small body)"
+            return False, "Bearish candle - waiting for bullish"
+
+        elif direction in ["SHORT", "SELL"]:
+            is_bearish = current["close"] < current["open"]
+            if is_bearish and body_ratio > 0.3:
+                upper_wick = current["high"] - max(current["close"], current["open"])
+                lower_wick = min(current["close"], current["open"]) - current["low"]
+                if upper_wick >= lower_wick:
+                    return True, "Bearish candle with rejection wick"
+                return True, "Bearish candle confirmed"
+            elif is_bearish:
+                return False, "Weak bearish candle (small body)"
+            return False, "Bullish candle - waiting for bearish"
+
+        return True, "Direction unknown"
+
+    def check_smart_entry_filters(self, symbol: str, signal) -> Tuple[bool, str]:
+        """
+        Apply all smart entry filters to a signal.
+
+        Returns:
+            (passed, reason)
+        """
+        if not signal or not signal.action:
+            return True, "No signal"
+
+        direction = signal.action
+        failed_filters = []
+
+        # Get 5m data for ATR/ADX calculation
+        ltf_df, _ = self.get_market_data(symbol)
+        if ltf_df is None:
+            return True, "No data for filters"
+
+        # Filter 1: ATR volatility check
+        if self.use_atr_filter:
+            atr_pct = self.calculate_atr(ltf_df, 14)
+            if atr_pct > self.max_atr_pct:
+                failed_filters.append(f"ATR {atr_pct:.2f}% > {self.max_atr_pct}% (too choppy)")
+
+        # Filter 2: ADX trend check
+        if self.use_adx_filter:
+            adx = self.calculate_adx(ltf_df, 14)
+            if adx < self.min_adx:
+                failed_filters.append(f"ADX {adx:.1f} < {self.min_adx} (no trend)")
+
+        # Filter 3: 1m pullback check
+        if self.use_1m_pullback:
+            passed, reason = self.check_1m_pullback(symbol, direction)
+            if not passed:
+                failed_filters.append(reason)
+
+        # Filter 4: Candle confirmation
+        if self.use_candle_confirm:
+            passed, reason = self.check_candle_confirmation(symbol, direction)
+            if not passed:
+                failed_filters.append(reason)
+
+        if failed_filters:
+            return False, " | ".join(failed_filters)
+
+        return True, "All filters passed"
 
     def check_cooldown(self, symbol: str) -> bool:
         """
@@ -536,13 +1143,14 @@ class HTFConfluenceLiveEngine:
 
         return quantity
 
-    def open_position(self, symbol: str, signal) -> bool:
+    def open_position(self, symbol: str, signal, signal_id: str = "") -> bool:
         """
         Open a new position based on signal.
 
         Args:
             symbol: Trading symbol
             signal: ConfluenceSignal from strategy
+            signal_id: ML signal ID for linking trade to signal log
 
         Returns:
             True if position opened successfully
@@ -638,6 +1246,51 @@ class HTFConfluenceLiveEngine:
                 sl_order_id = sl_result.get("orderId") or sl_result.get("algoId")
                 logger.info(f"[{symbol}] SL order placed: {sl_order_id}")
 
+            # Calculate margin for ML logging
+            margin = (actual_qty * actual_entry) / self.leverage
+
+            # Get market conditions for ML logging
+            ltf_df, _ = self.get_market_data(symbol)
+            atr_pct = self.calculate_atr(ltf_df, 14) if ltf_df is not None else 0
+            adx = self.calculate_adx(ltf_df, 14) if ltf_df is not None else 0
+
+            # Calculate RSI for ML logging
+            rsi = 50  # default
+            if ltf_df is not None and len(ltf_df) >= 14:
+                delta = ltf_df['close'].diff()
+                gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                rs = gain / (loss + 0.0001)
+                rsi_series = 100 - (100 / (1 + rs))
+                rsi = rsi_series.iloc[-1] if not pd.isna(rsi_series.iloc[-1]) else 50
+
+            # Calculate volume ratio for ML logging
+            volume_ratio = 1.0
+            if ltf_df is not None and len(ltf_df) >= 20:
+                vol_sma = ltf_df['volume'].rolling(window=20).mean().iloc[-1]
+                volume_ratio = ltf_df['volume'].iloc[-1] / (vol_sma + 0.0001)
+
+            # LOG TRADE ENTRY FOR ML
+            if signal_id:
+                trade_id = self.ml_logger.log_trade_entry(
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    position_side=position_side,
+                    entry_price=actual_entry,
+                    quantity=actual_qty,
+                    margin=margin,
+                    tp_price=tp_price,
+                    sl_price=sl_price,
+                    tp_roi=sym_config['tp_roi'] * 100,
+                    sl_roi=sym_config['sl_roi'] * 100,
+                    atr_pct=atr_pct,
+                    adx=adx,
+                    rsi=rsi,
+                    volume_ratio=volume_ratio
+                )
+                # Store trade_id for linking to exit
+                self.active_trade_ids[symbol] = trade_id
+
             # Track position
             self.positions[symbol] = {
                 "side": position_side,
@@ -647,7 +1300,8 @@ class HTFConfluenceLiveEngine:
                 "sl_price": sl_price,
                 "entry_time": datetime.now(),
                 "signal_strength": signal.strength.value,
-                "confluence_score": signal.confluence_score
+                "confluence_score": signal.confluence_score,
+                "signal_id": signal_id  # Store for ML linking
             }
 
             # Save tracked positions for restart detection
@@ -687,6 +1341,7 @@ class HTFConfluenceLiveEngine:
             if not position or position["quantity"] == 0:
                 # Position closed - get actual realized PnL from API
                 entry_price = tracked["entry_price"]
+                entry_time = tracked.get("entry_time", datetime.now())
 
                 # Query income history to get actual realized PnL
                 try:
@@ -715,6 +1370,18 @@ class HTFConfluenceLiveEngine:
                 margin = (tracked["quantity"] * entry_price) / self.leverage
                 roi = (pnl / margin) * 100 if margin > 0 else 0
 
+                # Calculate price move %
+                exit_price = tracked["tp_price"] if exit_type == "TP" else tracked["sl_price"]
+                if tracked["side"] == "LONG":
+                    price_move_pct = (exit_price - entry_price) / entry_price * 100
+                else:
+                    price_move_pct = (entry_price - exit_price) / entry_price * 100
+
+                # Calculate duration
+                duration_minutes = 0
+                if isinstance(entry_time, datetime):
+                    duration_minutes = (datetime.now() - entry_time).total_seconds() / 60
+
                 if exit_type == "TP":
                     self.wins_today += 1
                     self.symbol_stats[symbol]["wins"] += 1
@@ -727,6 +1394,37 @@ class HTFConfluenceLiveEngine:
                 self.pnl_today += pnl
                 self.symbol_stats[symbol]["pnl"] += pnl
                 self.trades_today += 1
+
+                # LOG TRADE EXIT FOR ML
+                if symbol in self.active_trade_ids:
+                    trade_id = self.active_trade_ids[symbol]
+
+                    # Get current market conditions for exit logging
+                    ltf_df, _ = self.get_market_data(symbol)
+                    exit_atr = self.calculate_atr(ltf_df, 14) if ltf_df is not None else 0
+                    exit_adx = self.calculate_adx(ltf_df, 14) if ltf_df is not None else 0
+                    exit_rsi = 50
+                    if ltf_df is not None and len(ltf_df) >= 14:
+                        delta = ltf_df['close'].diff()
+                        gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+                        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                        rs = gain / (loss + 0.0001)
+                        rsi_series = 100 - (100 / (1 + rs))
+                        exit_rsi = rsi_series.iloc[-1] if not pd.isna(rsi_series.iloc[-1]) else 50
+
+                    self.ml_logger.log_trade_exit(
+                        trade_id=trade_id,
+                        exit_price=exit_price,
+                        exit_type=exit_type,
+                        pnl=pnl,
+                        roi_pct=roi,
+                        price_move_pct=price_move_pct,
+                        duration_minutes=duration_minutes,
+                        atr_pct=exit_atr,
+                        adx=exit_adx,
+                        rsi=exit_rsi
+                    )
+                    del self.active_trade_ids[symbol]
 
                 # Save stats and update tracked positions
                 self._save_stats()
@@ -760,12 +1458,13 @@ class HTFConfluenceLiveEngine:
             logger.error(f"[{symbol}] Failed to check position: {e}")
             return None
 
-    def analyze_symbol(self, symbol: str) -> Optional[dict]:
+    def analyze_symbol(self, symbol: str, verbose: bool = False) -> Optional[dict]:
         """
         Analyze a symbol for trading signals.
 
         Args:
             symbol: Trading symbol
+            verbose: Show detailed indicator breakdown
 
         Returns:
             Signal dict or None
@@ -784,12 +1483,73 @@ class HTFConfluenceLiveEngine:
             if signal.action:
                 logger.info(f"[{symbol}] Signal: {signal.action} | Strength: {signal.strength.value} | Score: {signal.confluence_score}/4")
                 logger.info(f"[{symbol}] Reason: {signal.reason}")
+            elif verbose:
+                # Show detailed indicator breakdown when no signal
+                self._log_signal_diagnostics(symbol, ltf_df, htf_df, signal)
 
             return signal
 
         except Exception as e:
             logger.error(f"[{symbol}] Analysis failed: {e}")
             return None
+
+    def _log_signal_diagnostics(self, symbol: str, ltf_df: pd.DataFrame, htf_df: pd.DataFrame, signal):
+        """Log detailed indicator breakdown for signal diagnostics."""
+        try:
+            # Calculate LTF (5m) indicators
+            ltf_close = ltf_df['close']
+            ltf_ema9 = ltf_close.ewm(span=9, adjust=False).mean().iloc[-1]
+            ltf_ema21 = ltf_close.ewm(span=21, adjust=False).mean().iloc[-1]
+            ltf_ema50 = ltf_close.ewm(span=50, adjust=False).mean().iloc[-1]
+            ltf_price = ltf_close.iloc[-1]
+
+            # RSI
+            delta = ltf_close.diff()
+            gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / (loss + 0.0001)
+            ltf_rsi = (100 - (100 / (1 + rs))).iloc[-1]
+
+            # MACD
+            ema12 = ltf_close.ewm(span=12, adjust=False).mean()
+            ema26 = ltf_close.ewm(span=26, adjust=False).mean()
+            macd = ema12 - ema26
+            macd_signal = macd.ewm(span=9, adjust=False).mean()
+            ltf_macd = macd.iloc[-1]
+            ltf_macd_sig = macd_signal.iloc[-1]
+            macd_cross = "BULL" if ltf_macd > ltf_macd_sig else "BEAR"
+
+            # HTF (15m) indicators
+            htf_close = htf_df['close']
+            htf_ema21 = htf_close.ewm(span=21, adjust=False).mean().iloc[-1]
+            htf_ema50 = htf_close.ewm(span=50, adjust=False).mean().iloc[-1]
+
+            # Trend direction
+            trend = signal.trend.value if hasattr(signal, 'trend') else "?"
+
+            # EMA alignment check
+            ltf_ema_bullish = ltf_ema9 > ltf_ema21 > ltf_ema50
+            ltf_ema_bearish = ltf_ema9 < ltf_ema21 < ltf_ema50
+            htf_ema_bullish = htf_ema21 > htf_ema50
+            htf_ema_bearish = htf_ema21 < htf_ema50
+
+            # Build status indicators
+            ema_status = "✓" if (ltf_ema_bullish or ltf_ema_bearish) else "✗"
+            rsi_status = "✓" if (30 < ltf_rsi < 70) else "✗"  # Not overbought/oversold
+            macd_status = "✓" if ((trend == "BULLISH" and ltf_macd > ltf_macd_sig) or (trend == "BEARISH" and ltf_macd < ltf_macd_sig)) else "✗"
+
+            # Log compact diagnostics
+            logger.info(f"┌─ {symbol} SIGNAL CHECK ──────────────────────────")
+            logger.info(f"│ Trend: {trend} | Price: ${ltf_price:.4f}")
+            logger.info(f"│ 5m EMA: 9={ltf_ema9:.4f} | 21={ltf_ema21:.4f} | 50={ltf_ema50:.4f}")
+            logger.info(f"│ 5m RSI: {ltf_rsi:.1f} | MACD: {ltf_macd:.6f} vs Sig: {ltf_macd_sig:.6f} ({macd_cross})")
+            logger.info(f"│ 15m EMA: 21={htf_ema21:.4f} | 50={htf_ema50:.4f}")
+            logger.info(f"│ Checks: EMA-align:{ema_status} RSI:{rsi_status} MACD:{macd_status}")
+            logger.info(f"│ Score: {signal.confluence_score}/4 | Reason: {signal.reason if signal.reason else 'Waiting for confluence'}")
+            logger.info(f"└────────────────────────────────────────────────")
+
+        except Exception as e:
+            logger.debug(f"[{symbol}] Diagnostics error: {e}")
 
     def run_cycle(self):
         """Run one trading cycle."""
@@ -848,28 +1608,79 @@ class HTFConfluenceLiveEngine:
                 if not self.check_cooldown(symbol):
                     continue
 
-                # Analyze for new signal
-                signal = self.analyze_symbol(symbol)
+                # Get market data for ML logging
+                ltf_df, htf_df = self.get_market_data(symbol)
+                m1_df = self.get_1m_data(symbol)
+
+                # Analyze for new signal (verbose=True shows diagnostics when no signal)
+                signal = self.analyze_symbol(symbol, verbose=True)
 
                 if signal and signal.action:
                     # We have a signal - check if strong enough
                     if signal.confluence_score >= 3:
                         logger.info(f"[{symbol}] SIGNAL: {signal.action} (Score: {signal.confluence_score}/4)")
 
-                        # Open position
-                        if self.open_position(symbol, signal):
-                            logger.info(f"[{symbol}] Position opened successfully")
+                        # Apply SMART ENTRY FILTERS before opening
+                        filters_passed, filter_reason = self.check_smart_entry_filters(symbol, signal)
+
+                        if filters_passed:
+                            logger.info(f"[{symbol}] Smart filters: {filter_reason}")
+
+                            # LOG SIGNAL FOR ML (will be traded)
+                            signal_id = self.ml_logger.log_signal(
+                                symbol=symbol,
+                                signal=signal,
+                                ltf_df=ltf_df,
+                                htf_df=htf_df,
+                                m1_df=m1_df,
+                                filters_passed=True,
+                                filter_reason=filter_reason,
+                                trade_executed=True,
+                                skip_reason=""
+                            )
+
+                            # Open position
+                            if self.open_position(symbol, signal, signal_id):
+                                logger.info(f"[{symbol}] Position opened successfully")
+                            else:
+                                logger.warning(f"[{symbol}] Failed to open position")
                         else:
-                            logger.warning(f"[{symbol}] Failed to open position")
+                            # Filters not passed - wait for better entry
+                            logger.info(f"[{symbol}] WAITING - Filters not passed:")
+                            logger.info(f"[{symbol}]   {filter_reason}")
+
+                            # LOG SKIPPED SIGNAL FOR ML (filters failed)
+                            self.ml_logger.log_signal(
+                                symbol=symbol,
+                                signal=signal,
+                                ltf_df=ltf_df,
+                                htf_df=htf_df,
+                                m1_df=m1_df,
+                                filters_passed=False,
+                                filter_reason=filter_reason,
+                                trade_executed=False,
+                                skip_reason="Smart filters not passed"
+                            )
                     else:
                         # Show signal status when not strong enough
                         trend_str = signal.trend.value if hasattr(signal, 'trend') else "?"
                         logger.info(f"[{symbol}] Watching | Trend: {trend_str} | Signal: {signal.action} ({signal.confluence_score}/4) - waiting for stronger confluence")
+
+                        # LOG WEAK SIGNAL FOR ML (confluence too low)
+                        self.ml_logger.log_signal(
+                            symbol=symbol,
+                            signal=signal,
+                            ltf_df=ltf_df,
+                            htf_df=htf_df,
+                            m1_df=m1_df,
+                            filters_passed=False,
+                            filter_reason="N/A",
+                            trade_executed=False,
+                            skip_reason=f"Low confluence ({signal.confluence_score}/4)"
+                        )
                 else:
-                    # No signal - show what we're looking for
-                    if signal:
-                        trend_str = signal.trend.value if hasattr(signal, 'trend') else "NEUTRAL"
-                        logger.info(f"[{symbol}] Watching | Trend: {trend_str} | No entry signal")
+                    # No signal - diagnostics already shown by analyze_symbol(verbose=True)
+                    pass
 
             except Exception as e:
                 logger.error(f"[{symbol}] Cycle error: {e}")
@@ -963,7 +1774,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="HTF Confluence Live Trading Engine")
-    parser.add_argument("--symbols", nargs="+", default=["DOTUSDT", "BNBUSDT"],
+    parser.add_argument("--symbols", nargs="+", default=["DOTUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT"],
                         help="Symbols to trade")
     parser.add_argument("--live", action="store_true",
                         help="Use live mainnet (default: demo/testnet)")

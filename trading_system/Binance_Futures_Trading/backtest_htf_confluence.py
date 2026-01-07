@@ -171,7 +171,12 @@ class HTFConfluenceBacktester:
             return df[["open", "high", "low", "close", "volume"]]
 
         try:
-            ltf_days = min(days, 60)
+            # For scalping: LTF = 5m, HTF = 15m
+            # Override ltf_interval to 5m for scalping backtest
+            ltf_interval = "5m"
+            htf_interval = "15m"
+
+            ltf_days = min(days, 30)  # 5m data limited to 30 days for API limits
             print(f"  Fetching {ltf_interval} data (last {ltf_days} days)...")
             ltf_df = fetch_binance_futures_klines(self.symbol, ltf_interval, ltf_days)
 
@@ -179,16 +184,16 @@ class HTFConfluenceBacktester:
                 print(f"ERROR: No LTF data returned for {self.symbol}")
                 return None, None
 
-            htf_days = days + 50
-            print(f"  Fetching 4h data (last {htf_days} days)...")
-            htf_df = fetch_binance_futures_klines(self.symbol, "4h", htf_days)
+            htf_days = days + 10
+            print(f"  Fetching {htf_interval} data (last {htf_days} days)...")
+            htf_df = fetch_binance_futures_klines(self.symbol, htf_interval, htf_days)
 
             if htf_df is None or len(htf_df) == 0:
                 print(f"ERROR: No HTF data returned for {self.symbol}")
                 return None, None
 
             print(f"  LTF ({ltf_interval}): {len(ltf_df)} candles")
-            print(f"  HTF (4h): {len(htf_df)} candles")
+            print(f"  HTF ({htf_interval}): {len(htf_df)} candles")
 
             return ltf_df, htf_df
 

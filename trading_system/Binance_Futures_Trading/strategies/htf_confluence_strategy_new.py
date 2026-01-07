@@ -4,8 +4,8 @@ HTF Trend + Confluence Strategy
 Combines high win-rate indicators with higher timeframe trend detection.
 
 Key Components:
-1. HTF (4H) Trend Detection - 200 EMA filter
-2. Entry Signals - MACD + RSI + EMA (9/21) crossover confluence
+1. HTF (15m) Trend Detection - 50 EMA filter
+2. Entry Signals - MACD + RSI + EMA (9/21) crossover confluence (5m)
 3. Single Direction Trading - Follow the trend, no hedging
 4. Lower Leverage - 5-10x for better risk management
 
@@ -16,14 +16,14 @@ Research Base:
 
 Entry Conditions (ALL must be met):
 LONG:
-  - HTF: Price > 200 EMA (4H)
-  - LTF: 9 EMA crosses above 21 EMA
+  - HTF: Price > 50 EMA (15m)
+  - LTF: 9 EMA crosses above 21 EMA (5m)
   - RSI: Between 40-65 (not overbought)
   - MACD: Histogram bullish (> 0) or MACD line crossing above signal
 
 SHORT:
-  - HTF: Price < 200 EMA (4H)
-  - LTF: 9 EMA crosses below 21 EMA
+  - HTF: Price < 50 EMA (15m)
+  - LTF: 9 EMA crosses below 21 EMA (5m)
   - RSI: Between 35-60 (not oversold)
   - MACD: Histogram bearish (< 0) or MACD line crossing below signal
 
@@ -95,10 +95,10 @@ class HTFConfluenceStrategy:
         self.sl_roi = sl_roi
 
         # HTF trend settings
-        # Use 50 EMA instead of 200 - more responsive and accurate with limited data
-        self.htf_ema_period = 50           # 50 EMA on 4H for trend (200 needs too much history)
+        # Use 50 EMA on 15m timeframe for trend filter
+        self.htf_ema_period = 50           # 50 EMA on 15m for trend (responsive to market changes)
 
-        # LTF entry settings (15m or 1H)
+        # LTF entry settings (5m timeframe)
         self.ema_fast = 9                   # Fast EMA
         self.ema_slow = 21                  # Slow EMA
 
@@ -134,8 +134,8 @@ class HTFConfluenceStrategy:
         self.atr_spike_threshold = 1.5      # ATR > 1.5x average = spiking (choppy)
         self.atr_avg_period = 20            # Period to calculate average ATR
 
-        # Cooldown - reduced for day trading (5m bars)
-        self.min_bars_between_signals = 6   # Wait 6 bars (30 min on 5m) between signals
+        # Cooldown - increased to reduce over-trading
+        self.min_bars_between_signals = 12   # Wait 12 bars (1 hour on 5m) between signals
         self.last_signal_bar = -999
 
         # Minimum confluence score (keep 3 but with stricter individual conditions)
@@ -226,7 +226,7 @@ class HTFConfluenceStrategy:
         Calculate all technical indicators for LTF data.
 
         Args:
-            df: OHLCV DataFrame (15m or 1H timeframe)
+            df: OHLCV DataFrame (5m timeframe)
 
         Returns:
             Dict with all indicator values
@@ -327,7 +327,7 @@ class HTFConfluenceStrategy:
         More responsive than single EMA approach.
 
         Args:
-            htf_df: 4H OHLCV DataFrame
+            htf_df: 15m OHLCV DataFrame
 
         Returns:
             (trend_direction, distance_from_ema_pct)
@@ -506,8 +506,8 @@ class HTFConfluenceStrategy:
         Determine if should enter a position.
 
         Args:
-            ltf_df: Lower timeframe OHLCV data (15m or 1H)
-            htf_df: Higher timeframe OHLCV data (4H)
+            ltf_df: Lower timeframe OHLCV data (5m)
+            htf_df: Higher timeframe OHLCV data (15m)
             current_bar: Current bar index for cooldown tracking
 
         Returns:
@@ -695,22 +695,6 @@ class HTFConfluenceStrategy:
 # =============================================================================
 # Configuration for different risk profiles
 # =============================================================================
-# =============================================================================
-# IMPORTANT: ROI vs Price Move
-# =============================================================================
-# ROI = Return on Margin (what you see in Binance)
-# Price Move = ROI / Leverage
-#
-# Example with 20x leverage:
-#   - 10% ROI = 0.5% price move
-#   - 20% ROI = 1% price move
-#   - 100% ROI = 5% price move (double your money)
-#   - 400% ROI = 20% price move (possible in strong trends!)
-#
-# SL should be tight (10-20% ROI) to protect capital
-# TP can be wide (30-100%+ ROI) in trending markets
-# =============================================================================
-
 CONSERVATIVE_CONFIG = {
     "leverage": 10,
     "tp_roi": 0.20,     # 20% ROI (TP) = 2% price move
@@ -729,133 +713,14 @@ AGGRESSIVE_CONFIG = {
     "sl_roi": 0.15,     # 15% ROI (SL) = 0.75% price move | 3.3:1 R:R
 }
 
-# OPTIMIZED CONFIG - Based on user's live trading (20x leverage)
-# Wider TP to catch trends, tight SL to protect capital
 OPTIMIZED_CONFIG = {
     "leverage": 20,
     "tp_roi": 0.40,     # 40% ROI (TP) = 2% price move
     "sl_roi": 0.10,     # 10% ROI (SL) = 0.5% price move | 4:1 R:R
 }
 
-# SWING CONFIG - For catching bigger moves in trending markets
-# Can hit 100%+ ROI in strong trends
 SWING_CONFIG = {
     "leverage": 20,
     "tp_roi": 1.00,     # 100% ROI (TP) = 5% price move (double your money)
     "sl_roi": 0.20,     # 20% ROI (SL) = 1% price move | 5:1 R:R
 }
-
-# =============================================================================
-# ASSET-SPECIFIC OPTIMIZED CONFIGS (from 60-day backtest optimization)
-# =============================================================================
-# Each asset has different volatility characteristics:
-# - DOT: More volatile, needs wider SL (15% ROI = 0.75% price move)
-# - BNB: Less volatile, tight SL works (10% ROI = 0.5% price move)
-# - AVAX: Trending well, tight SL works (10% ROI = 0.5% price move)
-#
-# Optimization results (60-day backtest):
-# Optimized with REAL Binance Futures data (60-day backtest Jan 2026)
-# Total: +165.8% return over 60 days
-# =============================================================================
-ASSET_SPECIFIC_CONFIG = {
-    "DOTUSDT": {
-        "leverage": 20,
-        "tp_roi": 0.75,     # 75% ROI (TP) = 3.75% price move
-        "sl_roi": 0.35,     # 35% ROI (SL) = 1.75% price move | 2.14:1 R:R
-    },
-    "BNBUSDT": {
-        "leverage": 20,
-        "tp_roi": 0.30,     # 30% ROI (TP) = 1.5% price move
-        "sl_roi": 0.15,     # 15% ROI (SL) = 0.75% price move | 2:1 R:R
-    },
-    "XRPUSDT": {
-        "leverage": 20,
-        "tp_roi": 0.40,     # 40% ROI (TP) = 2% price move
-        "sl_roi": 0.25,     # 25% ROI (SL) = 1.25% price move | 1.6:1 R:R
-    },
-    "ADAUSDT": {
-        "leverage": 20,
-        "tp_roi": 0.60,     # 60% ROI (TP) = 3% price move
-        "sl_roi": 0.25,     # 25% ROI (SL) = 1.25% price move | 2.4:1 R:R
-    },
-}
-
-def get_config_for_symbol(symbol: str) -> dict:
-    """
-    Get the optimized config for a specific symbol.
-    Falls back to MODERATE_CONFIG if symbol not in asset-specific configs.
-    """
-    return ASSET_SPECIFIC_CONFIG.get(symbol, MODERATE_CONFIG)
-
-
-# =============================================================================
-# Test
-# =============================================================================
-if __name__ == "__main__":
-    import sys
-    import os
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-    print("\n" + "="*60)
-    print("HTF CONFLUENCE STRATEGY - TEST")
-    print("="*60)
-
-    # Create sample data
-    np.random.seed(42)
-
-    # Simulate bullish trending market
-    print("\nSimulating BULLISH trend scenario...")
-
-    # 4H data (HTF) - 250 candles for 200 EMA
-    htf_prices = [50000]
-    for i in range(249):
-        change = np.random.uniform(0.001, 0.003)  # Uptrend
-        htf_prices.append(htf_prices[-1] * (1 + change))
-
-    htf_df = pd.DataFrame({
-        "open": htf_prices,
-        "high": [p * 1.002 for p in htf_prices],
-        "low": [p * 0.998 for p in htf_prices],
-        "close": htf_prices,
-    })
-
-    # 15m data (LTF) - 100 candles
-    ltf_prices = [htf_prices[-1]]
-    for i in range(99):
-        change = np.random.uniform(-0.001, 0.002)  # Slight uptrend
-        if i > 90:  # Recent momentum
-            change = np.random.uniform(0.001, 0.003)
-        ltf_prices.append(ltf_prices[-1] * (1 + change))
-
-    ltf_df = pd.DataFrame({
-        "open": ltf_prices,
-        "high": [p * 1.001 for p in ltf_prices],
-        "low": [p * 0.999 for p in ltf_prices],
-        "close": ltf_prices,
-    })
-
-    # Test strategy
-    strategy = HTFConfluenceStrategy(**MODERATE_CONFIG)
-    signal = strategy.should_enter(ltf_df, htf_df)
-
-    print(f"\nSignal Results:")
-    print(f"  Action: {signal.action}")
-    print(f"  Strength: {signal.strength.value}")
-    print(f"  Confidence: {signal.confidence:.1%}")
-    print(f"  HTF Trend: {signal.trend.value}")
-    print(f"  Confluence Score: {signal.confluence_score}/4")
-    print(f"  Reason: {signal.reason}")
-
-    if signal.action:
-        print(f"\n  Entry Price: ${signal.entry_price:,.2f}")
-        print(f"  Stop Loss: ${signal.stop_loss:,.2f}")
-        print(f"  Take Profit: ${signal.take_profit:,.2f}")
-
-    print(f"\n  Key Indicators:")
-    print(f"    RSI: {signal.indicators.get('rsi', 0):.1f}")
-    print(f"    MACD Histogram: {signal.indicators.get('macd_histogram', 0):.4f}")
-    print(f"    EMA Fast: {signal.indicators.get('ema_fast', 0):,.2f}")
-    print(f"    EMA Slow: {signal.indicators.get('ema_slow', 0):,.2f}")
-    print(f"    HTF Distance: {signal.indicators.get('htf_distance_pct', 0):+.2f}%")
-
-    print("\n" + "="*60)
