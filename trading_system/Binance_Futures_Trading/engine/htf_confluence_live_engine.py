@@ -1418,13 +1418,14 @@ class HTFConfluenceLiveEngine:
             logger.info(f"[{symbol}] PROFIT LOCK triggered at {roi:+.1f}% ROI - Trend reversed!")
 
             # Close position using proper client method
-            position_side = pos["side"]
+            position_side = pos["side"]  # "LONG" or "SHORT"
             close_side = "SELL" if position_side == "LONG" else "BUY"
 
             result = self.client.place_market_order(
                 symbol=symbol,
                 side=close_side,
-                quantity=pos["quantity"]
+                quantity=pos["quantity"],
+                position_side=position_side  # Required for hedge mode
             )
 
             if result:
@@ -1616,13 +1617,15 @@ class HTFConfluenceLiveEngine:
         """Close position early for fakeout protection."""
         try:
             pos = self.positions[symbol]
-            close_side = "SELL" if pos["side"] == "LONG" else "BUY"
+            position_side = pos["side"]  # "LONG" or "SHORT"
+            close_side = "SELL" if position_side == "LONG" else "BUY"
 
             # Close position using proper client method
             result = self.client.place_market_order(
                 symbol=symbol,
                 side=close_side,
-                quantity=pos["quantity"]
+                quantity=pos["quantity"],
+                position_side=position_side  # Required for hedge mode
             )
 
             if result:
@@ -1726,13 +1729,15 @@ class HTFConfluenceLiveEngine:
 
             try:
                 pos = self.positions[symbol]
-                close_side = "SELL" if pos["side"] == "LONG" else "BUY"
+                position_side = pos["side"]  # "LONG" or "SHORT"
+                close_side = "SELL" if position_side == "LONG" else "BUY"
 
                 # Close position using proper client method
                 result = self.client.place_market_order(
                     symbol=symbol,
                     side=close_side,
-                    quantity=pos["quantity"]
+                    quantity=pos["quantity"],
+                    position_side=position_side  # Required for hedge mode
                 )
 
                 if result:
