@@ -546,6 +546,13 @@ class HTFConfluenceLiveEngine:
         self.small_profit_exit_roi = 10.0     # Close if ROI < this and confirms <= 1
         self.damage_control_roi = -15.0       # Close immediately if ROI below this and reversed
 
+        # TRAILING PROFIT LOCK - Never give back too much profit
+        self.use_trailing_profit_lock = True
+        self.peak_roi = {}                    # symbol -> highest ROI reached
+        self.trailing_lock_activation = 30.0  # Start trailing after 30% ROI
+        self.trailing_lock_distance = 15.0    # Close if ROI drops 15% from peak
+        self.trailing_lock_min_floor = 15.0   # Never let floor go below 15% ROI
+
         logger.info("=" * 60)
         logger.info("HTF CONFLUENCE LIVE TRADING ENGINE")
         logger.info("=" * 60)
@@ -581,6 +588,13 @@ class HTFConfluenceLiveEngine:
         logger.info(f"  ROI 0-{self.small_profit_exit_roi}% + confirms ≤1: Small profit exit")
         logger.info(f"  ROI -10-0% + confirms ≤1: Cut loss early")
         logger.info(f"  ROI < {self.damage_control_roi}%: Damage control (immediate close)")
+        logger.info("-" * 60)
+        logger.info("TRAILING PROFIT LOCK:")
+        logger.info(f"  Trailing Lock: {'ON' if self.use_trailing_profit_lock else 'OFF'}")
+        logger.info(f"  Activates at: {self.trailing_lock_activation}% ROI")
+        logger.info(f"  Floor distance: {self.trailing_lock_distance}% below peak")
+        logger.info(f"  Minimum floor: {self.trailing_lock_min_floor}% ROI")
+        logger.info(f"  Example: Peak 34% → Floor 19% → Close if drops to 19%")
         logger.info("=" * 60)
 
     def _load_stats(self):
@@ -1685,6 +1699,119 @@ class HTFConfluenceLiveEngine:
         except Exception as e:
             logger.error(f"[{symbol}] Failed to close position early: {e}")
 
+    def check_trailing_profit_lock(self, symbol: str, roi: float) -> bool:
+        """
+        Trailing profit lock - never give back too much profit.
+
+        Once ROI hits 30%, we track the peak and close if it drops too much.
+
+        Logic:
+        - Track peak ROI for each position
+        - Once peak >= 30%, set a floor at (peak - 15%) but minimum 15%
+        - If ROI drops to floor, close to lock profit
+
+        Example:
+        - Peak hits 34% → floor = 34 - 15 = 19%
+        - If ROI drops to 19% → close and lock +19% profit
+
+        Returns:
+            True if position was closed
+        """
+        if not self.use_trailing_profit_lock:
+            return False
+
+        if symbol not in self.positions:
+            return False
+
+        # Initialize peak tracking if not exists
+        if symbol not in self.peak_roi:
+            self.peak_roi[symbol] = roi
+
+        # Update peak if current ROI is higher
+        if roi > self.peak_roi[symbol]:
+            self.peak_roi[symbol] = roi
+
+        peak = self.peak_roi[symbol]
+
+        # Only activate trailing lock once peak hits threshold
+        if peak < self.trailing_lock_activation:
+            return False
+
+        # Calculate floor: peak - distance, but minimum floor
+        floor = max(peak - self.trailing_lock_distance, self.trailing_lock_min_floor)
+
+        # Check if ROI dropped to floor
+        if roi <= floor:
+            logger.info(f"[{symbol}] 📉 TRAILING PROFIT LOCK: ROI dropped from peak {peak:.1f}% to {roi:.1f}% (floor: {floor:.1f}%)")
+
+            try:
+                pos = self.positions[symbol]
+                close_side = "SELL" if pos["side"] == "LONG" else "BUY"
+
+                # Close position
+                result = self.client.client.futures_create_order(
+                    symbol=symbol,
+                    side=close_side,
+                    type="MARKET",
+                    quantity=pos["quantity"],
+                    reduceOnly=True
+                )
+
+                if result:
+                    # Get actual PnL
+                    time.sleep(1)
+                    try:
+                        income = self.client.get_income_history(symbol=symbol, income_type="REALIZED_PNL", limit=1)
+                        pnl = float(income[0].get("income", 0)) if income else 0
+                    except:
+                        margin = (pos["quantity"] * pos["entry_price"]) / self.leverage
+                        pnl = margin * (roi / 100)
+
+                    # Update stats (this is a WIN - we locked profit)
+                    self.wins_today += 1
+                    self.symbol_stats[symbol]["wins"] += 1
+                    self.pnl_today += pnl
+                    self.symbol_stats[symbol]["pnl"] += pnl
+                    self.trades_today += 1
+
+                    logger.info(f"[{symbol}] TRAILING LOCK WIN! Peak: {peak:.1f}% → Locked: {roi:.1f}% | PnL: ${pnl:+.2f}")
+
+                    # Log to ML
+                    if symbol in self.active_trade_ids:
+                        trade_id = self.active_trade_ids[symbol]
+                        entry_time = pos.get("entry_time", datetime.now())
+                        duration = (datetime.now() - entry_time).total_seconds() / 60 if isinstance(entry_time, datetime) else 0
+                        price_data = self.client.get_current_price(symbol)
+                        self.ml_logger.log_trade_exit(
+                            trade_id=trade_id,
+                            exit_price=price_data["price"],
+                            exit_type="TRAILING_PROFIT_LOCK",
+                            pnl=pnl,
+                            roi_pct=roi,
+                            price_move_pct=roi / self.leverage,
+                            duration_minutes=duration
+                        )
+                        del self.active_trade_ids[symbol]
+
+                    # Clean up
+                    del self.positions[symbol]
+                    if symbol in self.peak_roi:
+                        del self.peak_roi[symbol]
+                    if symbol in self.reversal_cycles:
+                        del self.reversal_cycles[symbol]
+                    self._save_tracked_positions()
+                    self._save_stats()
+
+                    # Cancel any remaining orders
+                    self.client.cancel_all_orders(symbol)
+
+                    return True
+
+            except Exception as e:
+                logger.error(f"[{symbol}] Failed to execute trailing profit lock: {e}")
+
+        return False
+
     def check_position(self, symbol: str) -> Optional[str]:
         """
         Check if position was closed (TP or SL hit).
@@ -1956,6 +2083,10 @@ class HTFConfluenceLiveEngine:
                                 to_tp_price = (current_price - pos["tp_price"]) / current_price * 100
                                 to_sl_price = (pos["sl_price"] - current_price) / current_price * 100
 
+                            # Check trailing profit lock FIRST (before anything else)
+                            if self.check_trailing_profit_lock(symbol, roi):
+                                continue  # Position was closed, move to next symbol
+
                             # Calculate margin and unrealized PnL
                             position_value = qty * entry
                             margin = position_value / self.leverage
@@ -2036,6 +2167,14 @@ class HTFConfluenceLiveEngine:
                                 # Count confirmations still valid
                                 confirmations = sum([ema_aligned, rsi_ok, macd_ok, htf_trend == original_trend])
 
+                                # Trailing profit lock status
+                                peak = self.peak_roi.get(symbol, roi)
+                                if peak >= self.trailing_lock_activation:
+                                    floor = max(peak - self.trailing_lock_distance, self.trailing_lock_min_floor)
+                                    trailing_status = f"📈 Peak: {peak:.1f}% | Floor: {floor:.1f}%"
+                                else:
+                                    trailing_status = f"Peak: {peak:.1f}% (need {self.trailing_lock_activation}% to activate)"
+
                                 # Profit lock status (only triggers if BOTH reversed)
                                 if roi >= self.profit_lock_min_roi:
                                     if both_reversed:
@@ -2084,6 +2223,7 @@ class HTFConfluenceLiveEngine:
                                 lock_status = "Error checking trend"
                                 fakeout_status = "Error"
                                 cycles_reversed = 0
+                                trailing_status = "Error"
 
                             logger.info(f"┌─ {symbol} {pos['side']} ─────────────────────────────────")
                             logger.info(f"│ Entry: ${entry:,.4f} | Now: ${current_price:,.4f} | Qty: {qty}")
@@ -2093,6 +2233,7 @@ class HTFConfluenceLiveEngine:
                             logger.info(f"│ ── TREND CHECK ──")
                             logger.info(f"│ Entry: {original_trend} | 15m: {htf_trend} | 5m: {ltf_trend} {trend_match}")
                             logger.info(f"│ 5m RSI: {rsi:.1f} | MACD: {macd_trend} | Confirms: {confirmations}/4")
+                            logger.info(f"│ Trailing: {trailing_status}")
                             logger.info(f"│ Profit Lock: {lock_status}")
                             logger.info(f"│ Fakeout: {fakeout_status}")
                             logger.info(f"└────────────────────────────────────────────────")
