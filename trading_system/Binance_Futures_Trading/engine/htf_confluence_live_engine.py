@@ -636,17 +636,22 @@ class HTFConfluenceLiveEngine:
         try:
             # Get today's start timestamp
             today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-            start_time = int(today_start.timestamp() * 1000)
+            today_start_ms = int(today_start.timestamp() * 1000)
 
-            # Get income history for today
-            income = self.client.get_income_history(income_type="REALIZED_PNL", limit=100, start_time=start_time)
+            # Get income history (last 100 records)
+            income = self.client.get_income_history(income_type="REALIZED_PNL", limit=100)
 
             if not income:
-                logger.info("No income history for today")
+                logger.info("No income history found")
                 return
 
-            # Count wins and losses from income history
+            # Filter for today's records and count wins/losses
             for record in income:
+                # Check if record is from today
+                record_time = int(record.get("time", 0))
+                if record_time < today_start_ms:
+                    continue  # Skip records from before today
+
                 symbol = record.get("symbol", "")
                 pnl = float(record.get("income", 0))
 
