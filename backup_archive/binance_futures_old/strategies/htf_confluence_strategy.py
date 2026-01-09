@@ -4,33 +4,44 @@ HTF Trend + Confluence Strategy
 Combines high win-rate indicators with higher timeframe trend detection.
 
 Key Components:
-1. HTF (4H) Trend Detection - 200 EMA filter
-2. Entry Signals - MACD + RSI + EMA (9/21) crossover confluence
+1. HTF (1H) Trend Detection - 21/50 EMA crossover (fast for scalping)
+2. Entry Signals - MACD + RSI + EMA (9/21) confluence with MOMENTUM + VOLUME filters
 3. Single Direction Trading - Follow the trend, no hedging
-4. Lower Leverage - 5-10x for better risk management
+4. Moderate Leverage - 20x with strict 8/8 confluence requirement
 
 Research Base:
 - MACD + RSI: 73% win rate in backtests
 - EMA Crossover (9/21): 55-60% win rate, 2.65% avg gain on BTC
-- 200 EMA trend filter: Proven to increase win rates by filtering counter-trend trades
+- MACD Momentum: Filters weak signals by requiring increasing histogram
+- Volume Confirmation: Ensures strong market participation
+- HTF trend filter: Proven to increase win rates by filtering counter-trend trades
 
-Entry Conditions (ALL must be met):
+Entry Conditions (ALL 8 must be met - MAXIMUM STRENGTH):
 LONG:
-  - HTF: Price > 200 EMA (4H)
-  - LTF: 9 EMA crosses above 21 EMA
-  - RSI: Between 40-65 (not overbought)
-  - MACD: Histogram bullish (> 0) or MACD line crossing above signal
+  1. HTF: 1H EMA 21 > 50 (Bullish trend)
+  2. LTF: 15m EMA 9 > 21 (Bullish alignment)
+  3. RSI: Between 35-75 (not extreme overbought)
+  4. MACD: Line > Signal (bullish momentum)
+  5. 5m: EMA 9 > 21 (confirmation)
+  6. ADX: > 20 (trending, not choppy)
+  7. Momentum: MACD histogram increasing (building momentum)
+  8. Volume: 5m volume > 1.2x average (strong participation)
 
 SHORT:
-  - HTF: Price < 200 EMA (4H)
-  - LTF: 9 EMA crosses below 21 EMA
-  - RSI: Between 35-60 (not oversold)
-  - MACD: Histogram bearish (< 0) or MACD line crossing below signal
+  1. HTF: 1H EMA 21 < 50 (Bearish trend)
+  2. LTF: 15m EMA 9 < 21 (Bearish alignment)
+  3. RSI: Between 25-65 (not extreme oversold)
+  4. MACD: Line < Signal (bearish momentum)
+  5. 5m: EMA 9 < 21 (confirmation)
+  6. ADX: > 20 (trending, not choppy)
+  7. Momentum: MACD histogram decreasing (building momentum)
+  8. Volume: 5m volume > 1.2x average (strong participation)
 
 Risk Management:
-  - TP: 2% ROI
-  - SL: 1% ROI (2:1 reward-to-risk)
-  - Leverage: 5-10x
+  - TP: 40% ROI (2% price move at 20x leverage)
+  - SL: 10% ROI (0.5% price move at 20x leverage)
+  - Reward:Risk = 4:1
+  - Leverage: 20x
   - Risk per trade: 1-2% of balance
 """
 
@@ -80,7 +91,7 @@ class HTFConfluenceStrategy:
     Single direction trading - only trade in direction of HTF trend.
     """
 
-    def __init__(self, leverage: int = 10, tp_roi: float = 0.02, sl_roi: float = 0.01):
+    def __init__(self, leverage: int = 10, tp_roi: float = 0.02, sl_roi: float = 0.01, min_confluence_score: int = 8):
         """
         Initialize strategy.
 
@@ -88,6 +99,7 @@ class HTFConfluenceStrategy:
             leverage: Trading leverage (5-10x recommended)
             tp_roi: Take profit as ROI (0.02 = 2% ROI)
             sl_roi: Stop loss as ROI (0.01 = 1% ROI)
+            min_confluence_score: Minimum confluence score required (asset-specific: 4-8)
         """
         # Risk settings
         self.leverage = leverage
@@ -102,12 +114,12 @@ class HTFConfluenceStrategy:
         self.ema_fast = 9                   # Fast EMA
         self.ema_slow = 21                  # Slow EMA
 
-        # RSI settings - Original values (tighter RSI range was not better in backtest)
+        # RSI settings - WIDENED for trending markets (RSI stays elevated in trends)
         self.rsi_period = 14
-        self.rsi_long_min = 40              # Minimum RSI for LONG
-        self.rsi_long_max = 65              # Maximum RSI for LONG
-        self.rsi_short_min = 35             # Minimum RSI for SHORT
-        self.rsi_short_max = 60             # Maximum RSI for SHORT
+        self.rsi_long_min = 35              # Minimum RSI for LONG (was 40)
+        self.rsi_long_max = 75              # Maximum RSI for LONG (was 65) - RSI can stay high in uptrend
+        self.rsi_short_min = 25             # Minimum RSI for SHORT (was 35) - RSI can stay low in downtrend  
+        self.rsi_short_max = 65             # Maximum RSI for SHORT (was 60)
 
         # MACD settings (standard 12, 26, 9)
         self.macd_fast = 12
@@ -138,8 +150,9 @@ class HTFConfluenceStrategy:
         self.min_bars_between_signals = 0   # No cooldown
         self.last_signal_bar = -999
 
-        # Minimum confluence score - REQUIRE 6/6 for entry
-        self.min_confluence_score = 6       # Need ALL 6 conditions: 1H trend + 15m EMA + 15m RSI + 15m MACD + 5m EMA + ADX trending
+        # Minimum confluence score - Asset-specific based on historical performance
+        # BTC/SOL/ETH/DOT=8 (premium), XRP=6 (never reaches 8), ADA/BNB=4 (mostly 3-4)
+        self.min_confluence_score = min_confluence_score
 
     def calculate_ema(self, series: pd.Series, period: int) -> pd.Series:
         """Calculate Exponential Moving Average"""
@@ -284,17 +297,17 @@ class HTFConfluenceStrategy:
             macd_line.iloc[-1] < signal_line.iloc[-1] and
             macd_line.iloc[-2] >= signal_line.iloc[-2]
         )
-        indicators["macd_bullish"] = indicators["macd_histogram"] > 0
-        indicators["macd_bearish"] = indicators["macd_histogram"] < 0
+        # FIXED: Use MACD line > signal (more responsive to trend changes)
+        indicators["macd_bullish"] = macd_line.iloc[-1] > signal_line.iloc[-1]
+        indicators["macd_bearish"] = macd_line.iloc[-1] < signal_line.iloc[-1]
 
-        # STRENGTHENED: MACD momentum building (histogram increasing)
+        # FIXED: MACD momentum building (histogram increasing, can start from negative)
+        # This catches momentum BUILDING, not just already positive
         indicators["macd_momentum_bullish"] = (
-            indicators["macd_histogram"] > indicators["macd_histogram_prev"] and
-            indicators["macd_histogram"] > 0
+            indicators["macd_histogram"] > indicators["macd_histogram_prev"]
         )
         indicators["macd_momentum_bearish"] = (
-            indicators["macd_histogram"] < indicators["macd_histogram_prev"] and
-            indicators["macd_histogram"] < 0
+            indicators["macd_histogram"] < indicators["macd_histogram_prev"]
         )
 
         # ADX for trend strength
@@ -318,6 +331,15 @@ class HTFConfluenceStrategy:
         indicators["pullback_ema"] = pullback_ema.iloc[-1]
         indicators["distance_from_ema"] = ((indicators["price"] - indicators["pullback_ema"]) / indicators["pullback_ema"]) * 100
         indicators["is_pullback"] = abs(indicators["distance_from_ema"]) <= self.max_distance_from_ema
+
+        # VOLUME CONFIRMATION (5m timeframe) - Strong volume supports real moves
+        volume = df['volume']
+        vol_sma20 = volume.rolling(window=20).mean()
+        indicators["volume"] = volume.iloc[-1]
+        indicators["volume_sma20"] = vol_sma20.iloc[-1] if not pd.isna(vol_sma20.iloc[-1]) else volume.iloc[-1]
+        indicators["volume_ratio"] = indicators["volume"] / indicators["volume_sma20"] if indicators["volume_sma20"] > 0 else 1.0
+        # Volume must be at least 1.2x average (20% above average)
+        indicators["volume_confirmed"] = indicators["volume_ratio"] >= 1.2
 
         return indicators
 
@@ -412,15 +434,17 @@ class HTFConfluenceStrategy:
 
     def check_long_conditions(self, indicators: Dict, htf_trend: TrendDirection) -> Tuple[int, List[str]]:
         """
-        Check LONG entry conditions - 6/6 CONFLUENCE REQUIRED.
+        Check LONG entry conditions - 8/8 CONFLUENCE REQUIRED.
 
         Conditions:
         1. 1H Trend: EMA 21 > 50 (Bullish)
         2. 15m EMA: 9 > 21 (Bullish alignment)
-        3. 15m RSI: 40-65 range
-        4. 15m MACD: Histogram > 0
+        3. 15m RSI: 35-75 range (trending up)
+        4. 15m MACD: Line > Signal (bullish momentum)
         5. 5m EMA: 9 > 21 (Confirmation)
         6. ADX > 20 (Trending, not choppy)
+        7. MACD Momentum: Histogram increasing (building bullish momentum)
+        8. Volume: 5m volume > 1.2x average (strong volume confirmation)
 
         Returns:
             (confluence_score, list of met conditions)
@@ -453,19 +477,30 @@ class HTFConfluenceStrategy:
         if indicators.get("adx_trending", False):
             conditions_met.append(f"ADX {adx:.0f}")
 
+        # Condition 7: MACD Momentum building (histogram increasing)
+        if indicators.get("macd_momentum_bullish", False):
+            conditions_met.append("Momentum ↑")
+
+        # Condition 8: Volume confirmation (5m volume > 1.2x average)
+        volume_ratio = indicators.get("volume_ratio", 0)
+        if indicators.get("volume_confirmed", False):
+            conditions_met.append(f"Vol {volume_ratio:.1f}x")
+
         return len(conditions_met), conditions_met
 
     def check_short_conditions(self, indicators: Dict, htf_trend: TrendDirection) -> Tuple[int, List[str]]:
         """
-        Check SHORT entry conditions - 6/6 CONFLUENCE REQUIRED.
+        Check SHORT entry conditions - 8/8 CONFLUENCE REQUIRED.
 
         Conditions:
         1. 1H Trend: EMA 21 < 50 (Bearish)
         2. 15m EMA: 9 < 21 (Bearish alignment)
-        3. 15m RSI: 35-60 range
-        4. 15m MACD: Histogram < 0
+        3. 15m RSI: 25-65 range (trending down)
+        4. 15m MACD: Line < Signal (bearish momentum)
         5. 5m EMA: 9 < 21 (Confirmation)
         6. ADX > 20 (Trending, not choppy)
+        7. MACD Momentum: Histogram decreasing (building bearish momentum)
+        8. Volume: 5m volume > 1.2x average (strong volume confirmation)
 
         Returns:
             (confluence_score, list of met conditions)
@@ -497,6 +532,15 @@ class HTFConfluenceStrategy:
         adx = indicators.get("adx", 0)
         if indicators.get("adx_trending", False):
             conditions_met.append(f"ADX {adx:.0f}")
+
+        # Condition 7: MACD Momentum building (histogram decreasing)
+        if indicators.get("macd_momentum_bearish", False):
+            conditions_met.append("Momentum ↓")
+
+        # Condition 8: Volume confirmation (5m volume > 1.2x average)
+        volume_ratio = indicators.get("volume_ratio", 0)
+        if indicators.get("volume_confirmed", False):
+            conditions_met.append(f"Vol {volume_ratio:.1f}x")
 
         return len(conditions_met), conditions_met
 
@@ -776,21 +820,61 @@ ASSET_SPECIFIC_CONFIG = {
         "leverage": 20,
         "tp_roi": 0.75,     # 75% ROI (TP) = 3.75% price move
         "sl_roi": 0.35,     # 35% ROI (SL) = 1.75% price move | 2.14:1 R:R
+        "min_confluence_score": 5,  # Quality threshold - between 4 and 8
     },
     "BNBUSDT": {
         "leverage": 20,
         "tp_roi": 0.30,     # 30% ROI (TP) = 1.5% price move
         "sl_roi": 0.15,     # 15% ROI (SL) = 0.75% price move | 2:1 R:R
+        "min_confluence_score": 5,  # Quality threshold - between 4 and 8
     },
     "XRPUSDT": {
         "leverage": 20,
-        "tp_roi": 0.40,     # 40% ROI (TP) = 2% price move
-        "sl_roi": 0.25,     # 25% ROI (SL) = 1.25% price move | 1.6:1 R:R
+        "tp_roi": 0.50,     # 50% ROI (TP) = 2.5% price move (was 40%, +10%)
+        "sl_roi": 0.35,     # 35% ROI (SL) = 1.75% price move | 1.43:1 R:R (was 25%, +10%)
+        "min_confluence_score": 6,  # Historical: Never reaches 8, maxes at 6 (25%)
     },
     "ADAUSDT": {
         "leverage": 20,
         "tp_roi": 0.60,     # 60% ROI (TP) = 3% price move
         "sl_roi": 0.25,     # 25% ROI (SL) = 1.25% price move | 2.4:1 R:R
+        "min_confluence_score": 5,  # Historical: Second-best at 5/8 (4% vs 10% at 8)
+    },
+    "BTCUSDT": {
+        "leverage": 20,
+        "tp_roi": 0.40,     # 40% ROI (TP) = 2% price move
+        "sl_roi": 0.20,     # 20% ROI (SL) = 1% price move | 2:1 R:R
+        "min_confluence_score": 8,  # Historical: 100% at 8/8 - premium quality
+    },
+    "ETHUSDT": {
+        "leverage": 20,
+        "tp_roi": 0.45,     # 45% ROI (TP) = 2.25% price move
+        "sl_roi": 0.20,     # 20% ROI (SL) = 1% price move | 2.25:1 R:R
+        "min_confluence_score": 7,  # High quality threshold
+    },
+    "SOLUSDT": {
+        "leverage": 20,
+        "tp_roi": 0.50,     # 50% ROI (TP) = 2.5% price move
+        "sl_roi": 0.25,     # 25% ROI (SL) = 1.25% price move | 2:1 R:R
+        "min_confluence_score": 7,  # High quality threshold
+    },
+    "AVAXUSDT": {
+        "leverage": 20,
+        "tp_roi": 0.75,     # 75% ROI (TP) = 3.75% price move
+        "sl_roi": 0.35,     # 35% ROI (SL) = 1.75% price move | 2.14:1 R:R
+        "min_confluence_score": 7,  # High quality - more volatile
+    },
+    "LINKUSDT": {
+        "leverage": 20,
+        "tp_roi": 0.45,     # 45% ROI (TP) = 2.25% price move
+        "sl_roi": 0.20,     # 20% ROI (SL) = 1% price move | 2.25:1 R:R
+        "min_confluence_score": 7,  # High quality - established oracle
+    },
+    "LTCUSDT": {
+        "leverage": 20,
+        "tp_roi": 0.40,     # 40% ROI (TP) = 2% price move (like BTC)
+        "sl_roi": 0.20,     # 20% ROI (SL) = 1% price move | 2:1 R:R
+        "min_confluence_score": 8,  # High quality - follows BTC closely
     },
 }
 

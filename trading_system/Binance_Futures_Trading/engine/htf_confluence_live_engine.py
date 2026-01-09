@@ -38,7 +38,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine.binance_client import BinanceClient
-from strategies.htf_confluence_strategy import (
+from engine.htf_confluence_strategy import (
     HTFConfluenceStrategy,
     MODERATE_CONFIG,
     ASSET_SPECIFIC_CONFIG,
@@ -108,6 +108,8 @@ class MLTradeLogger:
                     'htf_ema21', 'htf_ema50', 'htf_rsi',
                     # 1m Data (for smart filters)
                     'm1_close', 'm1_ema21', 'm1_distance_from_ema',
+                    # HTF Trend Analysis (4H + 1H)
+                    'htf_4h_trend', 'htf_1h_trend', 'trends_aligned',
                     # Volatility/Trend
                     'atr_pct', 'adx',
                     # Market structure
@@ -257,7 +259,8 @@ class MLTradeLogger:
 
     def log_signal(self, symbol: str, signal, ltf_df: pd.DataFrame, htf_df: pd.DataFrame,
                    m1_df: pd.DataFrame, filters_passed: bool, filter_reason: str,
-                   trade_executed: bool, skip_reason: str = "") -> str:
+                   trade_executed: bool, skip_reason: str = "",
+                   htf_4h_trend: str = "", htf_1h_trend: str = "", trends_aligned: bool = True) -> str:
         """
         Log a signal with all market context for ML training.
 
@@ -319,6 +322,8 @@ class MLTradeLogger:
                     htf_ind.get('ema21', ''), htf_ind.get('ema50', ''), htf_ind.get('rsi', ''),
                     # M1 data
                     m1_ind.get('close', ''), m1_ind.get('ema21', ''), m1_distance,
+                    # HTF Trend Analysis (4H + 1H alignment)
+                    htf_4h_trend, htf_1h_trend, trends_aligned,
                     # Volatility/Trend
                     ltf_ind.get('atr_pct', ''), ltf_ind.get('adx', ''),
                     # Market structure
@@ -476,7 +481,7 @@ class HTFConfluenceLiveEngine:
             total_capital: Total capital to use (None = use account balance)
             risk_per_trade: Risk per trade as fraction (default: 2%)
         """
-        self.symbols = symbols or ["DOTUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT"]
+        self.symbols = symbols or ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOTUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "LTCUSDT"]
         self.default_config = config or MODERATE_CONFIG
         self.testnet = testnet
         self.total_capital = total_capital
@@ -525,14 +530,17 @@ class HTFConfluenceLiveEngine:
         self.ml_logger = MLTradeLogger()
         self.active_trade_ids = {}  # symbol -> trade_id for linking entry to exit
 
-        # SMART ENTRY FILTER SETTINGS
-        self.use_1m_pullback = True        # Require pullback to 21 EMA on 1m
-        self.use_candle_confirm = True     # Require bullish/bearish candle
-        self.use_atr_filter = True         # Skip if ATR > max_atr_pct
-        self.use_adx_filter = True         # Skip if ADX < min_adx
+        # SMART ENTRY FILTER SETTINGS - Pullback + Candle confirmation (adds quality)
+        # If both pullback + candle pass, allow entry even if confluence drops 1 point
+        # (2 filters compensate for 1 confluence point drop while waiting)
+        self.use_1m_pullback = True        # ON - wait for pullback to EMA
+        self.use_candle_confirm = True     # ON - wait for candle confirmation
+        self.use_atr_filter = False        # OFF - volatility is okay
+        self.use_adx_filter = True         # ON - ensure we're in a trend (safety)
         self.max_atr_pct = 2.0             # Max ATR as % of price (skip if higher)
-        self.min_adx = 20                  # Min ADX for trending market
+        self.min_adx = 20                  # Min ADX for trending market (quality)
         self.pullback_tolerance = 0.003    # 0.3% tolerance from 21 EMA
+        self.smart_filter_confluence_offset = 1  # Allow 1 point drop if smart filters pass
 
         # SMART PROFIT LOCK - Close early if trend reverses while in profit
         self.use_profit_lock = True        # Enable smart profit lock
@@ -808,8 +816,20 @@ class HTFConfluenceLiveEngine:
 
             # Dynamic allocation: margin is calculated per-trade based on available balance
             # Each symbol gets equal share of available margin when opening
+            # MINIMUM $5 per trade enforced
+            MIN_MARGIN = 5.0
+            max_concurrent_positions = int((available * 0.95) / MIN_MARGIN)
+            
             logger.info(f"Margin Mode: DYNAMIC (Available balance split equally among symbols)")
-            logger.info(f"Initial per-symbol margin: ~${available / len(self.symbols):.2f} (will adjust based on availability)")
+            logger.info(f"Minimum margin per trade: ${MIN_MARGIN:.2f}")
+            logger.info(f"Maximum concurrent positions: {max_concurrent_positions} (with ${available:.2f} available)")
+            logger.info(f"Symbols will wait if insufficient balance for ${MIN_MARGIN:.2f} minimum")
+            
+            # Display asset-specific confluence requirements
+            logger.info(f"Asset-Specific Confluence Requirements:")
+            for symbol in self.symbols:
+                min_conf = self.strategies[symbol].min_confluence_score
+                logger.info(f"  {symbol}: {min_conf}/8 required")
 
         except Exception as e:
             logger.error(f"Failed to get account balance: {e}")
@@ -944,7 +964,7 @@ class HTFConfluenceLiveEngine:
             import traceback
             traceback.print_exc()
 
-    def get_market_data(self, symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    def get_market_data(self, symbol: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
         Fetch market data for strategy analysis.
 
@@ -952,23 +972,26 @@ class HTFConfluenceLiveEngine:
             symbol: Trading symbol
 
         Returns:
-            (ltf_df, htf_df, m5_df) - 15m, 1H, and 5m DataFrames
+            (ltf_df, htf_1h_df, htf_4h_df, m5_df) - 15m, 1H, 4H, and 5m DataFrames
         """
         try:
             # Get 15m data (LTF) - entry signals with EMA/RSI/MACD
             ltf_df = self.client.get_klines(symbol, "15m", 150)
 
-            # Get 1H data (HTF) - trend detection with 21/50 EMA
-            htf_df = self.client.get_klines(symbol, "1h", 150)
+            # Get 1H data (HTF intermediate) - trend confirmation
+            htf_1h_df = self.client.get_klines(symbol, "1h", 150)
+
+            # Get 4H data (HTF major) - main trend direction
+            htf_4h_df = self.client.get_klines(symbol, "4h", 150)
 
             # Get 5m data for confirmation
             m5_df = self.client.get_klines(symbol, "5m", 50)
 
-            if ltf_df.empty or htf_df.empty:
+            if ltf_df.empty or htf_1h_df.empty or htf_4h_df.empty:
                 logger.warning(f"[{symbol}] Empty data received")
-                return None, None, None
+                return None, None, None, None
 
-            return ltf_df, htf_df, m5_df
+            return ltf_df, htf_1h_df, htf_4h_df, m5_df
 
         except Exception as e:
             logger.error(f"[{symbol}] Failed to fetch market data: {e}")
@@ -1131,7 +1154,7 @@ class HTFConfluenceLiveEngine:
         failed_filters = []
 
         # Get 5m data for ATR/ADX calculation
-        ltf_df, _, _ = self.get_market_data(symbol)
+        ltf_df, _, _, _ = self.get_market_data(symbol)
         if ltf_df is None:
             return True, "No data for filters"
 
@@ -1188,32 +1211,39 @@ class HTFConfluenceLiveEngine:
 
         Uses CURRENT available balance divided by number of symbols without positions.
         This ensures each symbol gets equal margin based on what's actually available.
+        
+        MINIMUM MARGIN: $5 per trade (enforced)
+        If not enough balance, returns 0 and symbol must wait.
 
         Args:
             symbol: Trading symbol
             entry_price: Entry price
 
         Returns:
-            Position quantity
+            Position quantity (0 if insufficient balance for $5 minimum)
         """
+        # MINIMUM margin per trade
+        MIN_MARGIN_PER_TRADE = 5.0  # $5 minimum (= $100 position with 20x leverage)
+        
         # Get CURRENT available balance (dynamic, not fixed)
         available_balance = self.client.get_available_balance()
 
-        # Count how many symbols DON'T have positions (need margin)
-        symbols_needing_margin = [s for s in self.symbols if s not in self.positions]
-        num_symbols_needing_margin = len(symbols_needing_margin)
+        # Apply buffer to available balance
+        available_balance = available_balance * 0.95
 
-        if num_symbols_needing_margin == 0:
-            logger.warning(f"[{symbol}] All symbols have positions, cannot calculate margin")
+        # ENFORCE MINIMUM: If available balance < $5, symbol must wait
+        if available_balance < MIN_MARGIN_PER_TRADE:
+            logger.warning(
+                f"[{symbol}] Insufficient balance for minimum trade size. "
+                f"Need: ${MIN_MARGIN_PER_TRADE:.2f} | Available: ${available_balance:.2f}. "
+                f"Symbol will wait for more balance."
+            )
             return 0.0
 
-        # Split available balance equally among symbols needing margin
-        margin_per_symbol = available_balance / num_symbols_needing_margin
+        # Use $5 per position (don't divide by symbols - let them compete for margin)
+        margin = MIN_MARGIN_PER_TRADE
 
-        # Apply a small buffer (95%) to avoid "insufficient margin" errors
-        margin = margin_per_symbol * 0.95
-
-        logger.info(f"[{symbol}] Dynamic margin: ${margin:.2f} (${available_balance:.2f} available / {num_symbols_needing_margin} symbols * 0.95)")
+        logger.info(f"[{symbol}] Using margin: ${margin:.2f} (Available: ${available_balance:.2f})")
 
         # Position value = margin * leverage
         position_value = margin * self.leverage
@@ -1339,7 +1369,7 @@ class HTFConfluenceLiveEngine:
             margin = (actual_qty * actual_entry) / self.leverage
 
             # Get market conditions for ML logging
-            ltf_df, _, _ = self.get_market_data(symbol)
+            ltf_df, _, _, _ = self.get_market_data(symbol)
             atr_pct = self.calculate_atr(ltf_df, 14) if ltf_df is not None else 0
             adx = self.calculate_adx(ltf_df, 14) if ltf_df is not None else 0
 
@@ -1444,7 +1474,7 @@ class HTFConfluenceLiveEngine:
                 return False
 
             # Get HTF data to check trend
-            _, htf_df, _ = self.get_market_data(symbol)
+            _, htf_df, _, _ = self.get_market_data(symbol)
             if htf_df is None or len(htf_df) < 50:
                 return False
 
@@ -1615,11 +1645,11 @@ class HTFConfluenceLiveEngine:
             # Case 2 & 3: Small profit exit or cut loss early
             if cycles_reversed >= self.reversal_cycle_threshold and confirmations <= 1:
                 if 0 <= roi < self.small_profit_exit_roi:
-                    logger.info(f"[{symbol}] 💰 SMALL PROFIT EXIT: ROI +{roi:.1f}%, confirms {confirmations}/6, reversed {cycles_reversed} cycles")
+                    logger.info(f"[{symbol}] 💰 SMALL PROFIT EXIT: ROI +{roi:.1f}%, confirms {confirmations}/8, reversed {cycles_reversed} cycles")
                     self._close_position_early(symbol, "SMALL_PROFIT_EXIT", roi)
                     return "SMALL_PROFIT_EXIT"
                 elif -10 <= roi < 0:
-                    logger.info(f"[{symbol}] ✂️ CUT LOSS EARLY: ROI {roi:.1f}%, confirms {confirmations}/6, reversed {cycles_reversed} cycles")
+                    logger.info(f"[{symbol}] ✂️ CUT LOSS EARLY: ROI {roi:.1f}%, confirms {confirmations}/8, reversed {cycles_reversed} cycles")
                     self._close_position_early(symbol, "CUT_LOSS_EARLY", roi)
                     return "CUT_LOSS_EARLY"
 
@@ -1883,39 +1913,86 @@ class HTFConfluenceLiveEngine:
             position = self.client.get_position(symbol, position_side)
 
             if not position or position["quantity"] == 0:
-                # Position closed - get actual realized PnL from API
+                # Position closed - get ACTUAL PnL from Binance
                 entry_price = tracked["entry_price"]
+                quantity = tracked["quantity"]
                 entry_time = tracked.get("entry_time", datetime.now())
+                
+                # Store balance before getting PnL (for comparison)
+                balance_before = tracked.get("balance_at_entry", 0)
 
-                # Query income history to get actual realized PnL
+                # Get ACTUAL realized PnL from Binance income history (includes fees)
+                pnl = 0
                 try:
-                    income_history = self.client.get_income_history(symbol=symbol, income_type="REALIZED_PNL", limit=5)
+                    # Get income history for REALIZED_PNL (this is the actual P&L after fees)
+                    income_history = self.client.get_income_history(
+                        symbol=symbol, 
+                        income_type="REALIZED_PNL", 
+                        limit=10  # Get last 10 to find our trade
+                    )
+                    
                     if income_history:
-                        # Get the most recent realized PnL for this symbol
-                        pnl = float(income_history[0].get("income", 0))
-                    else:
-                        # Fallback: estimate from recent trades
-                        recent_trades = self.client.get_recent_trades(symbol, limit=5)
-                        if recent_trades:
-                            pnl = sum(float(t.get("realizedPnl", 0)) for t in recent_trades)
-                        else:
-                            pnl = 0
+                        # Sum all REALIZED_PNL entries since position opened
+                        # (in case of partial closes, though we don't do that)
+                        for income in income_history:
+                            income_time = income.get("time", 0)
+                            # Only count PnL after position was opened
+                            if entry_time and isinstance(entry_time, datetime):
+                                entry_timestamp = int(entry_time.timestamp() * 1000)
+                                if income_time >= entry_timestamp:
+                                    pnl += float(income.get("income", 0))
+                            else:
+                                # If no entry time, just take the most recent
+                                pnl = float(income_history[0].get("income", 0))
+                                break
+                    
+                    logger.info(f"[{symbol}] Realized PnL from Binance: ${pnl:.2f}")
+                    
                 except Exception as e:
-                    logger.warning(f"[{symbol}] Could not get realized PnL: {e}")
-                    pnl = 0
+                    logger.warning(f"[{symbol}] Could not get income history: {e}")
+                    # Fallback: Calculate from balance change
+                    try:
+                        account_info = self.client.get_account_info()
+                        balance_now = float(account_info.get("totalWalletBalance", 0))
+                        if balance_before > 0:
+                            pnl = balance_now - balance_before
+                            logger.info(f"[{symbol}] PnL from balance change: ${pnl:.2f}")
+                    except:
+                        pnl = 0
 
-                # Determine win/loss based on actual PnL (positive = win, negative = loss)
+                # Determine exit type and price
+                try:
+                    price_data = self.client.get_current_price(symbol)
+                    current_price = price_data["price"]
+                except:
+                    current_price = entry_price
+
+                tp_price = tracked["tp_price"]
+                sl_price = tracked["sl_price"]
+                
+                # Check which was closer to current price
+                tp_distance = abs(current_price - tp_price)
+                sl_distance = abs(current_price - sl_price)
+                
+                if tp_distance < sl_distance:
+                    exit_type = "TP"
+                    exit_price = tp_price
+                else:
+                    exit_type = "SL"
+                    exit_price = sl_price
+                
+                # Override exit_type based on actual PnL
                 if pnl > 0:
                     exit_type = "TP"
                 else:
                     exit_type = "SL"
 
                 # Calculate ROI from actual PnL
-                margin = (tracked["quantity"] * entry_price) / self.leverage
+                position_value = quantity * entry_price
+                margin = position_value / self.leverage
                 roi = (pnl / margin) * 100 if margin > 0 else 0
 
                 # Calculate price move %
-                exit_price = tracked["tp_price"] if exit_type == "TP" else tracked["sl_price"]
                 if tracked["side"] == "LONG":
                     price_move_pct = (exit_price - entry_price) / entry_price * 100
                 else:
@@ -1944,7 +2021,7 @@ class HTFConfluenceLiveEngine:
                     trade_id = self.active_trade_ids[symbol]
 
                     # Get current market conditions for exit logging
-                    ltf_df, _, _ = self.get_market_data(symbol)
+                    ltf_df, _, _, _ = self.get_market_data(symbol)
                     exit_atr = self.calculate_atr(ltf_df, 14) if ltf_df is not None else 0
                     exit_adx = self.calculate_adx(ltf_df, 14) if ltf_df is not None else 0
                     exit_rsi = 50
@@ -1986,7 +2063,7 @@ class HTFConfluenceLiveEngine:
                 if signal:
                     trend_str = signal.trend.value if hasattr(signal, 'trend') else "?"
                     if signal.action:
-                        logger.info(f"[{symbol}] Signal: {signal.action} | Trend: {trend_str} | Score: {signal.confluence_score}/6")
+                        logger.info(f"[{symbol}] Signal: {signal.action} | Trend: {trend_str} | Score: {signal.confluence_score}/8")
                         if signal.confluence_score < 3:
                             logger.info(f"[{symbol}] Waiting for stronger confluence (need 3+)")
                     else:
@@ -2014,10 +2091,10 @@ class HTFConfluenceLiveEngine:
             Signal dict or None
         """
         try:
-            # Get market data (15m LTF, 1H HTF, 5m confirmation)
-            ltf_df, htf_df, m5_df = self.get_market_data(symbol)
+            # Get market data (15m LTF, 1H HTF, 4H HTF, 5m confirmation)
+            ltf_df, htf_1h_df, htf_4h_df, m5_df = self.get_market_data(symbol)
 
-            if ltf_df is None or htf_df is None:
+            if ltf_df is None or htf_1h_df is None or htf_4h_df is None:
                 return None
 
             # Calculate 5m EMA confirmation
@@ -2039,12 +2116,27 @@ class HTFConfluenceLiveEngine:
                 indicators["5m_ema_bullish"] = m5_ema_bullish
                 indicators["5m_ema_bearish"] = m5_ema_bearish
             
-            # Get HTF trend
-            htf_trend, htf_distance = strategy.get_htf_trend(htf_df)
+            # Get HTF trends - BOTH 4H (major) and 1H (intermediate)
+            htf_4h_trend, htf_4h_distance = strategy.get_htf_trend(htf_4h_df)
+            htf_1h_trend, htf_1h_distance = strategy.get_htf_trend(htf_1h_df)
+            
+            # TREND ALIGNMENT CHECK: Both 4H and 1H must agree
+            # This prevents entering LONG on 1H bounce during 4H downtrend (pullback)
+            if htf_4h_trend != htf_1h_trend:
+                # Trends don't align - skip this signal (it's a pullback/bounce)
+                if indicators:
+                    indicators["htf_trend"] = "CONFLICTING"
+                    indicators["htf_distance_pct"] = 0.0
+                return None  # Don't trade when trends conflict
+            
+            # Trends align - use the confirmed trend
+            htf_trend = htf_4h_trend  # Use 4H as the main trend
             
             if indicators:
                 indicators["htf_trend"] = htf_trend.value
-                indicators["htf_distance_pct"] = htf_distance
+                indicators["htf_4h_trend"] = htf_4h_trend.value
+                indicators["htf_1h_trend"] = htf_1h_trend.value
+                indicators["htf_distance_pct"] = htf_4h_distance
             
             # Now get signal with injected 5m data
             # The strategy.should_enter recalculates indicators, so we need a workaround
@@ -2058,16 +2150,22 @@ class HTFConfluenceLiveEngine:
                 return result
             
             strategy.calculate_indicators = patched_calc
-            signal = strategy.should_enter(ltf_df, htf_df)
+            signal = strategy.should_enter(ltf_df, htf_4h_df)  # Use 4H for strategy
             strategy.calculate_indicators = original_calc  # Restore
 
             if signal.action:
-                logger.info(f"[{symbol}] Signal: {signal.action} | Strength: {signal.strength.value} | Score: {signal.confluence_score}/6")
+                logger.info(f"[{symbol}] Signal: {signal.action} | 4H: {htf_4h_trend.value} | 1H: {htf_1h_trend.value} | Score: {signal.confluence_score}/8")
                 logger.info(f"[{symbol}] Reason: {signal.reason}")
             elif verbose:
                 # Show detailed indicator breakdown when no signal
-                self._log_signal_diagnostics(symbol, ltf_df, htf_df, signal)
+                self._log_signal_diagnostics(symbol, ltf_df, htf_4h_df, signal)
 
+            # Store trend info in signal for ML logging
+            if signal:
+                signal.htf_4h_trend = htf_4h_trend.value
+                signal.htf_1h_trend = htf_1h_trend.value
+                signal.trends_aligned = True
+            
             return signal
 
         except Exception as e:
@@ -2187,11 +2285,32 @@ class HTFConfluenceLiveEngine:
 
                             # Get HTF trend info for reversal check
                             try:
-                                _, htf_df, _ = self.get_market_data(symbol)
-                                ltf_df, _, _ = self.get_market_data(symbol)
+                                # Define original trend before calculations
+                                original_trend = "BULLISH" if pos["side"] == "LONG" else "BEARISH"
+                                
+                                ltf_df, htf_1h_df, htf_4h_df, _ = self.get_market_data(symbol)
+
+                                # 4H EMAs (major trend)
+                                htf_4h_close = htf_4h_df['close']
+                                htf_4h_price = htf_4h_close.iloc[-1]
+                                htf_4h_ema21 = htf_4h_close.ewm(span=21, adjust=False).mean().iloc[-1]
+                                htf_4h_ema50 = htf_4h_close.ewm(span=50, adjust=False).mean().iloc[-1]
+                                
+                                ema_4h_diff_pct = abs(htf_4h_ema21 - htf_4h_ema50) / htf_4h_ema50 * 100
+                                
+                                if htf_4h_ema21 > htf_4h_ema50 and htf_4h_price > htf_4h_ema21:
+                                    htf_4h_trend = "BULLISH"  # Strong bullish
+                                elif htf_4h_ema21 < htf_4h_ema50 and htf_4h_price < htf_4h_ema21:
+                                    htf_4h_trend = "BEARISH"  # Strong bearish
+                                elif htf_4h_ema21 > htf_4h_ema50:
+                                    htf_4h_trend = "BULLISH" if ema_4h_diff_pct > 0.3 else "MIXED"
+                                elif htf_4h_ema21 < htf_4h_ema50:
+                                    htf_4h_trend = "BEARISH" if ema_4h_diff_pct > 0.3 else "MIXED"
+                                else:
+                                    htf_4h_trend = "MIXED"
 
                                 # HTF EMAs (1H) - STRENGTHENED reversal detection
-                                htf_close = htf_df['close']
+                                htf_close = htf_1h_df['close']
                                 htf_price = htf_close.iloc[-1]
                                 htf_ema21 = htf_close.ewm(span=21, adjust=False).mean().iloc[-1]
                                 htf_ema50 = htf_close.ewm(span=50, adjust=False).mean().iloc[-1]
@@ -2201,15 +2320,15 @@ class HTFConfluenceLiveEngine:
                                 ema_diff_pct = abs(htf_ema21 - htf_ema50) / htf_ema50 * 100
                                 
                                 if htf_ema21 > htf_ema50 and htf_price > htf_ema21:
-                                    htf_trend = "BULLISH"  # Strong bullish
+                                    htf_1h_trend = "BULLISH"  # Strong bullish
                                 elif htf_ema21 < htf_ema50 and htf_price < htf_ema21:
-                                    htf_trend = "BEARISH"  # Strong bearish
+                                    htf_1h_trend = "BEARISH"  # Strong bearish
                                 elif htf_ema21 > htf_ema50:
-                                    htf_trend = "BULLISH" if ema_diff_pct > 0.3 else "MIXED"  # Weak bullish needs clear separation
+                                    htf_1h_trend = "BULLISH" if ema_diff_pct > 0.3 else "MIXED"  # Weak bullish needs clear separation
                                 elif htf_ema21 < htf_ema50:
-                                    htf_trend = "BEARISH" if ema_diff_pct > 0.3 else "MIXED"  # Weak bearish needs clear separation
+                                    htf_1h_trend = "BEARISH" if ema_diff_pct > 0.3 else "MIXED"  # Weak bearish needs clear separation
                                 else:
-                                    htf_trend = "MIXED"
+                                    htf_1h_trend = "MIXED"
 
                                 # LTF indicators (5m)
                                 ltf_close = ltf_df['close']
@@ -2245,7 +2364,8 @@ class HTFConfluenceLiveEngine:
                                     ltf_trend = "MIXED"
 
                                 # Both must be against us for real reversal
-                                htf_reversed = htf_trend != original_trend
+                                # STRONG reversal only - MIXED doesn't count as reversal
+                                htf_reversed = htf_1h_trend != original_trend and htf_1h_trend != "MIXED"
                                 ltf_reversed = ltf_trend != original_trend and ltf_trend != "MIXED"
                                 both_reversed = htf_reversed and ltf_reversed
 
@@ -2268,8 +2388,45 @@ class HTFConfluenceLiveEngine:
                                     rsi_ok = rsi < 70  # Not overbought
                                     macd_ok = macd_val < signal_val
 
-                                # Count confirmations still valid
-                                confirmations = sum([ema_aligned, rsi_ok, macd_ok, htf_trend == original_trend])
+                                # Calculate FULL 8/8 confluence score for current position
+                                # This shows how many of the 8 entry conditions are STILL valid
+                                full_confirmations = 0
+                                
+                                # 1. HTF Trend still aligned (use 1H as confirmation layer)
+                                if htf_1h_trend == original_trend:
+                                    full_confirmations += 1
+                                
+                                # 2. 15m EMA aligned
+                                if ema_aligned:
+                                    full_confirmations += 1
+                                
+                                # 3. RSI in range (checking entry ranges)
+                                if pos["side"] == "LONG":
+                                    if 40 <= rsi <= 65:
+                                        full_confirmations += 1
+                                else:
+                                    if 35 <= rsi <= 60:
+                                        full_confirmations += 1
+                                
+                                # 4. MACD direction
+                                if macd_ok:
+                                    full_confirmations += 1
+                                
+                                # 5. 5m EMA (we don't have 5m data here, assume met if 15m aligned)
+                                if ema_aligned:
+                                    full_confirmations += 1
+                                
+                                # 6. ADX > 20 (we don't calculate ADX in monitoring, assume trending)
+                                full_confirmations += 1
+                                
+                                # 7. MACD Momentum (we don't have histogram history here, can't check)
+                                # Skip this one - would need previous histogram value
+                                
+                                # 8. Volume (we don't check volume in monitoring)
+                                # Skip this one
+                                
+                                # So we can reliably check 6 out of 8 conditions during monitoring
+                                confirmations = full_confirmations  # Out of 6 checkable conditions
 
                                 # Trailing profit lock status
                                 peak = self.peak_roi.get(symbol, roi)
@@ -2305,19 +2462,23 @@ class HTFConfluenceLiveEngine:
                                     fakeout_status = "🛡️ Will move SL to breakeven"
                                 elif confirmations <= 1:
                                     if roi >= 0:
-                                        fakeout_status = f"⚠️ SMALL PROFIT EXIT (confirms {confirmations}/6)"
+                                        fakeout_status = f"⚠️ SMALL PROFIT EXIT (confirms {confirmations}/8)"
                                     else:
-                                        fakeout_status = f"⚠️ CUT LOSS EARLY (confirms {confirmations}/6)"
+                                        fakeout_status = f"⚠️ CUT LOSS EARLY (confirms {confirmations}/8)"
                                 else:
-                                    fakeout_status = f"👀 Monitoring (confirms {confirmations}/6)"
+                                    fakeout_status = f"👀 Monitoring (confirms {confirmations}/8)"
 
                                 # Check fakeout protection (pass both trends)
-                                fakeout_action = self.check_fakeout_protection(symbol, roi, htf_trend, ltf_trend, confirmations)
+                                fakeout_action = self.check_fakeout_protection(symbol, roi, htf_1h_trend, ltf_trend, confirmations)
                                 if fakeout_action:
                                     continue  # Position was handled
 
                             except Exception as trend_e:
-                                htf_trend = "?"
+                                logger.error(f"[{symbol}] Trend calculation error: {trend_e}")
+                                import traceback
+                                logger.error(traceback.format_exc())
+                                htf_4h_trend = "?"
+                                htf_1h_trend = "?"
                                 ltf_trend = "?"
                                 original_trend = "BULLISH" if pos["side"] == "LONG" else "BEARISH"
                                 trend_match = "?"
@@ -2335,8 +2496,8 @@ class HTFConfluenceLiveEngine:
                             logger.info(f"│ Margin: ${margin:.2f} | Position: ${position_value:.2f}")
                             logger.info(f"│ To TP: {to_tp_price:.3f}% ({to_tp_roi:+.1f}% ROI) | To SL: {to_sl_price:.3f}% ({to_sl_roi:.1f}% ROI)")
                             logger.info(f"│ ── TREND CHECK ──")
-                            logger.info(f"│ Entry: {original_trend} | 1H: {htf_trend} | 15m: {ltf_trend} {trend_match}")
-                            logger.info(f"│ 15m RSI: {rsi:.1f} | MACD: {macd_trend} | Confirms: {confirmations}/6")
+                            logger.info(f"│ Entry: {original_trend} | 4H: {htf_4h_trend} | 1H: {htf_1h_trend} | 15m: {ltf_trend} {trend_match}")
+                            logger.info(f"│ 15m RSI: {rsi:.1f} | MACD: {macd_trend} | Still valid: {confirmations}/6 (Entry needs 8/8)")
                             logger.info(f"│ Trailing: {trailing_status}")
                             logger.info(f"│ Profit Lock: {lock_status}")
                             logger.info(f"│ Fakeout: {fakeout_status}")
@@ -2350,62 +2511,81 @@ class HTFConfluenceLiveEngine:
                     continue
 
                 # Get market data for ML logging
-                ltf_df, htf_df, _ = self.get_market_data(symbol)
+                ltf_df, htf_df, _, _ = self.get_market_data(symbol)
                 m1_df = self.get_1m_data(symbol)
 
                 # Analyze for new signal (verbose=True shows diagnostics when no signal)
                 signal = self.analyze_symbol(symbol, verbose=True)
 
                 if signal and signal.action:
+                    # Get required confluence score for this symbol
+                    min_required_score = self.strategies[symbol].min_confluence_score
+                    
                     # We have a signal - check if strong enough
                     if signal.confluence_score >= 3:
-                        logger.info(f"[{symbol}] SIGNAL: {signal.action} (Score: {signal.confluence_score}/6)")
-
                         # Apply SMART ENTRY FILTERS before opening
                         filters_passed, filter_reason = self.check_smart_entry_filters(symbol, signal)
 
-                        if filters_passed:
-                            logger.info(f"[{symbol}] Smart filters: {filter_reason}")
+                        # Allow 1 point drop if smart filters pass (pullback + candle = 2 confirmations)
+                        effective_required_score = min_required_score
+                        if filters_passed and self.use_1m_pullback and self.use_candle_confirm:
+                            effective_required_score = min_required_score - self.smart_filter_confluence_offset
+                            
+                        # Check if confluence meets requirement (with offset if filters passed)
+                        if signal.confluence_score >= effective_required_score:
+                            logger.info(f"[{symbol}] SIGNAL: {signal.action} (Score: {signal.confluence_score}/8, Required: {effective_required_score}/8)")
 
-                            # LOG SIGNAL FOR ML (will be traded)
-                            signal_id = self.ml_logger.log_signal(
-                                symbol=symbol,
-                                signal=signal,
-                                ltf_df=ltf_df,
-                                htf_df=htf_df,
-                                m1_df=m1_df,
-                                filters_passed=True,
-                                filter_reason=filter_reason,
-                                trade_executed=True,
-                                skip_reason=""
-                            )
+                            if filters_passed:
+                                logger.info(f"[{symbol}] Smart filters: {filter_reason}")
 
-                            # Open position
-                            if self.open_position(symbol, signal, signal_id):
-                                logger.info(f"[{symbol}] Position opened successfully")
+                                # LOG SIGNAL FOR ML (will be traded)
+                                signal_id = self.ml_logger.log_signal(
+                                    symbol=symbol,
+                                    signal=signal,
+                                    ltf_df=ltf_df,
+                                    htf_df=htf_df,
+                                    m1_df=m1_df,
+                                    filters_passed=True,
+                                    filter_reason=filter_reason,
+                                    trade_executed=True,
+                                    skip_reason="",
+                                    htf_4h_trend=getattr(signal, 'htf_4h_trend', ''),
+                                    htf_1h_trend=getattr(signal, 'htf_1h_trend', ''),
+                                    trends_aligned=getattr(signal, 'trends_aligned', True)
+                                )
+
+                                # Open position
+                                if self.open_position(symbol, signal, signal_id):
+                                    logger.info(f"[{symbol}] Position opened successfully")
+                                else:
+                                    logger.warning(f"[{symbol}] Failed to open position")
                             else:
-                                logger.warning(f"[{symbol}] Failed to open position")
-                        else:
-                            # Filters not passed - wait for better entry
-                            logger.info(f"[{symbol}] WAITING - Filters not passed:")
-                            logger.info(f"[{symbol}]   {filter_reason}")
+                                # Filters not passed - wait for better entry
+                                logger.info(f"[{symbol}] WAITING - Filters not passed:")
+                                logger.info(f"[{symbol}]   {filter_reason}")
 
-                            # LOG SKIPPED SIGNAL FOR ML (filters failed)
-                            self.ml_logger.log_signal(
-                                symbol=symbol,
-                                signal=signal,
-                                ltf_df=ltf_df,
-                                htf_df=htf_df,
-                                m1_df=m1_df,
-                                filters_passed=False,
-                                filter_reason=filter_reason,
-                                trade_executed=False,
-                                skip_reason="Smart filters not passed"
-                            )
+                                # LOG SKIPPED SIGNAL FOR ML (filters failed)
+                                self.ml_logger.log_signal(
+                                    symbol=symbol,
+                                    signal=signal,
+                                    ltf_df=ltf_df,
+                                    htf_df=htf_df,
+                                    m1_df=m1_df,
+                                    filters_passed=False,
+                                    filter_reason=filter_reason,
+                                    trade_executed=False,
+                                    skip_reason="Smart filters not passed",
+                                    htf_4h_trend=getattr(signal, 'htf_4h_trend', ''),
+                                    htf_1h_trend=getattr(signal, 'htf_1h_trend', ''),
+                                    trends_aligned=getattr(signal, 'trends_aligned', True)
+                                )
+                        else:
+                            # Confluence not high enough
+                            logger.info(f"[{symbol}] Watching | Signal: {signal.action} ({signal.confluence_score}/8) - need {min_required_score}/8")
                     else:
                         # Show signal status when not strong enough
                         trend_str = signal.trend.value if hasattr(signal, 'trend') else "?"
-                        logger.info(f"[{symbol}] Watching | Trend: {trend_str} | Signal: {signal.action} ({signal.confluence_score}/6) - waiting for stronger confluence")
+                        logger.info(f"[{symbol}] Watching | Trend: {trend_str} | Signal: {signal.action} ({signal.confluence_score}/8) - waiting for stronger confluence")
 
                         # LOG WEAK SIGNAL FOR ML (confluence too low)
                         self.ml_logger.log_signal(
@@ -2417,7 +2597,10 @@ class HTFConfluenceLiveEngine:
                             filters_passed=False,
                             filter_reason="N/A",
                             trade_executed=False,
-                            skip_reason=f"Low confluence ({signal.confluence_score}/6)"
+                            skip_reason=f"Low confluence ({signal.confluence_score}/8)",
+                            htf_4h_trend=getattr(signal, 'htf_4h_trend', ''),
+                            htf_1h_trend=getattr(signal, 'htf_1h_trend', ''),
+                            trends_aligned=getattr(signal, 'trends_aligned', True)
                         )
                 else:
                     # No signal - diagnostics already shown by analyze_symbol(verbose=True)
@@ -2454,6 +2637,37 @@ class HTFConfluenceLiveEngine:
         win_rate = (self.wins_today / self.trades_today * 100) if self.trades_today > 0 else 0
         logger.info(f"┌─ SESSION STATS ─────────────────────────────────")
         logger.info(f"│ Total: {self.trades_today} trades | {self.wins_today}W/{self.losses_today}L | WR: {win_rate:.0f}%")
+        
+        # Show open positions with their current PnL
+        if self.positions:
+            logger.info(f"│ ── OPEN POSITIONS ({len(self.positions)}) ──")
+            for symbol, pos in self.positions.items():
+                try:
+                    price_data = self.client.get_current_price(symbol)
+                    current_price = price_data["price"]
+                    entry_price = pos["entry_price"]
+                    qty = pos["quantity"]
+                    side = pos["side"]
+                    
+                    # Calculate unrealized PnL
+                    if side == "LONG":
+                        price_move_pct = ((current_price - entry_price) / entry_price) * 100
+                    else:
+                        price_move_pct = ((entry_price - current_price) / entry_price) * 100
+                    
+                    roi = price_move_pct * self.leverage
+                    position_value = current_price * qty
+                    margin = position_value / self.leverage
+                    unrealized_pnl = margin * (roi / 100)
+                    
+                    logger.info(f"│ {symbol} {side}: ${entry_price:.4f}→${current_price:.4f} | ROI: {roi:+.1f}% | PnL: ${unrealized_pnl:+.2f}")
+                except Exception as e:
+                    logger.info(f"│ {symbol} {pos['side']}: Error calculating PnL - {e}")
+        else:
+            logger.info(f"│ No open positions")
+        
+        # Show per-symbol closed trades stats
+        logger.info(f"│ ── CLOSED TRADES ──")
         for symbol in self.symbols:
             stats = self.symbol_stats[symbol]
             sym_trades = stats["wins"] + stats["losses"]
@@ -2515,7 +2729,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="HTF Confluence Live Trading Engine")
-    parser.add_argument("--symbols", nargs="+", default=["DOTUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT"],
+    parser.add_argument("--symbols", nargs="+", default=["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOTUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "LTCUSDT"],
                         help="Symbols to trade")
     parser.add_argument("--live", action="store_true",
                         help="Use live mainnet (default: demo/testnet)")

@@ -1,4 +1,3 @@
-# Binance Futures Trading Engines
+# Binance Futures Trading Engines - HTF Confluence System
 from .binance_client import BinanceClient
-from .momentum_signal import MasterMomentumSignal
-from .paper_trading_engine import BinancePaperTradingEngine
+from .htf_confluence_strategy import HTFConfluenceStrategy

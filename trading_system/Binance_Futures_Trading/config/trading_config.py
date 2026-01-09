@@ -19,9 +19,9 @@ BINANCE_CONFIG = {
     "live_api_key": os.getenv("BINANCE_LIVE_API_KEY", "28VMu8a8Ho9GIlPSZZQnAyAPOMU2WRncPDOWdgNXORunOVMbB4ilsWtJbX8NwwGP"),
     "live_api_secret": os.getenv("BINANCE_LIVE_API_SECRET", "bl9qn0mq99BJfeH0MwrRRCdyu8OpXMclVsVUbtmOxY48SzNS1DvmPaXMq4853e7R"),
 
-    # Use demo mode
-    "testnet": True,
-    "demo_mode": True,
+    # LIVE MODE - PRODUCTION TRADING
+    "testnet": False,
+    "demo_mode": False,
 
     # Binance Futures URLs
     "futures_demo_url": "https://demo-fapi.binance.com",               # Demo futures API (demo.binance.com)
