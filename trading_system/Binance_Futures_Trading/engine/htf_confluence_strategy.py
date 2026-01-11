@@ -137,15 +137,19 @@ class HTFConfluenceStrategy:
         self.use_dynamic_sl = False         # DISABLED - fixed ROI works better
 
         # Pullback entry filter - enter on dips, not chasing (DISABLED)
-        self.use_pullback_filter = False    # DISABLED - reduces good entries
+        self.use_pullback_filter = True     # ENABLED - wait for price near EMA (avoid chasing)
         self.pullback_ema_period = 21       # Check pullback to this EMA
-        self.max_distance_from_ema = 0.5    # Max 0.5% from EMA (enter on dips)
+        self.max_distance_from_ema = 2.0    # Max 2.0% from EMA (avoid over-extension)
 
         # Volatility filter - skip when ATR is too high (ENABLED - blocks choppy markets)
         self.use_volatility_filter = True   # ENABLED - blocks high volatility losses
         self.atr_spike_threshold = 1.5      # ATR > 1.5x average = spiking (choppy)
         self.atr_pct_max = 0.35             # Max ATR as % of price (0.35% = calm market)
         self.atr_avg_period = 20            # Period to calculate average ATR
+        
+        # Momentum spike filter (NEW - avoid parabolic moves that reverse)
+        self.use_momentum_filter = True     # ENABLED - blocks momentum exhaustion
+        self.momentum_spike_ratio = 2.0     # Block if candle moved >2x ATR (parabolic)
         
         # Volume confirmation filter (NEW - blocks low conviction entries)
         self.use_volume_filter = True       # ENABLED - require strong volume
@@ -635,8 +639,30 @@ class HTFConfluenceStrategy:
 
         entry_price = indicators["price"]
         atr = indicators.get("atr", 0.0)
+        
+        # SMART ENTRY FILTER 1: Momentum spike filter - avoid parabolic moves (NEW)
+        if self.use_momentum_filter and atr > 0:
+            # Calculate last candle % move
+            candle_range = abs(indicators.get("high", entry_price) - indicators.get("low", entry_price))
+            candle_pct = (candle_range / entry_price) * 100
+            atr_pct = (atr / entry_price) * 100
+            
+            # If candle moved >2x ATR, it's a momentum spike (likely to reverse)
+            if candle_pct > (atr_pct * self.momentum_spike_ratio):
+                return ConfluenceSignal(
+                    action=None,
+                    confidence=0.0,
+                    strength=SignalStrength.NONE,
+                    trend=htf_trend,
+                    confluence_score=0,
+                    reason=f"Momentum spike: {candle_pct:.2f}% > {atr_pct * self.momentum_spike_ratio:.2f}% ({self.momentum_spike_ratio}x ATR) - wait for consolidation",
+                    indicators=indicators,
+                    entry_price=0.0,
+                    stop_loss=0.0,
+                    take_profit=0.0
+                )
 
-        # SMART ENTRY FILTER 1: Volatility filter - skip when ATR is spiking (choppy market)
+        # SMART ENTRY FILTER 2: Volatility filter - skip when ATR is spiking (choppy market)
         if self.use_volatility_filter:
             atr_pct = indicators.get("atr_pct", 0.0)
             if atr_pct > self.atr_pct_max:
