@@ -141,10 +141,20 @@ class HTFConfluenceStrategy:
         self.pullback_ema_period = 21       # Check pullback to this EMA
         self.max_distance_from_ema = 0.5    # Max 0.5% from EMA (enter on dips)
 
-        # Volatility filter - skip when ATR is spiking (DISABLED)
-        self.use_volatility_filter = False  # DISABLED - misses good trends
+        # Volatility filter - skip when ATR is too high (ENABLED - blocks choppy markets)
+        self.use_volatility_filter = True   # ENABLED - blocks high volatility losses
         self.atr_spike_threshold = 1.5      # ATR > 1.5x average = spiking (choppy)
+        self.atr_pct_max = 0.35             # Max ATR as % of price (0.35% = calm market)
         self.atr_avg_period = 20            # Period to calculate average ATR
+        
+        # Volume confirmation filter (NEW - blocks low conviction entries)
+        self.use_volume_filter = True       # ENABLED - require strong volume
+        self.volume_min_ratio = 1.5         # Require 1.5x average volume
+        
+        # RSI zone filter (NEW - avoid extreme overbought/oversold)
+        self.use_rsi_zone_filter = True     # ENABLED - avoid buying tops/selling bottoms
+        self.rsi_entry_min = 30             # Don't buy if RSI < 30 (oversold bounce risk)
+        self.rsi_entry_max = 70             # Don't buy if RSI > 70 (overbought reversal risk)
 
         # Cooldown - DISABLED (trade whenever signal appears)
         self.min_bars_between_signals = 0   # No cooldown
@@ -627,20 +637,36 @@ class HTFConfluenceStrategy:
         atr = indicators.get("atr", 0.0)
 
         # SMART ENTRY FILTER 1: Volatility filter - skip when ATR is spiking (choppy market)
-        if self.use_volatility_filter and indicators.get("volatility_spiking", False):
-            atr_ratio = indicators.get("atr_ratio", 1.0)
-            return ConfluenceSignal(
-                action=None,
-                confidence=0.0,
-                strength=SignalStrength.NONE,
-                trend=htf_trend,
-                confluence_score=0,
-                reason=f"Volatility filter: ATR spiking ({atr_ratio:.2f}x avg) - choppy market",
-                indicators=indicators,
-                entry_price=0.0,
-                stop_loss=0.0,
-                take_profit=0.0
-            )
+        if self.use_volatility_filter:
+            atr_pct = indicators.get("atr_pct", 0.0)
+            if atr_pct > self.atr_pct_max:
+                return ConfluenceSignal(
+                    action=None,
+                    confidence=0.0,
+                    strength=SignalStrength.NONE,
+                    trend=htf_trend,
+                    confluence_score=0,
+                    reason=f"Volatility filter: ATR {atr_pct:.2f}% > {self.atr_pct_max}% - too choppy",
+                    indicators=indicators,
+                    entry_price=0.0,
+                    stop_loss=0.0,
+                    take_profit=0.0
+                )
+            # Also check ATR spike ratio
+            if indicators.get("volatility_spiking", False):
+                atr_ratio = indicators.get("atr_ratio", 1.0)
+                return ConfluenceSignal(
+                    action=None,
+                    confidence=0.0,
+                    strength=SignalStrength.NONE,
+                    trend=htf_trend,
+                    confluence_score=0,
+                    reason=f"Volatility filter: ATR spiking ({atr_ratio:.2f}x avg) - choppy market",
+                    indicators=indicators,
+                    entry_price=0.0,
+                    stop_loss=0.0,
+                    take_profit=0.0
+                )
 
         # SMART ENTRY FILTER 2: Pullback filter - only enter on dips to EMA
         if self.use_pullback_filter and not indicators.get("is_pullback", True):
@@ -657,6 +683,81 @@ class HTFConfluenceStrategy:
                 stop_loss=0.0,
                 take_profit=0.0
             )
+        
+        # SMART ENTRY FILTER 3: Volume confirmation - require strong volume
+        if self.use_volume_filter:
+            volume_ratio = indicators.get("volume_ratio", 0.0)
+            if volume_ratio < self.volume_min_ratio:
+                return ConfluenceSignal(
+                    action=None,
+                    confidence=0.0,
+                    strength=SignalStrength.NONE,
+                    trend=htf_trend,
+                    confluence_score=0,
+                    reason=f"Volume filter: {volume_ratio:.2f}x < {self.volume_min_ratio}x required - low conviction",
+                    indicators=indicators,
+                    entry_price=0.0,
+                    stop_loss=0.0,
+                    take_profit=0.0
+                )
+        
+        # SMART ENTRY FILTER 4: RSI zone filter - avoid extreme overbought/oversold
+        if self.use_rsi_zone_filter:
+            rsi = indicators.get("rsi", 50)
+            if htf_trend == TrendDirection.BULLISH:
+                if rsi < self.rsi_entry_min:
+                    return ConfluenceSignal(
+                        action=None,
+                        confidence=0.0,
+                        strength=SignalStrength.NONE,
+                        trend=htf_trend,
+                        confluence_score=0,
+                        reason=f"RSI filter: RSI {rsi:.1f} < {self.rsi_entry_min} - too oversold (bounce risk)",
+                        indicators=indicators,
+                        entry_price=0.0,
+                        stop_loss=0.0,
+                        take_profit=0.0
+                    )
+                if rsi > self.rsi_entry_max:
+                    return ConfluenceSignal(
+                        action=None,
+                        confidence=0.0,
+                        strength=SignalStrength.NONE,
+                        trend=htf_trend,
+                        confluence_score=0,
+                        reason=f"RSI filter: RSI {rsi:.1f} > {self.rsi_entry_max} - too overbought (reversal risk)",
+                        indicators=indicators,
+                        entry_price=0.0,
+                        stop_loss=0.0,
+                        take_profit=0.0
+                    )
+            elif htf_trend == TrendDirection.BEARISH:
+                if rsi > self.rsi_entry_max:
+                    return ConfluenceSignal(
+                        action=None,
+                        confidence=0.0,
+                        strength=SignalStrength.NONE,
+                        trend=htf_trend,
+                        confluence_score=0,
+                        reason=f"RSI filter: RSI {rsi:.1f} > {self.rsi_entry_max} - too overbought (bounce risk)",
+                        indicators=indicators,
+                        entry_price=0.0,
+                        stop_loss=0.0,
+                        take_profit=0.0
+                    )
+                if rsi < self.rsi_entry_min:
+                    return ConfluenceSignal(
+                        action=None,
+                        confidence=0.0,
+                        strength=SignalStrength.NONE,
+                        trend=htf_trend,
+                        confluence_score=0,
+                        reason=f"RSI filter: RSI {rsi:.1f} < {self.rsi_entry_min} - too oversold (reversal risk)",
+                        indicators=indicators,
+                        entry_price=0.0,
+                        stop_loss=0.0,
+                        take_profit=0.0
+                    )
 
         # Check LONG conditions if HTF is bullish
         if htf_trend == TrendDirection.BULLISH:
