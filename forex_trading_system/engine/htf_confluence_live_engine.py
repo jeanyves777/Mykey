@@ -367,10 +367,33 @@ class HTFConfluenceForexEngine:
             pip_location = self.get_pip_location(symbol)
             pip_value = 10 ** pip_location
             
-            # Calculate position size
+            # Calculate ideal position size based on risk
             # Risk = Position Size * Pip Value * Stop Loss Pips
             # Position Size = Risk / (Pip Value * Stop Loss Pips)
-            position_size = risk_amount / (pip_value * stop_loss_pips)
+            ideal_position_size = risk_amount / (pip_value * stop_loss_pips)
+            
+            # Limit position size to prevent excessive margin usage
+            # For Forex, limit to approximately 1-2% of capital as notional value
+            # Assuming current price around 0.6-1.4 for major pairs
+            current_price = 1.0  # Rough estimate for calculation
+            try:
+                pricing = self.client.get_current_price(symbol)
+                if pricing and 'mid' in pricing:
+                    current_price = float(pricing['mid'])
+            except:
+                current_price = 1.0
+            
+            # Calculate notional value and limit it
+            notional_value = ideal_position_size * current_price
+            max_notional = capital * 0.02  # Limit to 2% of capital as notional value
+            
+            if notional_value > max_notional:
+                # Scale down position size
+                scale_factor = max_notional / notional_value
+                position_size = ideal_position_size * scale_factor
+                logger.warning(f"[{symbol}] Position size scaled down by {scale_factor:.2f} to limit margin usage")
+            else:
+                position_size = ideal_position_size
             
             # Round to nearest 100 units (OANDA minimum)
             position_size = round(position_size / 100) * 100

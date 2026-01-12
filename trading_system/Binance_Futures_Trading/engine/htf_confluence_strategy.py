@@ -144,19 +144,19 @@ class HTFConfluenceStrategy:
         # Volatility filter - skip when ATR is too high (ENABLED - blocks choppy markets)
         self.use_volatility_filter = True   # ENABLED - blocks high volatility losses
         self.atr_spike_threshold = 1.5      # ATR > 1.5x average = spiking (choppy)
-        self.atr_pct_max = 0.35             # Max ATR as % of price (0.35% = calm market)
+        self.atr_pct_max = 1.2              # Max ATR as % of price (1.2% = allows normal volatility)
         self.atr_avg_period = 20            # Period to calculate average ATR
         
         # Momentum spike filter (NEW - avoid parabolic moves that reverse)
-        self.use_momentum_filter = True     # ENABLED - blocks momentum exhaustion
+        self.use_momentum_filter = False    # DISABLED - too restrictive
         self.momentum_spike_ratio = 2.0     # Block if candle moved >2x ATR (parabolic)
-        
+
         # Volume confirmation filter (NEW - blocks low conviction entries)
-        self.use_volume_filter = True       # ENABLED - require strong volume
+        self.use_volume_filter = False      # DISABLED - too restrictive
         self.volume_min_ratio = 1.5         # Require 1.5x average volume
-        
+
         # RSI zone filter (NEW - avoid extreme overbought/oversold)
-        self.use_rsi_zone_filter = True     # ENABLED - avoid buying tops/selling bottoms
+        self.use_rsi_zone_filter = False    # DISABLED - RSI can stay overbought in trends
         self.rsi_entry_min = 30             # Don't buy if RSI < 30 (oversold bounce risk)
         self.rsi_entry_max = 70             # Don't buy if RSI > 70 (overbought reversal risk)
 
@@ -947,61 +947,61 @@ ASSET_SPECIFIC_CONFIG = {
         "leverage": 20,
         "tp_roi": 0.75,     # 75% ROI (TP) = 3.75% price move
         "sl_roi": 0.35,     # 35% ROI (SL) = 1.75% price move | 2.14:1 R:R
-        "min_confluence_score": 5,  # Quality threshold - between 4 and 8
+        "min_confluence_score": 4,  # Lowered from 5 to allow more trades
     },
     "BNBUSDT": {
         "leverage": 20,
         "tp_roi": 0.30,     # 30% ROI (TP) = 1.5% price move
         "sl_roi": 0.15,     # 15% ROI (SL) = 0.75% price move | 2:1 R:R
-        "min_confluence_score": 5,  # Quality threshold - between 4 and 8
+        "min_confluence_score": 4,  # Lowered from 5 to allow more trades
     },
     "XRPUSDT": {
         "leverage": 20,
         "tp_roi": 0.50,     # 50% ROI (TP) = 2.5% price move (was 40%, +10%)
         "sl_roi": 0.35,     # 35% ROI (SL) = 1.75% price move | 1.43:1 R:R (was 25%, +10%)
-        "min_confluence_score": 6,  # Historical: Never reaches 8, maxes at 6 (25%)
+        "min_confluence_score": 5,  # Lowered from 6 - already struggles to reach 6
     },
     "ADAUSDT": {
         "leverage": 20,
         "tp_roi": 0.60,     # 60% ROI (TP) = 3% price move
         "sl_roi": 0.25,     # 25% ROI (SL) = 1.25% price move | 2.4:1 R:R
-        "min_confluence_score": 5,  # Historical: Second-best at 5/8 (4% vs 10% at 8)
+        "min_confluence_score": 4,  # Lowered from 5 to allow more trades
     },
     "BTCUSDT": {
         "leverage": 20,
         "tp_roi": 0.40,     # 40% ROI (TP) = 2% price move
         "sl_roi": 0.20,     # 20% ROI (SL) = 1% price move | 2:1 R:R
-        "min_confluence_score": 8,  # Historical: 100% at 8/8 - premium quality
+        "min_confluence_score": 6,  # Lowered from 8 to 6 (still high quality)
     },
     "ETHUSDT": {
         "leverage": 20,
         "tp_roi": 0.45,     # 45% ROI (TP) = 2.25% price move
         "sl_roi": 0.20,     # 20% ROI (SL) = 1% price move | 2.25:1 R:R
-        "min_confluence_score": 7,  # High quality threshold
+        "min_confluence_score": 5,  # Lowered from 7 to 5
     },
     "SOLUSDT": {
         "leverage": 20,
         "tp_roi": 0.50,     # 50% ROI (TP) = 2.5% price move
         "sl_roi": 0.25,     # 25% ROI (SL) = 1.25% price move | 2:1 R:R
-        "min_confluence_score": 7,  # High quality threshold
+        "min_confluence_score": 5,  # Lowered from 7 to 5
     },
     "AVAXUSDT": {
         "leverage": 20,
         "tp_roi": 0.75,     # 75% ROI (TP) = 3.75% price move
         "sl_roi": 0.35,     # 35% ROI (SL) = 1.75% price move | 2.14:1 R:R
-        "min_confluence_score": 7,  # High quality - more volatile
+        "min_confluence_score": 5,  # Lowered from 7 to 5
     },
     "LINKUSDT": {
         "leverage": 20,
         "tp_roi": 0.45,     # 45% ROI (TP) = 2.25% price move
         "sl_roi": 0.20,     # 20% ROI (SL) = 1% price move | 2.25:1 R:R
-        "min_confluence_score": 7,  # High quality - established oracle
+        "min_confluence_score": 5,  # Lowered from 7 to 5
     },
     "LTCUSDT": {
         "leverage": 20,
         "tp_roi": 0.40,     # 40% ROI (TP) = 2% price move (like BTC)
         "sl_roi": 0.20,     # 20% ROI (SL) = 1% price move | 2:1 R:R
-        "min_confluence_score": 8,  # High quality - follows BTC closely
+        "min_confluence_score": 6,  # Lowered from 8 to 6 (still high quality)
     },
 }
 
