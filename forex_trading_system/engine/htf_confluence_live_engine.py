@@ -385,30 +385,10 @@ class HTFConfluenceForexEngine:
                 # Base currency is USD (USD_JPY, USD_CAD, etc.)
                 pip_value_per_unit = pip_size / current_price
 
-            # Calculate position size based on risk
+            # Calculate position size based on DOLLAR RISK
             # Risk = Position Size * Pip Value Per Unit * Stop Loss Pips
             # Position Size = Risk / (Pip Value Per Unit * Stop Loss Pips)
-            ideal_position_size = risk_amount / (pip_value_per_unit * stop_loss_pips)
-
-            # CRITICAL: Limit position size by MARGIN USAGE (not just risk)
-            # Calculate notional value and estimated margin requirement
-            notional_value = ideal_position_size * current_price
-
-            # OANDA typical leverage is 50:1 (2% margin) or 30:1 (3.33% margin)
-            # Use conservative 30:1 leverage assumption
-            estimated_margin = notional_value / 30.0
-
-            # Limit margin usage to 10% of capital per position (very conservative)
-            # This prevents margin calls and keeps plenty of room for multiple positions
-            max_margin_per_trade = capital * 0.10  # 10% max margin per trade
-
-            if estimated_margin > max_margin_per_trade:
-                # Scale down position to limit margin usage
-                scale_factor = max_margin_per_trade / estimated_margin
-                position_size = ideal_position_size * scale_factor
-                logger.warning(f"[{symbol}] Position scaled down by {scale_factor:.2f}x to limit margin to ${max_margin_per_trade:.2f}")
-            else:
-                position_size = ideal_position_size
+            position_size = risk_amount / (pip_value_per_unit * stop_loss_pips)
 
             # Round to nearest 100 units (OANDA minimum)
             position_size = round(position_size / 100) * 100
@@ -418,14 +398,14 @@ class HTFConfluenceForexEngine:
 
             # Log the calculation for verification
             final_notional = position_size * current_price
-            final_margin_estimate = final_notional / 30.0
+            final_margin = final_notional / 50.0  # OANDA fixed 50:1 leverage
             actual_risk = position_size * pip_value_per_unit * stop_loss_pips
 
             logger.info(f"[{symbol}] Position sizing: {position_size:,.0f} units")
             logger.info(f"   Price: {current_price:.5f} | Pip value/unit: ${pip_value_per_unit:.6f}")
             logger.info(f"   Target risk: ${risk_amount:.2f} | Actual risk: ${actual_risk:.2f}")
             logger.info(f"   Notional value: ${final_notional:.2f}")
-            logger.info(f"   Estimated margin: ${final_margin_estimate:.2f} (~{final_margin_estimate/capital*100:.1f}% of capital)")
+            logger.info(f"   Margin required (50:1): ${final_margin:.2f} ({final_margin/capital*100:.1f}% of capital)")
 
             return position_size
         
