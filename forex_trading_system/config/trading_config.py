@@ -67,16 +67,16 @@ FOREX_SYMBOLS = FOREX_SYMBOLS_LIVE
 # =============================================================================
 # Session Performance Analysis Results:
 # - ASIAN (00:00-08:00 UTC): +$70,127 profit, 63.9% WR ✅ EXCELLENT  
-# - LONDON (08:00-16:00 UTC): -$42,634 loss, 49.9% WR ❌ UNPROFITABLE
-# - NY (16:00-24:00 UTC): -$9,731 loss, 59.6% WR ❌ UNPROFITABLE (with session filter)
+# - LONDON (08:00-17:00 UTC): -$42,634 loss, 49.9% WR ❌ UNPROFITABLE
+# - NY (13:00-22:00 UTC): High volatility, re-enabled for testing
 
 SESSION_TRADING = {
     "enabled": True,
-    "allowed_sessions": ["ASIAN"],  # Trade only Asian session
+    "allowed_sessions": ["ASIAN", "NY"],  # Trade Asian + NY sessions
     "session_hours": {
-        "ASIAN": (0, 8),    # 00:00-08:00 UTC
-        "LONDON": (8, 16),  # 08:00-16:00 UTC (DISABLED)
-        "NY": (16, 24),     # 16:00-24:00 UTC (DISABLED)
+        "ASIAN": (0, 8),     # 00:00-08:00 UTC
+        "LONDON": (8, 17),   # 08:00-17:00 UTC (DISABLED)
+        "NY": (13, 22),      # 13:00-22:00 UTC (ENABLED - Real market hours)
     }
 }
 
