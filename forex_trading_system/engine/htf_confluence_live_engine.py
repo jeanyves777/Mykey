@@ -24,6 +24,7 @@ import sys
 import time
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -48,13 +49,49 @@ from config.trading_config import (
     SESSION_TRADING
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(message)s',
+# Configure logging with file output
+log_formatter = logging.Formatter(
+    '%(asctime)s | %(levelname)s | %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+
+# Create logs directory if it doesn't exist
+os.makedirs('logs', exist_ok=True)
+
+# Root logger
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# Remove existing handlers to avoid duplicates
+logger.handlers.clear()
+
+# Console handler (for screen output)
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(log_formatter)
+logger.addHandler(console_handler)
+
+# File handler with rotation (main trading log)
+file_handler = RotatingFileHandler(
+    'logs/trading_system.log',
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5
+)
+file_handler.setFormatter(log_formatter)
+logger.addHandler(file_handler)
+
+# Detailed analysis log (for debugging)
+analysis_handler = RotatingFileHandler(
+    'logs/analysis_detailed.log',
+    maxBytes=50*1024*1024,  # 50MB
+    backupCount=3
+)
+analysis_handler.setFormatter(log_formatter)
+
+# Create separate logger for detailed analysis
+analysis_logger = logging.getLogger('analysis')
+analysis_logger.setLevel(logging.INFO)
+analysis_logger.addHandler(analysis_handler)
+analysis_logger.addHandler(console_handler)  # Also show on console
 
 
 class HTFConfluenceForexEngine:
@@ -386,6 +423,7 @@ class HTFConfluenceForexEngine:
         
         except Exception as e:
             logger.error(f"[{symbol}] Error checking for signal: {e}")
+            analysis_logger.error(f"[{symbol}] Detailed error in signal check: {e}")
             return None
     
     def execute_trade(self, symbol: str, signal: ConfluenceSignal) -> bool:
@@ -750,15 +788,28 @@ class HTFConfluenceForexEngine:
                         # Check for signal
                         signal = self.check_for_signal(symbol)
                         
+                        # Log detailed analysis to file
+                        if signal:
+                            analysis_logger.info(f"\n[{symbol}] DETAILED ANALYSIS:")
+                            analysis_logger.info(f"  Action: {signal.action or 'NONE'}")
+                            analysis_logger.info(f"  Confluence Score: {signal.confluence_score}/8")
+                            analysis_logger.info(f"  Confidence: {signal.confidence:.1%}")
+                            analysis_logger.info(f"  Reason: {signal.reason}")
+                            analysis_logger.info(f"  Entry Price: {signal.entry_price:.5f}")
+                            if signal.indicators:
+                                analysis_logger.info(f"  Indicators: {signal.indicators}")
+                        
                         if signal and signal.action:
                             logger.info(f"\n[{symbol}] 📊 Signal: {signal.action} | Score: {signal.confluence_score}/8 | {signal.reason}")
+                            analysis_logger.info(f"[{symbol}] EXECUTING TRADE: {signal.action} at {signal.entry_price:.5f}")
                             
                             # Execute trade
                             if self.execute_trade(symbol, signal):
                                 self.last_trade_time[symbol] = datetime.now()
                         elif signal:
                             # Show all checks even when no signal
-                            logger.info(f"[{symbol}] ✓ Checked | {signal.reason}")
+                            logger.info(f"[{symbol}]  Checked | {signal.reason}")
+                            analysis_logger.info(f"[{symbol}] NO SIGNAL: {signal.reason} (Score: {signal.confluence_score}/8)")
                     
                     except Exception as e:
                         logger.error(f"[{symbol}] Error in trading loop: {e}")
@@ -778,8 +829,19 @@ class HTFConfluenceForexEngine:
                         logger.info(f"📊 System Realized PnL: ${self.system_realized_pnl:+,.2f} (our trades only)")
                         logger.info(f"📈 Unrealized PnL: ${unrealized_pl:+,.2f}")
                         logger.info(f"🎯 Total Equity: ${balance + unrealized_pl:,.2f}")
+                        
+                        # Detailed logging to file
+                        analysis_logger.info(f"ACCOUNT SUMMARY:")
+                        analysis_logger.info(f"  Balance: ${balance:,.2f}")
+                        analysis_logger.info(f"  System Realized PnL: ${self.system_realized_pnl:+,.2f}")
+                        analysis_logger.info(f"  Unrealized PnL: ${unrealized_pl:+,.2f}")
+                        analysis_logger.info(f"  Total Equity: ${balance + unrealized_pl:,.2f}")
+                        analysis_logger.info(f"  Daily Stats: {self.wins_today}W/{self.losses_today}L | PnL: ${self.pnl_today:+.2f}")
+                        if hasattr(self, 'per_symbol_daily_losses'):
+                            analysis_logger.info(f"  Daily Losses by Symbol: {dict(self.per_symbol_daily_losses)}")
                 except Exception as e:
                     logger.error(f"Failed to get account info: {e}")
+                    analysis_logger.error(f"Account info error: {e}")
                 
                 logger.info(f"📋 Today's Stats: {self.wins_today}W/{self.losses_today}L | PnL: ${self.pnl_today:+.2f}")
                 logger.info(f"🔄 Active positions: {len(self.positions)}")
