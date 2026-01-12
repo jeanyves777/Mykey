@@ -447,8 +447,8 @@ class HTFConfluenceForexEngine:
             order_result = self.client.place_market_order(
                 instrument=symbol,
                 units=units,
-                take_profit_price=tp_price,
-                stop_loss_price=sl_price
+                take_profit=tp_price,
+                stop_loss=sl_price
             )
             
             if not order_result:
