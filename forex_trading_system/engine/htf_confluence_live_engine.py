@@ -362,43 +362,72 @@ class HTFConfluenceForexEngine:
             
             # Calculate risk amount in currency
             risk_amount = capital * self.risk_per_trade
-            
-            # Get pip value
-            pip_location = self.get_pip_location(symbol)
-            pip_value = 10 ** pip_location
-            
-            # Calculate ideal position size based on risk
-            # Risk = Position Size * Pip Value * Stop Loss Pips
-            # Position Size = Risk / (Pip Value * Stop Loss Pips)
-            ideal_position_size = risk_amount / (pip_value * stop_loss_pips)
-            
-            # Limit position size to prevent excessive margin usage
-            # For Forex, limit to approximately 1-2% of capital as notional value
-            # Assuming current price around 0.6-1.4 for major pairs
-            current_price = 1.0  # Rough estimate for calculation
+
+            # Get current price for accurate pip value calculation
+            current_price = 1.0
             try:
                 pricing = self.client.get_current_price(symbol)
                 if pricing and 'mid' in pricing:
                     current_price = float(pricing['mid'])
             except:
-                current_price = 1.0
-            
-            # Calculate notional value and limit it
+                logger.warning(f"[{symbol}] Could not get current price, using 1.0")
+
+            # Calculate pip value in USD per unit
+            # For pairs quoted in USD (XXX_USD like EUR_USD): pip_value_per_unit = pip_size
+            # For pairs with USD as base (USD_XXX like USD_JPY): pip_value_per_unit = pip_size / current_price
+            pip_location = self.get_pip_location(symbol)
+            pip_size = 10 ** pip_location  # e.g., 0.0001 for EUR_USD, 0.01 for USD_JPY
+
+            if symbol.endswith('_USD'):
+                # Quote currency is USD (EUR_USD, GBP_USD, etc.)
+                pip_value_per_unit = pip_size
+            else:
+                # Base currency is USD (USD_JPY, USD_CAD, etc.)
+                pip_value_per_unit = pip_size / current_price
+
+            # Calculate position size based on risk
+            # Risk = Position Size * Pip Value Per Unit * Stop Loss Pips
+            # Position Size = Risk / (Pip Value Per Unit * Stop Loss Pips)
+            ideal_position_size = risk_amount / (pip_value_per_unit * stop_loss_pips)
+
+            # CRITICAL: Limit position size by MARGIN USAGE (not just risk)
+            # Calculate notional value and estimated margin requirement
             notional_value = ideal_position_size * current_price
-            max_notional = capital * 0.02  # Limit to 2% of capital as notional value
-            
-            if notional_value > max_notional:
-                # Scale down position size
-                scale_factor = max_notional / notional_value
+
+            # OANDA typical leverage is 50:1 (2% margin) or 30:1 (3.33% margin)
+            # Use conservative 30:1 leverage assumption
+            estimated_margin = notional_value / 30.0
+
+            # Limit margin usage to 10% of capital per position (very conservative)
+            # This prevents margin calls and keeps plenty of room for multiple positions
+            max_margin_per_trade = capital * 0.10  # 10% max margin per trade
+
+            if estimated_margin > max_margin_per_trade:
+                # Scale down position to limit margin usage
+                scale_factor = max_margin_per_trade / estimated_margin
                 position_size = ideal_position_size * scale_factor
-                logger.warning(f"[{symbol}] Position size scaled down by {scale_factor:.2f} to limit margin usage")
+                logger.warning(f"[{symbol}] Position scaled down by {scale_factor:.2f}x to limit margin to ${max_margin_per_trade:.2f}")
             else:
                 position_size = ideal_position_size
-            
+
             # Round to nearest 100 units (OANDA minimum)
             position_size = round(position_size / 100) * 100
-            
-            return max(position_size, 100)  # Minimum 100 units
+
+            # Ensure minimum position size
+            position_size = max(position_size, 100)
+
+            # Log the calculation for verification
+            final_notional = position_size * current_price
+            final_margin_estimate = final_notional / 30.0
+            actual_risk = position_size * pip_value_per_unit * stop_loss_pips
+
+            logger.info(f"[{symbol}] Position sizing: {position_size:,.0f} units")
+            logger.info(f"   Price: {current_price:.5f} | Pip value/unit: ${pip_value_per_unit:.6f}")
+            logger.info(f"   Target risk: ${risk_amount:.2f} | Actual risk: ${actual_risk:.2f}")
+            logger.info(f"   Notional value: ${final_notional:.2f}")
+            logger.info(f"   Estimated margin: ${final_margin_estimate:.2f} (~{final_margin_estimate/capital*100:.1f}% of capital)")
+
+            return position_size
         
         except Exception as e:
             logger.error(f"[{symbol}] Failed to calculate position size: {e}")
