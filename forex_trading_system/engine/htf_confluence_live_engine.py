@@ -379,8 +379,15 @@ class HTFConfluenceForexEngine:
             # With 50:1 leverage: Notional = Margin × 50
             target_notional = target_margin * 50.0
 
-            # Calculate units: Units = Notional / Price
-            position_size = target_notional / current_price
+            # Calculate units based on pair type
+            # For XXX_USD pairs (EUR/USD, GBP/USD, NZD/USD): notional = units × price
+            # For USD_XXX pairs (USD/JPY, USD/CAD): notional = units (already in USD!)
+            if symbol.endswith('_USD'):
+                # Quote currency is USD: units × price = notional in USD
+                position_size = target_notional / current_price
+            else:
+                # Base currency is USD: units = notional in USD directly
+                position_size = target_notional
 
             # Round to nearest 100 units (OANDA minimum)
             position_size = round(position_size / 100) * 100
@@ -389,7 +396,10 @@ class HTFConfluenceForexEngine:
             position_size = max(position_size, 100)
 
             # Calculate actual values for logging
-            final_notional = position_size * current_price
+            if symbol.endswith('_USD'):
+                final_notional = position_size * current_price
+            else:
+                final_notional = position_size  # Units already in USD
             final_margin = final_notional / 50.0
 
             # Calculate pip value for risk estimation
