@@ -72,11 +72,11 @@ FOREX_SYMBOLS = FOREX_SYMBOLS_LIVE
 
 SESSION_TRADING = {
     "enabled": True,
-    "allowed_sessions": ["ASIAN", "NY"],  # Trade Asian + NY sessions
+    "allowed_sessions": ["ASIAN", "LONDON", "NY"],  # Trade all sessions
     "session_hours": {
         "ASIAN": (0, 8),     # 00:00-08:00 UTC
-        "LONDON": (8, 17),   # 08:00-17:00 UTC (DISABLED)
-        "NY": (13, 22),      # 13:00-22:00 UTC (ENABLED - Real market hours)
+        "LONDON": (8, 17),   # 08:00-17:00 UTC
+        "NY": (13, 22),      # 13:00-22:00 UTC
     }
 }
 
