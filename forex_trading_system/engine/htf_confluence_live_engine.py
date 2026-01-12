@@ -904,54 +904,46 @@ class HTFConfluenceForexEngine:
                     logger.info("\n📍 OPEN POSITIONS (LIVE FROM OANDA):")
                     for pos in real_positions:
                         symbol = pos["instrument"]
-                        # Find matching internal position for metadata (if exists)
-                        internal_pos = self.positions.get(symbol)
                         try:
-                            # Get current price
-                            pricing = self.client.get_current_price(symbol)
-                            if not pricing:
-                                continue
-                            current_price = float(pricing.get('mid', 0))
-                            if current_price == 0:
-                                continue
-                            
-                            # Calculate current PnL
-                            cfg = self.symbol_configs[symbol]
-                            pip_value = 10 ** cfg["pip_location"]
-                            
-                            if pos["side"] == "BUY":
-                                pnl_pips = (current_price - pos["entry_price"]) / pip_value
+                            # OANDA position data only has basic info
+                            # Use internal tracking for entry price and other metadata if available
+                            internal_pos = self.positions.get(symbol)
+
+                            if internal_pos:
+                                # We have internal tracking - use full display
+                                pricing = self.client.get_current_price(symbol)
+                                if not pricing:
+                                    continue
+                                current_price = float(pricing.get('mid', 0))
+                                if current_price == 0:
+                                    continue
+
+                                cfg = self.symbol_configs[symbol]
+                                pip_value = 10 ** cfg["pip_location"]
+
+                                if internal_pos["side"] == "BUY":
+                                    pnl_pips = (current_price - internal_pos["entry_price"]) / pip_value
+                                else:
+                                    pnl_pips = (internal_pos["entry_price"] - current_price) / pip_value
+
+                                pnl_usd = pnl_pips * pip_value * pos["units"]
+                                time_in_trade = datetime.now() - internal_pos["entry_time"]
+                                hours = time_in_trade.seconds // 3600
+                                minutes = (time_in_trade.seconds % 3600) // 60
+                                status = "🟢" if pnl_pips > 0 else "🔴" if pnl_pips < 0 else "⚪"
+
+                                logger.info(f"\n  {status} {symbol} - {pos['side']}")
+                                logger.info(f"     Entry: {internal_pos['entry_price']:.5f} | Current: {current_price:.5f}")
+                                logger.info(f"     TP: {internal_pos['tp_price']:.5f} ({internal_pos['tp_pips']:+.1f}p) | SL: {internal_pos['sl_price']:.5f} ({-internal_pos['sl_pips']:+.1f}p)")
+                                logger.info(f"     Size: {pos['units']:,.0f} units | Risk: {self.risk_per_trade*100}%")
+                                logger.info(f"     PnL: {pnl_pips:+.1f} pips (${pnl_usd:+,.2f})")
+                                logger.info(f"     Duration: {hours}h {minutes}m | Score: {internal_pos['confluence_score']}/8")
                             else:
-                                pnl_pips = (pos["entry_price"] - current_price) / pip_value
-                            
-                            # Calculate PnL in USD
-                            pnl_usd = pnl_pips * pip_value * pos["units"]
-                            
-                            # Time in trade
-                            time_in_trade = datetime.now() - pos["entry_time"]
-                            hours = time_in_trade.seconds // 3600
-                            minutes = (time_in_trade.seconds % 3600) // 60
-                            
-                            # Status emoji
-                            status = "🟢" if pnl_pips > 0 else "🔴" if pnl_pips < 0 else "⚪"
-                            
-                            logger.info(f"\n  {status} {symbol} - {pos['side']}")
-                            logger.info(f"     Entry: {pos['entry_price']:.5f} | Current: {current_price:.5f}")
-                            logger.info(f"     TP: {pos['tp_price']:.5f} ({pos['tp_pips']:+.1f}p) | SL: {pos['sl_price']:.5f} ({-pos['sl_pips']:+.1f}p)")
-                            logger.info(f"     Size: {pos['units']:,.0f} units | Risk: {self.risk_per_trade*100}%")
-                            logger.info(f"     PnL: {pnl_pips:+.1f} pips (${pnl_usd:+,.2f})")
-                            logger.info(f"     Duration: {hours}h {minutes}m | Score: {pos['confluence_score']}/8")
-                            
-                            # Show peak if trailing lock is active
-                            if symbol in self.peak_pips and self.peak_pips[symbol] >= self.trailing_lock_activation:
-                                peak = self.peak_pips[symbol]
-                                floor = max(peak - self.trailing_lock_distance, self.trailing_lock_min_floor)
-                                logger.info(f"     🔒 Trailing Lock Active | Peak: {peak:+.1f}p | Floor: {floor:+.1f}p")
-                            
-                            # Show reversal count if any
-                            if symbol in self.reversal_cycles and self.reversal_cycles[symbol] > 0:
-                                logger.info(f"     ⚠️  HTF Reversals: {self.reversal_cycles[symbol]} cycles")
-                        
+                                # No internal tracking - just show basic OANDA data
+                                logger.info(f"\n  ⚪ {symbol} - {pos['side']}")
+                                logger.info(f"     Size: {pos['units']:,.0f} units")
+                                logger.info(f"     (Position not tracked by system - manual or old trade)")
+
                         except Exception as e:
                             logger.error(f"     Error monitoring {symbol}: {e}")
                 else:
