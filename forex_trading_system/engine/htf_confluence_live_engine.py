@@ -376,8 +376,12 @@ class HTFConfluenceForexEngine:
             # Calculate target margin to use
             target_margin = capital * self.risk_per_trade
 
-            # With 50:1 leverage: Notional = Margin × 50
-            target_notional = target_margin * 50.0
+            # OANDA uses different leverage per pair (not fixed 50:1!)
+            # Major pairs (GBP, EUR, USD/JPY, USD/CAD): 20:1 (5% margin)
+            # Minor pairs (NZD, AUD): 30:1 (3.33% margin)
+            # Use conservative 20:1 to match OANDA's actual margin requirements
+            leverage = 20.0
+            target_notional = target_margin * leverage
 
             # Calculate units based on pair type
             # For XXX_USD pairs (EUR/USD, GBP/USD, NZD/USD): notional = units × price
@@ -400,7 +404,7 @@ class HTFConfluenceForexEngine:
                 final_notional = position_size * current_price
             else:
                 final_notional = position_size  # Units already in USD
-            final_margin = final_notional / 50.0
+            final_margin = final_notional / leverage
 
             # Calculate pip value for risk estimation
             pip_location = self.get_pip_location(symbol)
