@@ -596,7 +596,14 @@ class HTFConfluenceForexEngine:
                 # Calculate final PnL to track daily losses per symbol
                 cfg = self.symbol_configs[symbol]
                 pip_value = 10 ** cfg["pip_location"]
-                current_price = self.client.get_current_price(symbol)
+                pricing = self.client.get_current_price(symbol)
+                if not pricing:
+                    logger.error(f"[{symbol}] Could not get current price for PnL calculation")
+                    return
+                current_price = float(pricing.get('mid', 0))
+                if current_price == 0:
+                    logger.error(f"[{symbol}] Invalid price for PnL calculation") 
+                    return
                 
                 if position_info["side"] == "BUY":
                     pnl_pips = (current_price - position_info["entry_price"]) / pip_value
@@ -783,8 +790,11 @@ class HTFConfluenceForexEngine:
                     for symbol, pos in self.positions.items():
                         try:
                             # Get current price
-                            current_price = self.client.get_current_price(symbol)
-                            if not current_price:
+                            pricing = self.client.get_current_price(symbol)
+                            if not pricing:
+                                continue
+                            current_price = float(pricing.get('mid', 0))
+                            if current_price == 0:
                                 continue
                             
                             # Calculate current PnL
