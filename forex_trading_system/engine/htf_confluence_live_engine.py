@@ -939,13 +939,25 @@ class HTFConfluenceForexEngine:
                                 logger.info(f"     PnL: {pnl_pips:+.1f} pips (${pnl_usd:+,.2f})")
                                 logger.info(f"     Duration: {hours}h {minutes}m | Score: {internal_pos['confluence_score']}/8")
                             else:
-                                # No internal tracking - just show basic OANDA data
-                                logger.info(f"\n  ⚪ {symbol} - {pos['side']}")
-                                logger.info(f"     Size: {pos['units']:,.0f} units")
-                                logger.info(f"     (Position not tracked by system - manual or old trade)")
+                                # No internal tracking - show OANDA data with average price
+                                pricing = self.client.get_current_price(symbol)
+                                if pricing:
+                                    current_price = float(pricing.get('mid', 0))
+                                    avg_price = pos.get('average_price', 0)
+                                    unrealized_pl = pos.get('unrealized_pl', 0)
+
+                                    status = "🟢" if unrealized_pl > 0 else "🔴" if unrealized_pl < 0 else "⚪"
+                                    logger.info(f"\n  {status} {symbol} - {pos['side']}")
+                                    logger.info(f"     Avg Entry: {avg_price:.5f} | Current: {current_price:.5f}")
+                                    logger.info(f"     Size: {pos['units']:,.0f} units")
+                                    logger.info(f"     Unrealized P&L: ${unrealized_pl:+.2f}")
+                                    logger.info(f"     (Not tracked - opened before restart)")
+                                else:
+                                    logger.info(f"\n  ⚪ {symbol} - {pos['side']}")
+                                    logger.info(f"     Size: {pos['units']:,.0f} units")
 
                         except Exception as e:
-                            logger.error(f"     Error monitoring {symbol}: {e}")
+                            logger.error(f"     Error monitoring {symbol}: {str(e)}")
                 else:
                     # Show position sizing info when no positions
                     try:
