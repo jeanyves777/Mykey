@@ -107,7 +107,7 @@ class HTFConfluenceForexEngine:
                 leverage=cfg["leverage"],
                 tp_pips=cfg["tp_pips"],
                 sl_pips=cfg["sl_pips"],
-                min_confluence_score=8  # 8/8 required
+                min_confluence_score=cfg.get("min_confluence_score", 4)  # Use config value
             )
         
         # Position tracking
