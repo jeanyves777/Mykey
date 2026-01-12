@@ -130,7 +130,24 @@ class OANDAClient:
         """Get available margin for trading."""
         summary = self.get_account_summary()
         return float(summary.get("marginAvailable", 0))
-    
+
+    def get_margin_rate(self, instrument: str) -> float:
+        """Get margin rate for a specific instrument."""
+        try:
+            url = f"{self.base_url}/v3/accounts/{self.account_id}/instruments"
+            params = {"instruments": instrument}
+            response = requests.get(url, headers=self.headers, params=params, timeout=10)
+
+            if response.status_code == 200:
+                data = response.json()
+                instruments = data.get("instruments", [])
+                if instruments:
+                    return float(instruments[0].get("marginRate", 0.02))  # Default 2% if not found
+            return 0.02  # Default 2% margin (50:1 leverage)
+        except Exception as e:
+            logger.error(f"Error getting margin rate for {instrument}: {e}")
+            return 0.02
+
     def get_candles(
         self,
         instrument: str,
