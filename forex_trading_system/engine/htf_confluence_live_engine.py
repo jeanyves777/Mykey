@@ -206,6 +206,7 @@ class HTFConfluenceForexEngine:
         self.wins_today = 0
         self.losses_today = 0
         self.pnl_today = 0.0
+        self.system_realized_pnl = 0.0  # Track only OUR trades
         self.symbol_stats = {}
         for symbol in self.symbols:
             self.symbol_stats[symbol] = {"wins": 0, "losses": 0, "pnl": 0.0}
@@ -214,6 +215,9 @@ class HTFConfluenceForexEngine:
             if os.path.exists(self.stats_file):
                 with open(self.stats_file, 'r') as f:
                     data = json.load(f)
+                    # Load overall system realized PnL (persists across days)
+                    self.system_realized_pnl = data.get("system_realized_pnl", 0.0)
+                    
                     # Check if stats are from today
                     if data.get("date") == datetime.now().strftime("%Y-%m-%d"):
                         self.trades_today = data.get("trades_today", 0)
@@ -225,6 +229,7 @@ class HTFConfluenceForexEngine:
                             if symbol in saved_stats:
                                 self.symbol_stats[symbol] = saved_stats[symbol]
                         logger.info(f"Loaded session stats: {self.wins_today}W/{self.losses_today}L, PnL: ${self.pnl_today:+.2f}")
+                        logger.info(f"System Total Realized PnL: ${self.system_realized_pnl:+,.2f}")
         except Exception as e:
             logger.warning(f"Could not load stats: {e}")
     
@@ -237,6 +242,7 @@ class HTFConfluenceForexEngine:
                 "wins_today": self.wins_today,
                 "losses_today": self.losses_today,
                 "pnl_today": self.pnl_today,
+                "system_realized_pnl": self.system_realized_pnl,  # Persists across days
                 "symbol_stats": self.symbol_stats
             }
             with open(self.stats_file, 'w') as f:
@@ -597,6 +603,13 @@ class HTFConfluenceForexEngine:
                 else:
                     pnl_pips = (position_info["entry_price"] - current_price) / pip_value
                 
+                # Calculate PnL in USD
+                pnl_usd = pnl_pips * pip_value * position_info["units"]
+                
+                # Update system realized PnL (only OUR trades)
+                self.system_realized_pnl += pnl_usd
+                self.pnl_today += pnl_usd
+                
                 # Update daily loss tracking per symbol
                 current_date = datetime.now().strftime('%Y-%m-%d')
                 
@@ -612,14 +625,16 @@ class HTFConfluenceForexEngine:
                     self.per_symbol_daily_losses[symbol]['losses'] += 1
                     daily_losses = self.per_symbol_daily_losses[symbol]['losses']
                     
-                    logger.info(f"[{symbol}] ✓ Position closed | Reason: {reason} | PnL: {pnl_pips:+.1f}p | Daily losses: {daily_losses}/{self.max_daily_losses_per_symbol}")
+                    self.losses_today += 1
+                    logger.info(f"[{symbol}] ✓ Position closed | Reason: {reason} | PnL: {pnl_pips:+.1f}p (${pnl_usd:+,.2f}) | Daily losses: {daily_losses}/{self.max_daily_losses_per_symbol}")
                     
                     if daily_losses >= self.max_daily_losses_per_symbol:
                         logger.warning(f"⚠️  [{symbol}] DAILY LIMIT REACHED: {daily_losses} loss today - BLOCKED until tomorrow")
                 else:
-                    logger.info(f"[{symbol}] ✓ Position closed | Reason: {reason} | PnL: {pnl_pips:+.1f}p")
+                    self.wins_today += 1
+                    logger.info(f"[{symbol}] ✓ Position closed | Reason: {reason} | PnL: {pnl_pips:+.1f}p (${pnl_usd:+,.2f})")
                 
-                # Update stats (simplified)
+                # Update stats
                 self.trades_today += 1
                 self._save_stats()
                 
@@ -751,10 +766,9 @@ class HTFConfluenceForexEngine:
                     if account_info:
                         balance = float(account_info.get('balance', 0))
                         unrealized_pl = float(account_info.get('unrealizedPL', 0))
-                        pl = float(account_info.get('pl', 0))  # Realized PnL
                         
                         logger.info(f"💰 Account Balance: ${balance:,.2f}")
-                        logger.info(f"📊 Realized PnL: ${pl:+,.2f}")
+                        logger.info(f"📊 System Realized PnL: ${self.system_realized_pnl:+,.2f} (our trades only)")
                         logger.info(f"📈 Unrealized PnL: ${unrealized_pl:+,.2f}")
                         logger.info(f"🎯 Total Equity: ${balance + unrealized_pl:,.2f}")
                 except Exception as e:
