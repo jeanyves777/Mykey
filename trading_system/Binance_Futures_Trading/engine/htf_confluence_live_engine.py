@@ -2219,9 +2219,15 @@ class HTFConfluenceLiveEngine:
             rsi_status = "✓" if (30 < ltf_rsi < 70) else "✗"  # Not overbought/oversold
             macd_status = "✓" if ((trend == "BULLISH" and ltf_macd > ltf_macd_sig) or (trend == "BEARISH" and ltf_macd < ltf_macd_sig)) else "✗"
 
-            # Log compact diagnostics
+            # Get HTF trend data from signal indicators
+            htf_4h_trend = signal.indicators.get('htf_4h_trend', '?')
+            htf_1h_trend = signal.indicators.get('htf_1h_trend', '?')
+            trends_aligned = signal.indicators.get('trends_aligned', False)
+            
+            # Log compact diagnostics with proper HTF data
             logger.info(f"┌─ {symbol} SIGNAL CHECK ──────────────────────────")
-            logger.info(f"│ Trend: {trend} | Price: ${ltf_price:.4f}")
+            logger.info(f"│ HTF Trends: 4H={htf_4h_trend} | 1H={htf_1h_trend} | Aligned: {'✓' if trends_aligned else '✗'}")
+            logger.info(f"│ Price: ${ltf_price:.4f} | Overall: {trend}")
             logger.info(f"│ 5m EMA: 9={ltf_ema9:.4f} | 21={ltf_ema21:.4f} | 50={ltf_ema50:.4f}")
             logger.info(f"│ 5m RSI: {ltf_rsi:.1f} | MACD: {ltf_macd:.6f} vs Sig: {ltf_macd_sig:.6f} ({macd_cross})")
             logger.info(f"│ 15m EMA: 21={htf_ema21:.4f} | 50={htf_ema50:.4f}")
