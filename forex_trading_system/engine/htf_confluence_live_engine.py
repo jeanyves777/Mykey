@@ -390,6 +390,16 @@ class HTFConfluenceForexEngine:
             # Position Size = Risk / (Pip Value Per Unit * Stop Loss Pips)
             position_size = risk_amount / (pip_value_per_unit * stop_loss_pips)
 
+            # CRITICAL: Cap position size to limit margin usage
+            # Maximum notional value = 20% of capital (conservative with 50:1 leverage = 0.4% margin)
+            max_notional = capital * 0.20
+            notional_value = position_size * current_price
+
+            if notional_value > max_notional:
+                # Scale down to stay within margin limits
+                position_size = max_notional / current_price
+                logger.warning(f"[{symbol}] Position capped: notional ${notional_value:,.0f} > max ${max_notional:,.0f}")
+
             # Round to nearest 100 units (OANDA minimum)
             position_size = round(position_size / 100) * 100
 
