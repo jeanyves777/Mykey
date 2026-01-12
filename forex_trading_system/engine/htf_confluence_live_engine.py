@@ -889,12 +889,18 @@ class HTFConfluenceForexEngine:
                     analysis_logger.error(f"Account info error: {e}")
                 
                 logger.info(f"📋 Today's Stats: {self.wins_today}W/{self.losses_today}L | PnL: ${self.pnl_today:+.2f}")
-                logger.info(f"🔄 Active positions: {len(self.positions)}")
-                
+
+                # Fetch REAL positions from OANDA API (not internal tracking)
+                real_positions = self.client.get_open_positions()
+                logger.info(f"🔄 Active positions: {len(real_positions)}")
+
                 # Show detailed position information if any
-                if self.positions:
-                    logger.info("\n📍 OPEN POSITIONS:")
-                    for symbol, pos in self.positions.items():
+                if real_positions:
+                    logger.info("\n📍 OPEN POSITIONS (LIVE FROM OANDA):")
+                    for pos in real_positions:
+                        symbol = pos["instrument"]
+                        # Find matching internal position for metadata (if exists)
+                        internal_pos = self.positions.get(symbol)
                         try:
                             # Get current price
                             pricing = self.client.get_current_price(symbol)
