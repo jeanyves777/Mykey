@@ -400,6 +400,21 @@ class HTFConfluenceForexEngine:
                 logger.error(f"[{symbol}] Invalid position size")
                 return False
             
+            # Log position size calculation
+            try:
+                account_info = self.client.get_account_summary()
+                balance = float(account_info.get('balance', 0)) if account_info else 0
+                risk_amount = balance * self.risk_per_trade
+                potential_gain = risk_amount * (signal.take_profit_pips / signal.stop_loss_pips)
+                
+                logger.info(f"[{symbol}] 💼 Position Size Calculation:")
+                logger.info(f"   Balance: ${balance:,.2f} | Risk: {self.risk_per_trade*100}% = ${risk_amount:,.2f}")
+                logger.info(f"   SL: {signal.stop_loss_pips}p | TP: {signal.take_profit_pips}p | R:R = 1:{signal.take_profit_pips/signal.stop_loss_pips:.1f}")
+                logger.info(f"   Position: {abs(position_size):,.0f} units")
+                logger.info(f"   Max Loss: ${risk_amount:,.2f} | Max Gain: ${potential_gain:,.2f}")
+            except Exception as e:
+                logger.debug(f"Could not log position calculation: {e}")
+            
             # Determine trade side
             if signal.action == "BUY":
                 units = position_size
@@ -748,11 +763,67 @@ class HTFConfluenceForexEngine:
                 logger.info(f"📋 Today's Stats: {self.wins_today}W/{self.losses_today}L | PnL: ${self.pnl_today:+.2f}")
                 logger.info(f"🔄 Active positions: {len(self.positions)}")
                 
-                # Show position details if any
+                # Show detailed position information if any
                 if self.positions:
-                    logger.info("   Open Positions:")
+                    logger.info("\n📍 OPEN POSITIONS:")
                     for symbol, pos in self.positions.items():
-                        logger.info(f"     • {symbol}: {pos['side']} @ {pos['entry_price']:.5f}")
+                        try:
+                            # Get current price
+                            current_price = self.client.get_current_price(symbol)
+                            if not current_price:
+                                continue
+                            
+                            # Calculate current PnL
+                            cfg = self.symbol_configs[symbol]
+                            pip_value = 10 ** cfg["pip_location"]
+                            
+                            if pos["side"] == "BUY":
+                                pnl_pips = (current_price - pos["entry_price"]) / pip_value
+                            else:
+                                pnl_pips = (pos["entry_price"] - current_price) / pip_value
+                            
+                            # Calculate PnL in USD
+                            pnl_usd = pnl_pips * pip_value * pos["units"]
+                            
+                            # Time in trade
+                            time_in_trade = datetime.now() - pos["entry_time"]
+                            hours = time_in_trade.seconds // 3600
+                            minutes = (time_in_trade.seconds % 3600) // 60
+                            
+                            # Status emoji
+                            status = "🟢" if pnl_pips > 0 else "🔴" if pnl_pips < 0 else "⚪"
+                            
+                            logger.info(f"\n  {status} {symbol} - {pos['side']}")
+                            logger.info(f"     Entry: {pos['entry_price']:.5f} | Current: {current_price:.5f}")
+                            logger.info(f"     TP: {pos['tp_price']:.5f} ({pos['tp_pips']:+.1f}p) | SL: {pos['sl_price']:.5f} ({-pos['sl_pips']:+.1f}p)")
+                            logger.info(f"     Size: {pos['units']:,.0f} units | Risk: {self.risk_per_trade*100}%")
+                            logger.info(f"     PnL: {pnl_pips:+.1f} pips (${pnl_usd:+,.2f})")
+                            logger.info(f"     Duration: {hours}h {minutes}m | Score: {pos['confluence_score']}/8")
+                            
+                            # Show peak if trailing lock is active
+                            if symbol in self.peak_pips and self.peak_pips[symbol] >= self.trailing_lock_activation:
+                                peak = self.peak_pips[symbol]
+                                floor = max(peak - self.trailing_lock_distance, self.trailing_lock_min_floor)
+                                logger.info(f"     🔒 Trailing Lock Active | Peak: {peak:+.1f}p | Floor: {floor:+.1f}p")
+                            
+                            # Show reversal count if any
+                            if symbol in self.reversal_cycles and self.reversal_cycles[symbol] > 0:
+                                logger.info(f"     ⚠️  HTF Reversals: {self.reversal_cycles[symbol]} cycles")
+                        
+                        except Exception as e:
+                            logger.error(f"     Error monitoring {symbol}: {e}")
+                else:
+                    # Show position sizing info when no positions
+                    try:
+                        account_info = self.client.get_account_summary()
+                        if account_info:
+                            balance = float(account_info.get('balance', 0))
+                            risk_amount = balance * self.risk_per_trade
+                            logger.info(f"\n💼 Position Sizing (when signal appears):")
+                            logger.info(f"   Risk per trade: {self.risk_per_trade*100}% = ${risk_amount:,.2f}")
+                            logger.info(f"   Example: EUR_USD with 12p SL = ~{int(risk_amount / (0.0001 * 12) / 100) * 100:,} units")
+                    except Exception as e:
+                        logger.debug(f"Could not calculate position size: {e}")
                 
                 logger.info("-" * 60)
                 
