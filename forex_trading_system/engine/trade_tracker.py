@@ -33,8 +33,15 @@ class TradeTracker:
         Args:
             data_dir: Directory to store tracking data
         """
-        self.data_dir = data_dir
-        os.makedirs(data_dir, exist_ok=True)
+        # Use absolute path based on script location
+        if not os.path.isabs(data_dir):
+            script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            self.data_dir = os.path.join(script_dir, data_dir)
+        else:
+            self.data_dir = data_dir
+
+        os.makedirs(self.data_dir, exist_ok=True)
+        logger.info(f"Trade Tracker data directory: {self.data_dir}")
 
         # File paths
         self.trades_file = os.path.join(data_dir, "trades_history.json")
