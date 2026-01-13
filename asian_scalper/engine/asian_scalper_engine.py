@@ -541,6 +541,12 @@ class AsianScalperEngine:
         """
         logger.info("Starting Asian Scalper in continuous mode...")
 
+        # Check for existing positions on startup (in case of restart)
+        existing_trades = self.client.get_open_trades()
+        if len(existing_trades) > 0:
+            logger.info(f"Found {len(existing_trades)} existing positions - resuming monitoring")
+            self.positions_opened = True
+
         while True:
             try:
                 # Check if we're in trading window and no positions open
@@ -555,6 +561,10 @@ class AsianScalperEngine:
                         # Wait before looking for next session
                         logger.info("Waiting for next trading window...")
                         time.sleep(3600)  # Wait 1 hour
+                    else:
+                        # Positions exist, resume monitoring
+                        logger.info(f"Found {len(open_trades)} existing positions - resuming monitoring")
+                        self.positions_opened = True
 
                 elif self.positions_opened:
                     # Monitor existing positions
