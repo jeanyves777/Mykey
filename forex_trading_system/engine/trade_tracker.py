@@ -73,13 +73,33 @@ class TradeTracker:
             logger.error(f"Error loading {filepath}: {e}")
         return default
 
+    def _convert_numpy(self, obj):
+        """Recursively convert numpy types to Python types."""
+        import numpy as np
+        if isinstance(obj, dict):
+            return {k: self._convert_numpy(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._convert_numpy(i) for i in obj]
+        elif isinstance(obj, (np.integer, np.floating)):
+            return obj.item()
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return obj
+
     def _save_json(self, filepath: str, data: Any):
         """Save data to JSON file."""
         try:
+            # Convert numpy types before saving
+            clean_data = self._convert_numpy(data)
             with open(filepath, 'w') as f:
-                json.dump(data, f, indent=2, default=str)
+                json.dump(clean_data, f, indent=2, default=str)
+            logger.debug(f"Saved data to {filepath}")
         except Exception as e:
             logger.error(f"Error saving {filepath}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     def _load_known_trades(self):
         """Load known trade IDs from history."""
