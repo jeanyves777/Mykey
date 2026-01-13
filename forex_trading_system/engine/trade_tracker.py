@@ -43,12 +43,12 @@ class TradeTracker:
         os.makedirs(self.data_dir, exist_ok=True)
         logger.info(f"Trade Tracker data directory: {self.data_dir}")
 
-        # File paths
-        self.trades_file = os.path.join(data_dir, "trades_history.json")
-        self.signals_file = os.path.join(data_dir, "signals_log.json")
-        self.analysis_file = os.path.join(data_dir, "analysis_log.json")
-        self.market_data_file = os.path.join(data_dir, "market_snapshots.json")
-        self.sync_state_file = os.path.join(data_dir, "sync_state.json")
+        # File paths - use self.data_dir (absolute path)
+        self.trades_file = os.path.join(self.data_dir, "trades_history.json")
+        self.signals_file = os.path.join(self.data_dir, "signals_log.json")
+        self.analysis_file = os.path.join(self.data_dir, "analysis_log.json")
+        self.market_data_file = os.path.join(self.data_dir, "market_snapshots.json")
+        self.sync_state_file = os.path.join(self.data_dir, "sync_state.json")
 
         # Load existing data
         self.trades = self._load_json(self.trades_file, {"active": {}, "closed": []})
