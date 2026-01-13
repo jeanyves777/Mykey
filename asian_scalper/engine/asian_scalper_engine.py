@@ -111,9 +111,12 @@ class AsianScalperEngine:
         now = datetime.now(timezone.utc)
         hour = now.hour
 
-        start = SESSION_CONFIG["trade_window_start"]
-        end = SESSION_CONFIG["trade_window_end"]
+        start = SESSION_CONFIG["trade_window_start"]  # 22
+        end = SESSION_CONFIG["trade_window_end"]      # 6
 
+        # Handle wrap-around midnight (22:00 to 06:00)
+        if start > end:
+            return hour >= start or hour < end
         return start <= hour < end
 
     def is_asian_session(self) -> bool:
@@ -121,9 +124,12 @@ class AsianScalperEngine:
         now = datetime.now(timezone.utc)
         hour = now.hour
 
-        start = SESSION_CONFIG["asian_start_hour"]
-        end = SESSION_CONFIG["asian_end_hour"]
+        start = SESSION_CONFIG["asian_start_hour"]  # 22
+        end = SESSION_CONFIG["asian_end_hour"]      # 8
 
+        # Handle wrap-around midnight (22:00 to 08:00)
+        if start > end:
+            return hour >= start or hour < end
         return start <= hour < end
 
     def calculate_ema(self, df: pd.DataFrame, period: int) -> pd.Series:

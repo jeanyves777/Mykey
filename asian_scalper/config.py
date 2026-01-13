@@ -108,8 +108,11 @@ SCALP_CONFIG = {
 # =============================================================================
 # SESSION TIMING (UTC)
 # =============================================================================
+# Forex market opens Sunday 5pm EST (winter) / 6pm EST (summer)
+# 5pm EST = 22:00 UTC (winter, no DST)
+# 6pm EST = 22:00 UTC (summer, with DST)
 SESSION_CONFIG = {
-    "asian_start_hour": 0,   # 00:00 UTC (Tokyo open)
+    "asian_start_hour": 22,  # 22:00 UTC (5pm EST winter / 6pm EST summer)
     "asian_end_hour": 8,     # 08:00 UTC (London open)
 
     # Extended for Tokyo/London overlap
@@ -117,7 +120,7 @@ SESSION_CONFIG = {
     "london_overlap_end": 9,    # 09:00 UTC
 
     # Trade window - when to open positions
-    "trade_window_start": 0,    # Start trading at 00:00 UTC
+    "trade_window_start": 22,   # Start trading at 22:00 UTC (5pm EST)
     "trade_window_end": 6,      # Stop new entries by 06:00 UTC
 
     # Check interval
