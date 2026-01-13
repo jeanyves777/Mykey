@@ -392,12 +392,14 @@ class AsianScalperEngine:
 
         logger.info(f"Portfolio Status | Balance: ${balance:.2f} | Unrealized P/L: ${unrealized_pl:.2f} | Open Trades: {len(open_trades)} | Target: ${self.portfolio_target}")
 
-        # Log individual positions if any
+        # Log individual positions
         if open_trades:
+            logger.info("  Open Positions:")
             for trade in open_trades:
                 pl = trade["unrealized_pl"]
-                symbol = "+" if pl >= 0 else ""
-                logger.debug(f"  {trade['instrument']}: {symbol}${pl:.2f}")
+                sign = "+" if pl >= 0 else ""
+                direction = "LONG" if trade["units"] > 0 else "SHORT"
+                logger.info(f"    {trade['instrument']:10} | {direction:5} | {sign}${pl:.2f}")
 
     def save_session_data(self, session_result: Dict):
         """Save session data to file."""
