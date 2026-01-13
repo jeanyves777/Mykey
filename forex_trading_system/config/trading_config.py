@@ -76,7 +76,7 @@ SESSION_TRADING = {
     "session_hours": {
         "ASIAN": (0, 8),     # 00:00-08:00 UTC
         "LONDON": (8, 17),   # 08:00-17:00 UTC
-        "NY": (13, 23),      # 13:00-23:00 UTC (8am-6pm EST, covers DST)
+        "NY": (13, 24),      # 13:00-24:00 UTC (8am-7pm EST winter, 9am-8pm EST summer)
     }
 }
 
