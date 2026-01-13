@@ -41,6 +41,7 @@ from engine.htf_confluence_strategy import (
     SignalStrength,
     ConfluenceSignal
 )
+from engine.trade_tracker import TradeTracker
 from config.trading_config import (
     FOREX_SYMBOLS,
     SYMBOL_CONFIG,
@@ -167,6 +168,10 @@ class HTFConfluenceForexEngine:
         # Running state
         self.running = False
         self.check_interval = 60  # Check every 60 seconds
+
+        # Initialize trade tracker for comprehensive logging
+        self.tracker = TradeTracker(data_dir="data")
+        logger.info("Trade Tracker initialized for comprehensive logging")
         
         # SMART EXIT SETTINGS (identical to Binance)
         
@@ -434,10 +439,10 @@ class HTFConfluenceForexEngine:
     def check_for_signal(self, symbol: str) -> Optional[ConfluenceSignal]:
         """
         Check for entry signal on a symbol.
-        
+
         Args:
             symbol: Forex pair to check
-            
+
         Returns:
             ConfluenceSignal if valid signal, None otherwise
         """
@@ -446,31 +451,100 @@ class HTFConfluenceForexEngine:
             ltf_df = self.get_candles(symbol, "M15", 200)  # 15m for entry signals
             htf_df = self.get_candles(symbol, "H1", 100)   # 1H for trend
             m5_df = self.get_candles(symbol, "M5", 100)    # 5m for confirmation
-            
+
             if ltf_df is None or htf_df is None or m5_df is None:
                 logger.warning(f"[{symbol}] Missing candle data")
                 return None
-            
+
             # Add 5m confirmation indicators to ltf indicators
             strategy = self.strategies[symbol]
             m5_indicators = strategy.calculate_indicators(m5_df)
-            
+            ltf_indicators = strategy.calculate_indicators(ltf_df)
+            htf_indicators = strategy.calculate_indicators(htf_df)
+
+            # Get HTF trend for logging
+            htf_trend, htf_strength = strategy.get_htf_trend(htf_df)
+
             # Get strategy instance
             signal = strategy.should_enter(
                 ltf_df=ltf_df,
                 htf_df=htf_df,
                 pip_location=self.get_pip_location(symbol)
             )
-            
+
             # Add 5m confirmation to signal indicators
             if m5_indicators:
                 signal.indicators["5m_ema_bullish"] = m5_indicators.get("ema_bullish", False)
                 signal.indicators["5m_ema_bearish"] = m5_indicators.get("ema_bearish", False)
                 signal.indicators["volume_confirmed"] = m5_indicators.get("volume_confirmed", False)
                 signal.indicators["volume_ratio"] = m5_indicators.get("volume_ratio", 0)
-            
+
+            # Get current price for market snapshot
+            current_price = ltf_df['close'].iloc[-1] if not ltf_df.empty else 0
+
+            # Prepare comprehensive analysis data
+            all_indicators = {
+                "htf_trend": htf_trend.value,
+                "htf_strength": htf_strength.value if htf_strength else "unknown",
+                "htf_ema_21": htf_indicators.get("ema_21", 0),
+                "htf_ema_50": htf_indicators.get("ema_50", 0),
+                "ltf_macd": ltf_indicators.get("macd", 0),
+                "ltf_macd_signal": ltf_indicators.get("macd_signal", 0),
+                "ltf_rsi": ltf_indicators.get("rsi", 0),
+                "ltf_ema_9": ltf_indicators.get("ema_9", 0),
+                "ltf_ema_21": ltf_indicators.get("ema_21", 0),
+                "5m_volume_ratio": m5_indicators.get("volume_ratio", 0) if m5_indicators else 0,
+                **signal.indicators
+            }
+
+            market_state = {
+                "price": current_price,
+                "htf_open": htf_df['open'].iloc[-1] if not htf_df.empty else 0,
+                "htf_high": htf_df['high'].iloc[-1] if not htf_df.empty else 0,
+                "htf_low": htf_df['low'].iloc[-1] if not htf_df.empty else 0,
+                "htf_close": htf_df['close'].iloc[-1] if not htf_df.empty else 0,
+                "ltf_open": ltf_df['open'].iloc[-1] if not ltf_df.empty else 0,
+                "ltf_high": ltf_df['high'].iloc[-1] if not ltf_df.empty else 0,
+                "ltf_low": ltf_df['low'].iloc[-1] if not ltf_df.empty else 0,
+                "ltf_close": ltf_df['close'].iloc[-1] if not ltf_df.empty else 0
+            }
+
+            signal_data = {
+                "action": signal.action,
+                "confluence_score": signal.confluence_score,
+                "confidence": signal.confidence,
+                "reason": signal.reason,
+                "entry_price": signal.entry_price,
+                "tp_pips": signal.take_profit_pips,
+                "sl_pips": signal.stop_loss_pips
+            }
+
+            # Log to tracker
+            self.tracker.log_signal_analysis(
+                symbol=symbol,
+                signal_data=signal_data,
+                indicators=all_indicators,
+                market_state=market_state
+            )
+
+            # Record market snapshot for data collection
+            price_data = {
+                "open": ltf_df['open'].iloc[-1] if not ltf_df.empty else 0,
+                "high": ltf_df['high'].iloc[-1] if not ltf_df.empty else 0,
+                "low": ltf_df['low'].iloc[-1] if not ltf_df.empty else 0,
+                "close": ltf_df['close'].iloc[-1] if not ltf_df.empty else 0,
+                "volume": ltf_df['volume'].iloc[-1] if not ltf_df.empty else 0
+            }
+            self.tracker.record_market_snapshot(
+                symbol=symbol,
+                price_data=price_data,
+                indicators=all_indicators,
+                htf_trend=htf_trend.value,
+                ltf_trend="bullish" if ltf_indicators.get("ema_bullish") else "bearish" if ltf_indicators.get("ema_bearish") else "neutral"
+            )
+
             return signal
-        
+
         except Exception as e:
             logger.error(f"[{symbol}] Error checking for signal: {e}")
             analysis_logger.error(f"[{symbol}] Detailed error in signal check: {e}")
@@ -543,6 +617,14 @@ class HTFConfluenceForexEngine:
                 logger.error(f"[{symbol}] Failed to place order")
                 return False
             
+            # Extract OANDA trade ID from order result
+            oanda_trade_id = None
+            if order_result and "orderFillTransaction" in order_result:
+                fill = order_result["orderFillTransaction"]
+                trade_ids = fill.get("tradeOpened", {}).get("tradeID")
+                if trade_ids:
+                    oanda_trade_id = trade_ids
+
             # Track position
             self.positions[symbol] = {
                 "entry_time": datetime.now(),
@@ -554,14 +636,32 @@ class HTFConfluenceForexEngine:
                 "tp_pips": signal.take_profit_pips,
                 "sl_pips": signal.stop_loss_pips,
                 "confluence_score": signal.confluence_score,
-                "htf_trend": signal.trend.value
+                "htf_trend": signal.trend.value,
+                "oanda_trade_id": oanda_trade_id
             }
-            
+
             # Initialize tracking for smart exits
             self.reversal_cycles[symbol] = 0
             self.peak_pips[symbol] = 0
-            
+
+            # Record trade entry in tracker
+            self.tracker.record_trade_entry(
+                symbol=symbol,
+                side=signal.action,
+                entry_price=signal.entry_price,
+                units=abs(units),
+                tp_price=tp_price,
+                sl_price=sl_price,
+                tp_pips=signal.take_profit_pips,
+                sl_pips=signal.stop_loss_pips,
+                confluence_score=signal.confluence_score,
+                signal_reason=signal.reason,
+                indicators=signal.indicators,
+                oanda_trade_id=oanda_trade_id
+            )
+
             logger.info(f"[{symbol}] ✓ Trade executed | {signal.reason}")
+            logger.info(f"[{symbol}] OANDA Trade ID: {oanda_trade_id}")
             return True
         
         except Exception as e:
@@ -665,7 +765,7 @@ class HTFConfluenceForexEngine:
     def close_position(self, symbol: str, reason: str = "manual"):
         """
         Close a position.
-        
+
         Args:
             symbol: Forex pair
             reason: Reason for closing
@@ -674,13 +774,14 @@ class HTFConfluenceForexEngine:
             if symbol not in self.positions:
                 logger.warning(f"[{symbol}] No position to close")
                 return
-            
+
+            position_info = self.positions[symbol]
+            side = "LONG" if position_info["side"] == "BUY" else "SHORT"
+
             # Close position via OANDA API
-            result = self.client.close_position(symbol)
-            
-            if result:
-                position_info = self.positions[symbol]
-                
+            result = self.client.close_position(symbol, side)
+
+            if result and "error" not in result:
                 # Calculate final PnL to track daily losses per symbol
                 cfg = self.symbol_configs[symbol]
                 pip_value = 10 ** cfg["pip_location"]
@@ -690,56 +791,65 @@ class HTFConfluenceForexEngine:
                     return
                 current_price = float(pricing.get('mid', 0))
                 if current_price == 0:
-                    logger.error(f"[{symbol}] Invalid price for PnL calculation") 
+                    logger.error(f"[{symbol}] Invalid price for PnL calculation")
                     return
-                
+
                 if position_info["side"] == "BUY":
                     pnl_pips = (current_price - position_info["entry_price"]) / pip_value
                 else:
                     pnl_pips = (position_info["entry_price"] - current_price) / pip_value
-                
+
                 # Calculate PnL in USD
                 pnl_usd = pnl_pips * pip_value * position_info["units"]
-                
+
                 # Update system realized PnL (only OUR trades)
                 self.system_realized_pnl += pnl_usd
                 self.pnl_today += pnl_usd
-                
+
                 # Update daily loss tracking per symbol
                 current_date = datetime.now().strftime('%Y-%m-%d')
-                
+
                 if pnl_pips < 0:
                     # Track daily loss for this symbol
                     if symbol not in self.per_symbol_daily_losses:
                         self.per_symbol_daily_losses[symbol] = {'date': current_date, 'losses': 0}
-                    
+
                     # If new day, reset
                     if self.per_symbol_daily_losses[symbol]['date'] != current_date:
                         self.per_symbol_daily_losses[symbol] = {'date': current_date, 'losses': 0}
-                    
+
                     self.per_symbol_daily_losses[symbol]['losses'] += 1
                     daily_losses = self.per_symbol_daily_losses[symbol]['losses']
-                    
+
                     self.losses_today += 1
                     logger.info(f"[{symbol}] ✓ Position closed | Reason: {reason} | PnL: {pnl_pips:+.1f}p (${pnl_usd:+,.2f}) | Daily losses: {daily_losses}/{self.max_daily_losses_per_symbol}")
-                    
+
                     if daily_losses >= self.max_daily_losses_per_symbol:
                         logger.warning(f"⚠️  [{symbol}] DAILY LIMIT REACHED: {daily_losses} loss today - BLOCKED until tomorrow")
                 else:
                     self.wins_today += 1
                     logger.info(f"[{symbol}] ✓ Position closed | Reason: {reason} | PnL: {pnl_pips:+.1f}p (${pnl_usd:+,.2f})")
-                
+
+                # Record exit in tracker
+                self.tracker.record_trade_exit(
+                    symbol=symbol,
+                    exit_price=current_price,
+                    exit_reason=reason,
+                    realized_pips=pnl_pips,
+                    realized_pl=pnl_usd
+                )
+
                 # Update stats
                 self.trades_today += 1
                 self._save_stats()
-                
+
                 # Remove from tracking
                 del self.positions[symbol]
                 if symbol in self.reversal_cycles:
                     del self.reversal_cycles[symbol]
                 if symbol in self.peak_pips:
                     del self.peak_pips[symbol]
-        
+
         except Exception as e:
             logger.error(f"[{symbol}] Failed to close position: {e}")
     
@@ -806,9 +916,51 @@ class HTFConfluenceForexEngine:
                 
                 logger.info("=" * 60)
                 
+                # Sync with OANDA to detect trades closed by SL/TP
+                try:
+                    closed_by_oanda = self.tracker.sync_with_oanda(self.client, self.symbols)
+                    for closed_trade in closed_by_oanda:
+                        symbol = closed_trade.get("symbol")
+                        pnl_pips = closed_trade.get("realized_pips", 0)
+                        pnl_usd = closed_trade.get("realized_pl", 0)
+                        exit_reason = closed_trade.get("exit_reason", "UNKNOWN")
+
+                        logger.info(f"\n🔔 [{symbol}] TRADE CLOSED BY OANDA: {exit_reason}")
+                        logger.info(f"   Result: {closed_trade.get('outcome')} | {pnl_pips:+.1f} pips (${pnl_usd:+.2f})")
+
+                        # Update daily stats
+                        if pnl_pips > 0:
+                            self.wins_today += 1
+                        elif pnl_pips < 0:
+                            self.losses_today += 1
+                            # Track daily loss for this symbol
+                            current_date_str = datetime.now().strftime('%Y-%m-%d')
+                            if symbol not in self.per_symbol_daily_losses:
+                                self.per_symbol_daily_losses[symbol] = {'date': current_date_str, 'losses': 0}
+                            if self.per_symbol_daily_losses[symbol]['date'] != current_date_str:
+                                self.per_symbol_daily_losses[symbol] = {'date': current_date_str, 'losses': 0}
+                            self.per_symbol_daily_losses[symbol]['losses'] += 1
+
+                        self.system_realized_pnl += pnl_usd
+                        self.pnl_today += pnl_usd
+                        self.trades_today += 1
+
+                        # Remove from internal tracking if present
+                        if symbol in self.positions:
+                            del self.positions[symbol]
+                        if symbol in self.reversal_cycles:
+                            del self.reversal_cycles[symbol]
+                        if symbol in self.peak_pips:
+                            del self.peak_pips[symbol]
+
+                    if closed_by_oanda:
+                        self._save_stats()
+                except Exception as e:
+                    logger.error(f"Error syncing with OANDA: {e}")
+
                 # Check each symbol for signals
                 current_date = datetime.now().strftime('%Y-%m-%d')
-                
+
                 for symbol in self.symbols:
                     try:
                         # Skip if already in position
@@ -971,8 +1123,19 @@ class HTFConfluenceForexEngine:
                     except Exception as e:
                         logger.debug(f"Could not calculate position size: {e}")
                 
+                # Show performance summary from tracker
+                try:
+                    perf = self.tracker.get_performance_summary()
+                    if perf.get("total_trades", 0) > 0:
+                        logger.info("\n📊 LIFETIME PERFORMANCE (from tracker):")
+                        logger.info(f"   Total trades: {perf['total_trades']} | Win rate: {perf['win_rate']:.1f}%")
+                        logger.info(f"   Total PnL: {perf['total_pips']:+.1f} pips (${perf['total_pl']:+.2f})")
+                        logger.info(f"   Avg Win: {perf['avg_win_pips']:+.1f}p | Avg Loss: {perf['avg_loss_pips']:+.1f}p")
+                except Exception as e:
+                    logger.debug(f"Could not get performance summary: {e}")
+
                 logger.info("-" * 60)
-                
+
                 # Wait before next check
                 time.sleep(self.check_interval)
         

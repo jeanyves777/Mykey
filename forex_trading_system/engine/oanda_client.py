@@ -480,20 +480,164 @@ class OANDAClient:
         try:
             url = f"{self.base_url}/v3/accounts/{self.account_id}/transactions"
             params = {"count": count}
-            
+
             if from_time:
                 params["from"] = from_time
             if to_time:
                 params["to"] = to_time
-            
+
             response = requests.get(url, headers=self.headers, params=params, timeout=10)
-            
+
             if response.status_code == 200:
                 data = response.json()
                 return data.get("transactions", [])
-            
+
             return []
-            
+
         except Exception as e:
             logger.error(f"Error getting transaction history: {e}")
+            return []
+
+    def get_closed_trades(self, count: int = 50) -> List[Dict]:
+        """
+        Get recently closed trades from OANDA.
+
+        Args:
+            count: Number of recent trades to fetch
+
+        Returns:
+            List of closed trade details
+        """
+        try:
+            url = f"{self.base_url}/v3/accounts/{self.account_id}/trades"
+            params = {
+                "state": "CLOSED",
+                "count": count
+            }
+
+            response = requests.get(url, headers=self.headers, params=params, timeout=10)
+
+            if response.status_code == 200:
+                data = response.json()
+                trades = []
+
+                for trade in data.get("trades", []):
+                    trades.append({
+                        "id": trade["id"],
+                        "instrument": trade["instrument"],
+                        "units": float(trade["initialUnits"]),
+                        "open_price": float(trade["price"]),
+                        "close_price": float(trade.get("averageClosePrice", trade["price"])),
+                        "realized_pl": float(trade["realizedPL"]),
+                        "financing": float(trade.get("financing", 0)),
+                        "open_time": trade["openTime"],
+                        "close_time": trade.get("closeTime", ""),
+                        "close_reason": trade.get("closingTransactionIDs", [])
+                    })
+
+                return trades
+
+            return []
+
+        except Exception as e:
+            logger.error(f"Error getting closed trades: {e}")
+            return []
+
+    def get_trade_details(self, trade_id: str) -> Optional[Dict]:
+        """
+        Get detailed information about a specific trade.
+
+        Args:
+            trade_id: The OANDA trade ID
+
+        Returns:
+            Trade details dict or None
+        """
+        try:
+            url = f"{self.base_url}/v3/accounts/{self.account_id}/trades/{trade_id}"
+            response = requests.get(url, headers=self.headers, timeout=10)
+
+            if response.status_code == 200:
+                data = response.json()
+                trade = data.get("trade", {})
+
+                return {
+                    "id": trade.get("id"),
+                    "instrument": trade.get("instrument"),
+                    "units": float(trade.get("currentUnits", trade.get("initialUnits", 0))),
+                    "initial_units": float(trade.get("initialUnits", 0)),
+                    "price": float(trade.get("price", 0)),
+                    "state": trade.get("state"),
+                    "realized_pl": float(trade.get("realizedPL", 0)),
+                    "unrealized_pl": float(trade.get("unrealizedPL", 0)),
+                    "financing": float(trade.get("financing", 0)),
+                    "open_time": trade.get("openTime"),
+                    "close_time": trade.get("closeTime"),
+                    "average_close_price": float(trade.get("averageClosePrice", 0)),
+                    "stop_loss": trade.get("stopLossOrder"),
+                    "take_profit": trade.get("takeProfitOrder"),
+                    "closing_transactions": trade.get("closingTransactionIDs", [])
+                }
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Error getting trade {trade_id} details: {e}")
+            return None
+
+    def get_transactions_since_id(self, since_id: str) -> List[Dict]:
+        """
+        Get all transactions since a specific transaction ID.
+
+        Args:
+            since_id: Transaction ID to start from
+
+        Returns:
+            List of transactions
+        """
+        try:
+            url = f"{self.base_url}/v3/accounts/{self.account_id}/transactions/sinceid"
+            params = {"id": since_id}
+
+            response = requests.get(url, headers=self.headers, params=params, timeout=10)
+
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("transactions", [])
+
+            return []
+
+        except Exception as e:
+            logger.error(f"Error getting transactions since {since_id}: {e}")
+            return []
+
+    def get_trades(self, instrument: str = None) -> List[Dict]:
+        """Get open trades, optionally filtered by instrument."""
+        try:
+            url = f"{self.base_url}/v3/accounts/{self.account_id}/openTrades"
+            response = requests.get(url, headers=self.headers, timeout=10)
+
+            if response.status_code == 200:
+                data = response.json()
+                trades = []
+
+                for trade in data.get("trades", []):
+                    if instrument is None or trade["instrument"] == instrument:
+                        trades.append({
+                            "id": trade["id"],
+                            "instrument": trade["instrument"],
+                            "units": float(trade["currentUnits"]),
+                            "price": float(trade["price"]),
+                            "unrealized_pl": float(trade["unrealizedPL"]),
+                            "open_time": trade["openTime"],
+                            "stop_loss": float(trade.get("stopLossOrder", {}).get("price", 0)),
+                            "take_profit": float(trade.get("takeProfitOrder", {}).get("price", 0))
+                        })
+
+                return trades
+
+            return []
+
+        except Exception as e:
+            logger.error(f"Error getting trades: {e}")
             return []
