@@ -127,9 +127,12 @@ SESSION_CONFIG = {
 # =============================================================================
 # LOGGING CONFIGURATION
 # =============================================================================
+# Get the directory where this config file is located
+_CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
+
 LOGGING_CONFIG = {
-    "log_dir": "/workspaces/Mykey/asian_scalper/logs",
-    "data_dir": "/workspaces/Mykey/asian_scalper/data",
+    "log_dir": os.path.join(_CONFIG_DIR, "logs"),
+    "data_dir": os.path.join(_CONFIG_DIR, "data"),
     "trade_log_file": "asian_scalper_trades.json",
     "session_log_file": "asian_scalper_sessions.json",
     "console_output": True,

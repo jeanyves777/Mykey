@@ -30,6 +30,10 @@ from config import (
 )
 from engine.oanda_client import AsianScalperOANDAClient
 
+# Create directories before setting up logging
+os.makedirs(LOGGING_CONFIG["log_dir"], exist_ok=True)
+os.makedirs(LOGGING_CONFIG["data_dir"], exist_ok=True)
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
