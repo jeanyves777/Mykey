@@ -482,31 +482,40 @@ class HTFConfluenceForexEngine:
             # Get current price for market snapshot
             current_price = ltf_df['close'].iloc[-1] if not ltf_df.empty else 0
 
+            # Helper to convert numpy types to Python types
+            def to_python(val):
+                if hasattr(val, 'item'):
+                    return val.item()
+                return val
+
             # Prepare comprehensive analysis data
+            htf_trend_str = htf_trend.value if hasattr(htf_trend, 'value') else str(htf_trend)
+            htf_strength_str = htf_strength.value if htf_strength and hasattr(htf_strength, 'value') else str(htf_strength) if htf_strength else "unknown"
+
             all_indicators = {
-                "htf_trend": htf_trend.value,
-                "htf_strength": htf_strength.value if htf_strength else "unknown",
-                "htf_ema_21": htf_indicators.get("ema_21", 0),
-                "htf_ema_50": htf_indicators.get("ema_50", 0),
-                "ltf_macd": ltf_indicators.get("macd", 0),
-                "ltf_macd_signal": ltf_indicators.get("macd_signal", 0),
-                "ltf_rsi": ltf_indicators.get("rsi", 0),
-                "ltf_ema_9": ltf_indicators.get("ema_9", 0),
-                "ltf_ema_21": ltf_indicators.get("ema_21", 0),
-                "5m_volume_ratio": m5_indicators.get("volume_ratio", 0) if m5_indicators else 0,
+                "htf_trend": htf_trend_str,
+                "htf_strength": htf_strength_str,
+                "htf_ema_21": to_python(htf_indicators.get("ema_21", 0)),
+                "htf_ema_50": to_python(htf_indicators.get("ema_50", 0)),
+                "ltf_macd": to_python(ltf_indicators.get("macd", 0)),
+                "ltf_macd_signal": to_python(ltf_indicators.get("macd_signal", 0)),
+                "ltf_rsi": to_python(ltf_indicators.get("rsi", 0)),
+                "ltf_ema_9": to_python(ltf_indicators.get("ema_9", 0)),
+                "ltf_ema_21": to_python(ltf_indicators.get("ema_21", 0)),
+                "5m_volume_ratio": to_python(m5_indicators.get("volume_ratio", 0)) if m5_indicators else 0,
                 **signal.indicators
             }
 
             market_state = {
-                "price": current_price,
-                "htf_open": htf_df['open'].iloc[-1] if not htf_df.empty else 0,
-                "htf_high": htf_df['high'].iloc[-1] if not htf_df.empty else 0,
-                "htf_low": htf_df['low'].iloc[-1] if not htf_df.empty else 0,
-                "htf_close": htf_df['close'].iloc[-1] if not htf_df.empty else 0,
-                "ltf_open": ltf_df['open'].iloc[-1] if not ltf_df.empty else 0,
-                "ltf_high": ltf_df['high'].iloc[-1] if not ltf_df.empty else 0,
-                "ltf_low": ltf_df['low'].iloc[-1] if not ltf_df.empty else 0,
-                "ltf_close": ltf_df['close'].iloc[-1] if not ltf_df.empty else 0
+                "price": to_python(current_price),
+                "htf_open": to_python(htf_df['open'].iloc[-1]) if not htf_df.empty else 0,
+                "htf_high": to_python(htf_df['high'].iloc[-1]) if not htf_df.empty else 0,
+                "htf_low": to_python(htf_df['low'].iloc[-1]) if not htf_df.empty else 0,
+                "htf_close": to_python(htf_df['close'].iloc[-1]) if not htf_df.empty else 0,
+                "ltf_open": to_python(ltf_df['open'].iloc[-1]) if not ltf_df.empty else 0,
+                "ltf_high": to_python(ltf_df['high'].iloc[-1]) if not ltf_df.empty else 0,
+                "ltf_low": to_python(ltf_df['low'].iloc[-1]) if not ltf_df.empty else 0,
+                "ltf_close": to_python(ltf_df['close'].iloc[-1]) if not ltf_df.empty else 0
             }
 
             signal_data = {
@@ -529,17 +538,17 @@ class HTFConfluenceForexEngine:
 
             # Record market snapshot for data collection
             price_data = {
-                "open": ltf_df['open'].iloc[-1] if not ltf_df.empty else 0,
-                "high": ltf_df['high'].iloc[-1] if not ltf_df.empty else 0,
-                "low": ltf_df['low'].iloc[-1] if not ltf_df.empty else 0,
-                "close": ltf_df['close'].iloc[-1] if not ltf_df.empty else 0,
-                "volume": ltf_df['volume'].iloc[-1] if not ltf_df.empty else 0
+                "open": to_python(ltf_df['open'].iloc[-1]) if not ltf_df.empty else 0,
+                "high": to_python(ltf_df['high'].iloc[-1]) if not ltf_df.empty else 0,
+                "low": to_python(ltf_df['low'].iloc[-1]) if not ltf_df.empty else 0,
+                "close": to_python(ltf_df['close'].iloc[-1]) if not ltf_df.empty else 0,
+                "volume": to_python(ltf_df['volume'].iloc[-1]) if not ltf_df.empty else 0
             }
             self.tracker.record_market_snapshot(
                 symbol=symbol,
                 price_data=price_data,
                 indicators=all_indicators,
-                htf_trend=htf_trend.value,
+                htf_trend=htf_trend_str,
                 ltf_trend="bullish" if ltf_indicators.get("ema_bullish") else "bearish" if ltf_indicators.get("ema_bearish") else "neutral"
             )
 
