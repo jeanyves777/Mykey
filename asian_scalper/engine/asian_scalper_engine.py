@@ -83,6 +83,7 @@ class AsianScalperEngine:
         self.force_entry = SCALP_CONFIG["force_entry"]
         self.fallback_direction = SCALP_CONFIG["fallback_direction"]
         self.use_per_pair_direction = SCALP_CONFIG.get("use_per_pair_direction", True)
+        self.max_spread_pips = SCALP_CONFIG.get("max_spread_pips", 2.0)
 
         # DCA settings
         self.dca_enabled = SCALP_CONFIG.get("dca_enabled", True)
@@ -121,6 +122,7 @@ class AsianScalperEngine:
         logger.info(f"Portfolio Target: ${self.portfolio_target}")
         logger.info(f"Individual TP: {self.tp_pips} pips | SL: {self.sl_pips} pips")
         logger.info(f"Units per pair: {self.units_per_pair}")
+        logger.info(f"Max spread: {self.max_spread_pips} pips")
         logger.info(f"Per-pair direction: {self.use_per_pair_direction}")
         logger.info(f"DCA enabled: {self.dca_enabled} | Trigger: ${self.dca_trigger_pl}")
         logger.info(f"Recovery exit: ${self.recovery_exit_pl}")
@@ -276,6 +278,7 @@ class AsianScalperEngine:
         results = []
         successful = 0
         failed = 0
+        skipped_spread = 0
         directions_used = {"LONG": 0, "SHORT": 0}
 
         # Get all prices at once for faster execution
@@ -283,6 +286,26 @@ class AsianScalperEngine:
 
         for pair in self.pairs:
             try:
+                # Get current price first to check spread
+                price_data = prices.get(pair)
+                if not price_data:
+                    price_data = self.client.get_current_price(pair)
+
+                if not price_data:
+                    logger.error(f"{pair}: Could not get price")
+                    failed += 1
+                    continue
+
+                # Calculate spread in pips
+                pip_value = get_pair_pip_value(pair)
+                spread = (price_data["ask"] - price_data["bid"]) / pip_value
+
+                # Check spread filter
+                if spread > self.max_spread_pips:
+                    logger.info(f"  {pair}: SKIPPED - spread {spread:.1f} pips > max {self.max_spread_pips} pips")
+                    skipped_spread += 1
+                    continue
+
                 # Determine direction for this pair
                 if self.use_per_pair_direction:
                     pair_direction = self.get_direction_for_pair(pair)
@@ -295,16 +318,6 @@ class AsianScalperEngine:
                             continue
                 else:
                     pair_direction = direction
-
-                # Get current price
-                price_data = prices.get(pair)
-                if not price_data:
-                    price_data = self.client.get_current_price(pair)
-
-                if not price_data:
-                    logger.error(f"{pair}: Could not get price")
-                    failed += 1
-                    continue
 
                 # Determine entry price (use ask for buy, bid for sell)
                 if pair_direction == "LONG":
@@ -353,7 +366,7 @@ class AsianScalperEngine:
                 logger.error(f"{pair}: Error opening position - {e}")
                 failed += 1
 
-        logger.info(f"Positions opened: {successful} successful, {failed} failed")
+        logger.info(f"Positions opened: {successful} successful, {failed} failed, {skipped_spread} skipped (high spread)")
         logger.info(f"Direction mix: {directions_used['LONG']} LONG, {directions_used['SHORT']} SHORT")
         self.positions_opened = True
 

@@ -86,7 +86,7 @@ SCALP_CONFIG = {
     "portfolio_target": 30.0,  # $30 total profit target
 
     # Individual pair settings
-    "individual_tp_pips": 3,   # 3 pips take profit per pair
+    "individual_tp_pips": 6,   # 6 pips take profit per pair (increased from 3 to account for spread)
     "individual_sl_pips": 30,  # 30 pips stop loss (wide SL)
 
     # Position sizing
@@ -94,6 +94,9 @@ SCALP_CONFIG = {
 
     # Entry timing
     "entry_mode": "ALL_AT_ONCE",  # Open all 15 pairs simultaneously
+
+    # Spread filter - skip pairs with spread > this value in pips
+    "max_spread_pips": 2.0,    # Only trade pairs with spread <= 2 pips
 
     # Direction determination - NOW PER-PAIR (smarter direction)
     "use_per_pair_direction": True,  # Each pair gets its own direction based on EMA
