@@ -95,7 +95,8 @@ SCALP_CONFIG = {
     # Entry timing
     "entry_mode": "ALL_AT_ONCE",  # Open all 15 pairs simultaneously
 
-    # Direction determination
+    # Direction determination - NOW PER-PAIR (smarter direction)
+    "use_per_pair_direction": True,  # Each pair gets its own direction based on EMA
     "ema_fast": 5,    # 5-period EMA
     "ema_slow": 10,   # 10-period EMA
     "timeframe": "M5",  # 5-minute chart for direction
@@ -103,6 +104,16 @@ SCALP_CONFIG = {
     # Force entry even without clear trend
     "force_entry": True,  # Trade even if direction unclear
     "fallback_direction": "LONG",  # Default to LONG if no clear signal
+
+    # DCA (Dollar Cost Averaging) for recovery
+    "dca_enabled": True,
+    "dca_trigger_pl": -15.0,    # Trigger DCA when portfolio unrealized P/L hits -$15
+    "dca_units": 5000,          # Same as entry size
+    "dca_max_per_pair": 1,      # Max 1 DCA per pair
+
+    # Recovery exit - close when recovered 50% from DCA point
+    "recovery_exit_enabled": True,
+    "recovery_exit_pl": -15.0,  # Close all when recovered to -$15 (50% of -$30)
 }
 
 # =============================================================================

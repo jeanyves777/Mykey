@@ -2,9 +2,10 @@
 Asian Session Portfolio Scalper Engine
 ======================================
 Trades 15 currency pairs simultaneously during Asian session
-Opens all positions at once based on 5m EMA direction
+Each pair gets its own direction based on 5m EMA (smarter direction)
 Closes ALL when portfolio target ($30) is met
-Individual pairs close at 3 pip TP or 30 pip SL
+DCA when portfolio P/L hits -$15 for recovery
+No session-end close - positions run until target or recovery
 """
 
 import logging
@@ -51,12 +52,14 @@ class AsianScalperEngine:
     Portfolio Scalper Engine
 
     Strategy:
-    1. During Asian session (00:00-08:00 UTC), determine direction using 5m EMA
-    2. Open ALL 15 pairs at once in the same direction
+    1. During Asian session (22:00-08:00 UTC), open all 15 pairs
+    2. Each pair gets its OWN direction based on EMA (smarter direction)
     3. Each pair has individual TP (3 pips) and SL (30 pips)
     4. Monitor portfolio unrealized P&L
-    5. When portfolio P&L >= $30, close ALL positions
-    6. Individual pairs close when they hit their TP/SL
+    5. When portfolio P&L >= $30, close ALL positions (WIN)
+    6. When portfolio P&L hits -$15, trigger DCA on all positions
+    7. After DCA, exit when recovered to -$15 (50% recovery) or +$30 target
+    8. NO session-end close - let positions run
     """
 
     def __init__(self):
@@ -79,6 +82,17 @@ class AsianScalperEngine:
         self.timeframe = SCALP_CONFIG["timeframe"]
         self.force_entry = SCALP_CONFIG["force_entry"]
         self.fallback_direction = SCALP_CONFIG["fallback_direction"]
+        self.use_per_pair_direction = SCALP_CONFIG.get("use_per_pair_direction", True)
+
+        # DCA settings
+        self.dca_enabled = SCALP_CONFIG.get("dca_enabled", True)
+        self.dca_trigger_pl = SCALP_CONFIG.get("dca_trigger_pl", -15.0)
+        self.dca_units = SCALP_CONFIG.get("dca_units", 5000)
+        self.dca_max_per_pair = SCALP_CONFIG.get("dca_max_per_pair", 1)
+
+        # Recovery exit settings
+        self.recovery_exit_enabled = SCALP_CONFIG.get("recovery_exit_enabled", True)
+        self.recovery_exit_pl = SCALP_CONFIG.get("recovery_exit_pl", -15.0)
 
         # State tracking
         self.session_active = False
@@ -86,6 +100,9 @@ class AsianScalperEngine:
         self.session_start_balance = 0.0
         self.session_trades = []
         self.current_direction = None
+        self.dca_triggered = False  # Track if DCA has been done
+        self.dca_positions = {}     # Track DCA count per pair: {pair: count}
+        self.worst_pl_after_dca = 0.0  # Track worst P/L after DCA for recovery calc
 
         # Data file paths
         self.trades_file = os.path.join(
@@ -104,6 +121,9 @@ class AsianScalperEngine:
         logger.info(f"Portfolio Target: ${self.portfolio_target}")
         logger.info(f"Individual TP: {self.tp_pips} pips | SL: {self.sl_pips} pips")
         logger.info(f"Units per pair: {self.units_per_pair}")
+        logger.info(f"Per-pair direction: {self.use_per_pair_direction}")
+        logger.info(f"DCA enabled: {self.dca_enabled} | Trigger: ${self.dca_trigger_pl}")
+        logger.info(f"Recovery exit: ${self.recovery_exit_pl}")
         logger.info("=" * 60)
 
     def is_trading_window(self) -> bool:
@@ -236,27 +256,46 @@ class AsianScalperEngine:
 
         return take_profit, stop_loss
 
-    def open_all_positions(self, direction: str) -> List[Dict]:
+    def open_all_positions(self, direction: str = None) -> List[Dict]:
         """
-        Open positions on all 15 pairs in the given direction.
+        Open positions on all 15 pairs.
+        If use_per_pair_direction is True, each pair gets its own direction.
+        Otherwise, use the provided direction for all.
 
         Args:
-            direction: "LONG" or "SHORT"
+            direction: "LONG" or "SHORT" (used only if not per-pair direction)
 
         Returns:
             List of order results
         """
-        logger.info(f"Opening ALL {len(self.pairs)} positions - Direction: {direction}")
+        if self.use_per_pair_direction:
+            logger.info(f"Opening ALL {len(self.pairs)} positions - PER-PAIR DIRECTION")
+        else:
+            logger.info(f"Opening ALL {len(self.pairs)} positions - Direction: {direction}")
 
         results = []
         successful = 0
         failed = 0
+        directions_used = {"LONG": 0, "SHORT": 0}
 
         # Get all prices at once for faster execution
         prices = self.client.get_multiple_prices(self.pairs)
 
         for pair in self.pairs:
             try:
+                # Determine direction for this pair
+                if self.use_per_pair_direction:
+                    pair_direction = self.get_direction_for_pair(pair)
+                    if not pair_direction:
+                        if self.force_entry:
+                            pair_direction = self.fallback_direction
+                            logger.info(f"  {pair}: No clear direction, using fallback: {pair_direction}")
+                        else:
+                            logger.info(f"  {pair}: No clear direction, skipping")
+                            continue
+                else:
+                    pair_direction = direction
+
                 # Get current price
                 price_data = prices.get(pair)
                 if not price_data:
@@ -268,15 +307,17 @@ class AsianScalperEngine:
                     continue
 
                 # Determine entry price (use ask for buy, bid for sell)
-                if direction == "LONG":
+                if pair_direction == "LONG":
                     entry_price = price_data["ask"]
                     units = self.units_per_pair  # Positive for buy
+                    directions_used["LONG"] += 1
                 else:
                     entry_price = price_data["bid"]
                     units = -self.units_per_pair  # Negative for sell
+                    directions_used["SHORT"] += 1
 
                 # Calculate TP and SL
-                take_profit, stop_loss = self.calculate_tp_sl(pair, direction, entry_price)
+                take_profit, stop_loss = self.calculate_tp_sl(pair, pair_direction, entry_price)
 
                 # Place order
                 result = self.client.place_market_order(
@@ -290,7 +331,7 @@ class AsianScalperEngine:
                     successful += 1
                     trade_info = {
                         "pair": pair,
-                        "direction": direction,
+                        "direction": pair_direction,
                         "units": units,
                         "entry_price": entry_price,
                         "take_profit": take_profit,
@@ -300,7 +341,7 @@ class AsianScalperEngine:
                     }
                     results.append(trade_info)
                     self.session_trades.append(trade_info)
-                    logger.info(f"  {pair}: OPENED {direction} @ {entry_price:.5f} | TP: {take_profit:.5f} | SL: {stop_loss:.5f}")
+                    logger.info(f"  {pair}: OPENED {pair_direction} @ {entry_price:.5f} | TP: {take_profit:.5f} | SL: {stop_loss:.5f}")
                 else:
                     failed += 1
                     logger.error(f"  {pair}: FAILED - {result.get('error', 'Unknown error')}")
@@ -313,6 +354,7 @@ class AsianScalperEngine:
                 failed += 1
 
         logger.info(f"Positions opened: {successful} successful, {failed} failed")
+        logger.info(f"Direction mix: {directions_used['LONG']} LONG, {directions_used['SHORT']} SHORT")
         self.positions_opened = True
 
         return results
@@ -328,6 +370,141 @@ class AsianScalperEngine:
 
         if unrealized_pl >= self.portfolio_target:
             logger.info(f"PORTFOLIO TARGET REACHED! Unrealized P/L: ${unrealized_pl:.2f}")
+            return True
+
+        return False
+
+    def check_dca_trigger(self) -> bool:
+        """
+        Check if portfolio P/L has hit DCA trigger level.
+
+        Returns:
+            True if DCA should be triggered, False otherwise
+        """
+        if not self.dca_enabled or self.dca_triggered:
+            return False
+
+        unrealized_pl = self.client.get_portfolio_unrealized_pl()
+
+        if unrealized_pl <= self.dca_trigger_pl:
+            logger.info(f"DCA TRIGGER HIT! Unrealized P/L: ${unrealized_pl:.2f} <= ${self.dca_trigger_pl}")
+            return True
+
+        return False
+
+    def execute_dca(self) -> List[Dict]:
+        """
+        Execute DCA - add to all open positions to lower average entry.
+
+        Returns:
+            List of DCA order results
+        """
+        if self.dca_triggered:
+            logger.info("DCA already triggered this session, skipping")
+            return []
+
+        logger.info("=" * 60)
+        logger.info("EXECUTING DCA - ADDING TO ALL POSITIONS")
+        logger.info("=" * 60)
+
+        open_trades = self.client.get_open_trades()
+        results = []
+        successful = 0
+        failed = 0
+
+        # Get current prices
+        pairs_in_trade = [t["instrument"] for t in open_trades]
+        prices = self.client.get_multiple_prices(pairs_in_trade)
+
+        for trade in open_trades:
+            pair = trade["instrument"]
+
+            # Check if we've already done max DCA for this pair
+            if self.dca_positions.get(pair, 0) >= self.dca_max_per_pair:
+                logger.info(f"  {pair}: Max DCA ({self.dca_max_per_pair}) already reached, skipping")
+                continue
+
+            try:
+                # Get current direction from existing position
+                existing_units = trade["units"]
+                direction = "LONG" if existing_units > 0 else "SHORT"
+
+                # Get current price
+                price_data = prices.get(pair)
+                if not price_data:
+                    price_data = self.client.get_current_price(pair)
+
+                if not price_data:
+                    logger.error(f"{pair}: Could not get price for DCA")
+                    failed += 1
+                    continue
+
+                # DCA in same direction
+                if direction == "LONG":
+                    entry_price = price_data["ask"]
+                    units = self.dca_units
+                else:
+                    entry_price = price_data["bid"]
+                    units = -self.dca_units
+
+                # Place DCA order (no new TP/SL - use existing position's)
+                result = self.client.place_market_order(
+                    instrument=pair,
+                    units=units,
+                    stop_loss=None,  # Let existing SL/TP handle it
+                    take_profit=None
+                )
+
+                if "error" not in result:
+                    successful += 1
+                    self.dca_positions[pair] = self.dca_positions.get(pair, 0) + 1
+
+                    dca_info = {
+                        "pair": pair,
+                        "direction": direction,
+                        "units": units,
+                        "entry_price": entry_price,
+                        "time": datetime.now(timezone.utc).isoformat(),
+                        "type": "DCA",
+                        "result": result
+                    }
+                    results.append(dca_info)
+                    logger.info(f"  {pair}: DCA {direction} +{abs(units)} units @ {entry_price:.5f}")
+                else:
+                    failed += 1
+                    logger.error(f"  {pair}: DCA FAILED - {result.get('error', 'Unknown error')}")
+
+                time.sleep(0.1)
+
+            except Exception as e:
+                logger.error(f"{pair}: Error executing DCA - {e}")
+                failed += 1
+
+        logger.info(f"DCA complete: {successful} successful, {failed} failed")
+
+        # Mark DCA as triggered and record worst P/L point
+        self.dca_triggered = True
+        self.worst_pl_after_dca = self.client.get_portfolio_unrealized_pl()
+        logger.info(f"DCA point P/L: ${self.worst_pl_after_dca:.2f}")
+
+        return results
+
+    def check_recovery_exit(self) -> bool:
+        """
+        Check if we should exit after DCA based on recovery.
+        Exit when recovered to recovery_exit_pl (e.g., -$15, which is 50% recovery from -$30).
+
+        Returns:
+            True if recovery exit should happen, False otherwise
+        """
+        if not self.dca_triggered or not self.recovery_exit_enabled:
+            return False
+
+        unrealized_pl = self.client.get_portfolio_unrealized_pl()
+
+        # Exit if recovered to recovery level
+        if unrealized_pl >= self.recovery_exit_pl:
+            logger.info(f"RECOVERY EXIT! P/L: ${unrealized_pl:.2f} >= ${self.recovery_exit_pl}")
             return True
 
         return False
@@ -436,10 +613,11 @@ class AsianScalperEngine:
         """
         Run a complete trading session.
 
-        1. Determine direction
+        1. Each pair gets its own direction based on EMA
         2. Open all positions
-        3. Monitor until portfolio target or session end
-        4. Close all remaining positions
+        3. Monitor until portfolio target ($30) OR recovery exit
+        4. DCA when P/L hits -$15
+        5. NO session-end close - let positions run
         """
         logger.info("=" * 60)
         logger.info("STARTING NEW TRADING SESSION")
@@ -454,36 +632,53 @@ class AsianScalperEngine:
         self.session_start_time = datetime.now(timezone.utc)
         self.session_start_balance = self.client.get_balance()
         self.session_trades = []
+        self.dca_triggered = False
+        self.dca_positions = {}
 
         logger.info(f"Session Start Balance: ${self.session_start_balance:.2f}")
 
-        # Determine trading direction
-        self.current_direction = self.get_majority_direction()
+        # For per-pair direction, we don't need majority direction
+        if self.use_per_pair_direction:
+            logger.info("Using PER-PAIR direction (each pair analyzed individually)")
+            self.current_direction = "PER_PAIR"
+        else:
+            # Determine trading direction (legacy mode)
+            self.current_direction = self.get_majority_direction()
 
-        if not self.current_direction:
-            if self.force_entry:
-                self.current_direction = self.fallback_direction
-                logger.info(f"No clear direction - Using fallback: {self.current_direction}")
-            else:
-                logger.info("No clear direction and force_entry is False. Skipping session.")
-                return
+            if not self.current_direction:
+                if self.force_entry:
+                    self.current_direction = self.fallback_direction
+                    logger.info(f"No clear direction - Using fallback: {self.current_direction}")
+                else:
+                    logger.info("No clear direction and force_entry is False. Skipping session.")
+                    return
 
-        logger.info(f"Session Direction: {self.current_direction}")
+            logger.info(f"Session Direction: {self.current_direction}")
 
-        # Open all positions
-        self.open_all_positions(self.current_direction)
+        # Open all positions (direction per-pair or fixed)
+        self.open_all_positions(self.current_direction if self.current_direction != "PER_PAIR" else None)
 
         # Monitor loop
         check_interval = SESSION_CONFIG["check_interval_seconds"]
         logger.info(f"Monitoring portfolio (checking every {check_interval}s)...")
+        logger.info("NOTE: No session-end close - positions will run until target or recovery")
 
         session_result = None
 
         while True:
             try:
-                # Check portfolio target
+                # Check portfolio target (+$30)
                 if self.check_portfolio_target():
                     session_result = self.close_all_positions("portfolio_target_reached")
+                    break
+
+                # Check DCA trigger (-$15)
+                if self.check_dca_trigger():
+                    self.execute_dca()
+
+                # Check recovery exit (after DCA, when recovered to -$15)
+                if self.check_recovery_exit():
+                    session_result = self.close_all_positions("recovery_exit")
                     break
 
                 # Check remaining positions
@@ -501,11 +696,7 @@ class AsianScalperEngine:
                 # Log status
                 self.log_portfolio_status()
 
-                # Check if still in trading session
-                if not self.is_asian_session():
-                    logger.info("Asian session ended - closing remaining positions")
-                    session_result = self.close_all_positions("session_ended")
-                    break
+                # NO SESSION END CLOSE - removed the is_asian_session check
 
                 # Wait before next check
                 time.sleep(check_interval)
@@ -533,13 +724,17 @@ class AsianScalperEngine:
         logger.info(f"Start Balance: ${self.session_start_balance:.2f}")
         logger.info(f"End Balance: ${end_balance:.2f}")
         logger.info(f"Session P/L: ${session_pl:.2f}")
+        logger.info(f"DCA triggered: {self.dca_triggered}")
         logger.info("=" * 60)
 
     def run_continuous(self):
         """
         Run continuously, starting new sessions during trading windows.
+        Includes DCA and recovery exit logic.
         """
         logger.info("Starting Asian Scalper in continuous mode...")
+        logger.info(f"DCA enabled: {self.dca_enabled} | Trigger: ${self.dca_trigger_pl}")
+        logger.info(f"Recovery exit: ${self.recovery_exit_pl}")
 
         # Check for existing positions on startup (in case of restart)
         existing_trades = self.client.get_open_trades()
@@ -568,19 +763,46 @@ class AsianScalperEngine:
 
                 elif self.positions_opened:
                     # Monitor existing positions
+
+                    # Check portfolio target (+$30)
                     if self.check_portfolio_target():
                         self.close_all_positions("portfolio_target_reached")
+                        self.positions_opened = False
+                        self.dca_triggered = False
+                        self.dca_positions = {}
+                        continue
+
+                    # Check DCA trigger (-$15)
+                    if self.check_dca_trigger():
+                        self.execute_dca()
+
+                    # Check recovery exit (after DCA)
+                    if self.check_recovery_exit():
+                        self.close_all_positions("recovery_exit")
+                        self.positions_opened = False
+                        self.dca_triggered = False
+                        self.dca_positions = {}
+                        continue
 
                     # Check remaining positions
                     open_trades = self.client.get_open_trades()
                     if len(open_trades) == 0:
+                        logger.info("All positions closed by individual TP/SL")
                         self.positions_opened = False
+                        self.dca_triggered = False
+                        self.dca_positions = {}
 
                     self.log_portfolio_status()
                     time.sleep(SESSION_CONFIG["check_interval_seconds"])
 
                 else:
-                    # Outside trading window
+                    # Outside trading window but still check for open positions
+                    open_trades = self.client.get_open_trades()
+                    if len(open_trades) > 0:
+                        logger.info(f"Found {len(open_trades)} positions outside trading window - monitoring")
+                        self.positions_opened = True
+                        continue
+
                     now = datetime.now(timezone.utc)
                     logger.info(f"Outside trading window (current hour: {now.hour} UTC). Waiting...")
                     time.sleep(300)  # Check every 5 minutes
