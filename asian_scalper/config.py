@@ -34,21 +34,17 @@ OANDA_CONFIG = {
 # 15 CURRENCY PAIRS FOR PORTFOLIO SCALPING
 # =============================================================================
 SCALP_PAIRS = [
-    # Major Pairs (7)
+    # Major Pairs (4) - removed USD_JPY, USD_CAD, USD_CHF (big losers)
     "EUR_USD",
     "GBP_USD",
-    "USD_JPY",
     "AUD_USD",
-    "USD_CAD",
     "NZD_USD",
-    "USD_CHF",
 
-    # Cross Pairs (8)
+    # Cross Pairs (7) - removed GBP_AUD (big loser)
     "EUR_GBP",
     "EUR_JPY",
     "GBP_JPY",
     "EUR_AUD",
-    "GBP_AUD",
     "AUD_JPY",
     "EUR_CAD",
     "GBP_CAD",
